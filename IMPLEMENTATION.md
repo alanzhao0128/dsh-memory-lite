@@ -833,3 +833,13 @@ agent-presets: { default: code }
 
 - build + 99 测试全绿；client.js `node --check` 通过。
 - 待用户重启 dsh：设置面板出现 memory-lite 页；改 extraction 参数即时生效（指示灯/提取日志佐证）；root/sharing 显示"重启生效"。
+
+### 16.10 UI 修订（2026-08-27，用户验收反馈）
+
+用户重启后确认设置面板可见，提出两点：
+
+1. **数字参数 = 0 的含义不明**：查代码后确认大部分字段 0 ≠ 禁用（windowTurns=0 每条消息立即触发；idleTimeoutMin=0 空闲立即提取；minTurnExtract=0 无条件触发；turnDebounceMs=0 无防抖；toolResultMaxBytes=0 工具内容全丢；maxMessages=0 窗口为空等效禁用；maxConcurrentRequests 为预留未接线字段改动无效；index.maxTokens 校验要求 ≥50）。已在设置页各字段 hint 逐条标注"0 = …"。
+2. **跨 peer 共享设置的是哪个 peer 不明确**：sharing.enabled 只是总开关，具体共享哪个 peer 由 sharing.mounts 数组决定；mounts 未纳入设置页表单（已知限制）。已在设置页新增"共享挂载（sharing.mounts，只读）"块，展示当前生效的每个挂载（shared/<name>/ → peer <peer>（只读/可写）），并注明需在 settings.yaml 编辑。
+
+- 当前生效配置：mounts = [{name: dsh-test, peer: dsh-test-72572e8b}]，即把 dsh-test-72572e8b peer 的记忆经 shared/dsh-test/ 暴露给其他 peer 只读访问。
+- 测试 98 全绿（16 文件）；client.js 语法通过。
