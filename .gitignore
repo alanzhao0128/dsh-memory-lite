@@ -1,8 +1,9 @@
 # Dependencies
 node_modules/
 
-# Build output
-lib/
+# Build output (lib/client.js is hand-written source and IS tracked)
+lib/*
+!lib/client.js
 
 # npm cache (local cache dir)
 .npm-cache/
