@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+lib/
+
+# npm cache (local cache dir)
+.npm-cache/
+
+# Packed tarballs
+*.tgz
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Editor/OS droppings
+.idea/
+.vscode/
+*.swp
