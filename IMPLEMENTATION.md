@@ -851,3 +851,10 @@ agent-presets: { default: code }
   - 组标签改名：提取（extraction）→ 记忆提取；常规（重启生效）→ 存储与共享。
 - 渲染逻辑：FIELDS 加 `sub` 字段，组内按 sub 聚类插入小节标题（12px 次级标题）。
 - 测试 98 全绿；client.js 语法通过。
+
+### 16.12 设置面板默认值显示（2026-08-27，用户要求"参数需要有默认值"）
+
+- 问题：settings 服务用 schemastery 解析 namespace，未提供键不填默认（value 里只有显式值）；默认值在宿主 resolveConfig 补齐，客户端拿不到 → 面板空白。
+- 方案：client.js 新增 DEFAULTS 表（镜像 src/config.ts 全部默认值），渲染时 `readPath(value, path) ?? DEFAULTS[key]`。已用宿主 resolveConfig({}) 实测核对一致（root 显示 ~/.agent-memory 原始值，更友好）。
+- 语义：未覆盖字段显示默认值；保存时 draft 为空 → 不写（保持默认）；清空输入 → unset → 回默认。用户显式设置的值（如 settings.yaml 里 turnStoppingTrigger: false）仍显示实际值。
+- 测试 98 全绿。
