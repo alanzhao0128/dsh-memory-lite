@@ -2,7 +2,9 @@
  * Regression tests for the browser half (lib/client.js): it must evaluate as a
  * classic-script under the ModuleLoader contract (declares module/exports —
  * a missing shell previously broke startup with "exports is not defined"),
- * return a plugin with apply/inject, and honor ui.headerOrder.
+ * return a plugin with apply/inject, and register both the header indicator
+ * (conversation.session.header.utilities) and the settings page
+ * (settings.section) with the settingsScope service bound.
  * @module dsh-memory-lite/tests/client
  */
 
@@ -34,7 +36,11 @@ function loadClient(): ModuleLoaderEntry {
   return registered!
 }
 
-const reactStub = { useCallback: (fn: unknown) => fn, useEffect: (fn: unknown) => fn, useState: (v: unknown) => [v, () => {}] }
+const reactStub = {
+  useCallback: (fn: unknown) => fn,
+  useEffect: (fn: unknown) => fn,
+  useState: (v: unknown) => [v, () => {}],
+}
 const jsxStub = { jsx: (_t: unknown, p: unknown) => ({ p }), jsxs: (_t: unknown, p: unknown) => ({ p }) }
 const fakeRequire = (name: string): unknown => {
   if (name === 'react') return reactStub
@@ -42,33 +48,50 @@ const fakeRequire = (name: string): unknown => {
   throw new Error('unexpected require: ' + name)
 }
 
-function applyWith(order: number | undefined): SlotEntry {
+/** Fake settingsScope: bind returns a scope whose snapshot is empty/ready. */
+const fakeScope = {
+  getSnapshot: () => ({ status: 'ready', value: {}, base: undefined, user: undefined, revision: 1, writable: true, mode: 'host' }),
+  subscribe: () => () => {},
+  set: async () => {}, unset: async () => {},
+}
+
+function applyWith(): { entries: SlotEntry[]; inject: string[] } {
   const { factory } = loadClient()
   const plugin = factory(fakeRequire) as { apply: (ctx: unknown, config: unknown) => void; inject: string[] }
   assert.equal(typeof plugin.apply, 'function')
-  assert.deepEqual(plugin.inject, ['connection', 'slots'])
-  let entry: SlotEntry | null = null
+  assert.deepEqual(plugin.inject, ['connection', 'slots', 'settingsScope'])
+  const entries: SlotEntry[] = []
   const fakeCtx = {
-    get: (name: string) => name === 'connection' ? { rpc: { call: async () => ({ ok: true, value: null }) } } : null,
+    get: (name: string) => {
+      if (name === 'connection') return { rpc: { call: async () => ({ ok: true, value: null }) }, api: { settings: { mutate: async () => ({ result: { ok: true } }) } } }
+      if (name === 'settingsScope') return { bind: () => fakeScope }
+      return null
+    },
     slots: {
-      inject: (_name: string, fn: () => unknown) => { entry = fn() as SlotEntry },
+      inject: (_name: string, fn: () => unknown) => { entries.push(fn() as SlotEntry) },
       register: (opts: SlotEntry, component: unknown) => ({ ...opts, component }),
     },
   }
-  plugin.apply(fakeCtx, order === undefined ? {} : { ui: { headerOrder: order } })
-  assert.ok(entry, 'apply must register the header utilities slot')
-  return entry!
+  plugin.apply(fakeCtx, {})
+  assert.ok(entries.length >= 2, 'apply must register both slots')
+  return { entries, inject: plugin.inject }
 }
 
-test('client.js evaluates and registers the header indicator with ui.headerOrder', () => {
-  const entry = applyWith(5)
-  assert.equal(entry.name, 'conversation.session.header.utilities')
-  assert.equal(entry.id, 'memory-lite-status')
-  assert.equal(entry.order, 5)
-  assert.equal(typeof entry.component, 'function')
+test('client.js evaluates and registers the header indicator + settings page', () => {
+  const { entries } = applyWith()
+  const header = entries.find(e => e.name === 'conversation.session.header.utilities')
+  assert.ok(header, 'header indicator entry registered')
+  assert.equal(header!.id, 'memory-lite-status')
+  assert.equal(header!.order, -1)
+  assert.equal(typeof header!.component, 'function')
+
+  const settings = entries.find(e => e.name === 'settings.section')
+  assert.ok(settings, 'settings page entry registered')
+  assert.equal(settings!.id, 'memory-lite')
+  assert.equal(typeof settings!.component, 'function')
 })
 
-test('client.js defaults headerOrder to -1 when ui config is absent', () => {
-  const entry = applyWith(undefined)
-  assert.equal(entry.order, -1)
+test('client.js binds the settingsScope namespace service', () => {
+  const { inject } = applyWith()
+  assert.ok(inject.includes('settingsScope'), 'inject declares settingsScope')
 })

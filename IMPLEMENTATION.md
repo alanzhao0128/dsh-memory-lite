@@ -791,3 +791,45 @@ agent-presets: { default: code }
   - 手写 client.js 表单可维护性差——若后续复杂度上升，再评估引入 tsdown 构建（better-sidebar 模式）。
   - settings.yaml 为整个 profile 共享文档，误写风险低（revision 防护），但迁移时注意不要覆盖其他插件段（只动 dsh-memory-lite 键）。
   - `applies: 'restart'` 的 UI 提示需自绘（官方卡片控件不依赖时无现成提示组件）。
+
+### 16.9 实施记录（2026-08-27）
+
+按 §16.7 顺序完成，总计 99 测试全绿（96 → 99）。
+
+**1. 宿主侧 settings 接入（§16.7 步骤 1-2）**
+
+- `package.json` dependencies 加 `@deepseek-ai/dsh-settings@0.1.1-rc.2`；`dsh.client.inject` 加 `@deepseek-ai/dsh-client-ui-settings`（提供浏览器 settingsScope 服务）。
+- `src/index.ts` apply：`let live: ResolvedConfig` 可变引用 + `installSettingsSection(ctx, settingsNamespace('dsh-memory-lite'), Config, config, { setSource, onChange })`；onChange 里 `live = { ...resolveConfig(source()), root: live.root, sharing: live.sharing }`（root/sharing 钉在 store 快照，restart 语义）。
+- `MemoryDeps.config` 从 `ResolvedConfig` 改为 `() => ResolvedConfig` getter；消费点全部改读 `deps.config()`：5 个 tools、inject.ts（applyMemoryCatalogInjection 签名改 `(ctx, deps, readTool)`）、extract/index.ts（applyExtraction / runExtraction / extractOnce 签名改传 deps，`const ext = config.extraction` 快照改为回调内 `ext().` 动态读；extractOnce 每次运行开始时读一次 config 快照）。
+- 行配置（cordis.patch.yml）不再携带 config：base 层为空 `{}`，schema 默认值兜底；settings 文档为 user 覆盖层。
+
+**2. 测试（§16.7 步骤 3、5）**
+
+- 新 `tests/fixtures/fake-settings.ts`：内存版 SettingsProvider（子类实现 load/persist，公开 seed/publishNow/sections）。
+- 新 `tests/settings-boot.test.ts` 2 例：
+  - settings.update 改 extraction.mode → /memory-status 立即反映（live 生效）；root 编辑不影响 live（restart 钉住）；写入持久化。
+  - 行配置为空 + seed 预置 explicit_only → boot 后初始 mode 即 explicit_only（settings 是配置源）。
+- `tests/client.test.ts` 更新：inject 断言加 settingsScope；断言两个注册（header utilities + settings.section）；settingsScope.bind 被调用。
+- `tests/extract-boot.test.ts`：extractOnce 调用改 deps 形态。
+
+**3. 配置迁移（§16.7 步骤 6）**
+
+- `~/.dsh/settings.yaml` 追加 `dsh-memory-lite:` 段（root/defaultPeer/extraction 非默认/sharing 全量）。
+- profile `cordis.patch.yml` memory-lite 行：删除整个 config 块与旧注释，仅保留挂载行 + 指向设置面板的注释。
+- **坑**：用 python yaml.safe_dump 重写 settings.yaml 把 `reasoningEfforts: { off:, ... }` 的 `off` 键破坏成 `false`（YAML 1.1 布尔解析）——已恢复原文件（保留 flow 格式）并改用纯文本追加；修复后 js-yaml（与 dsh 相同）验证 `off` 键完好。**教训：settings.yaml 是共享文档，绝不用破坏性 dump 重写，只做 leaf 级/追加修改。**
+
+**4. 客户端设置页（§16.7 步骤 4）**
+
+- `lib/client.js` 重写（135 → ~430 行）：新增 SettingsPage 注册 `settings.section`（id memory-lite, order 100），分组表单（提取/索引/界面/常规），字段表驱动（select/number/text/toggle 四类控件），draft 暂存 + Save（`connection.api.settings.mutate` 嵌套 path + expectedRevision）/Discard。
+- `ui.headerOrder` 语义：槽注册期快照（order 在 apply 时固定），改后需刷新页面生效——设置页 hint 已标注。
+- StatusDot 保留（轮询 /memory-status）；不再从 scope 读 order（注册期已固定）。
+
+**5. 已知限制**
+
+- `sharing.mounts`（数组）未纳入设置页字段表（FIELDS 无 mounts 项），仍靠 settings.yaml 手改；root/sharing.enabled 可编辑但标"重启生效"。
+- 手写 client.js 表单可维护性：当前可接受，复杂度再升时评估 tsdown（§16.8 风险项）。
+
+**6. 验收**
+
+- build + 99 测试全绿；client.js `node --check` 通过。
+- 待用户重启 dsh：设置面板出现 memory-lite 页；改 extraction 参数即时生效（指示灯/提取日志佐证）；root/sharing 显示"重启生效"。

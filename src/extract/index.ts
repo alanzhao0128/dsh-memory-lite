@@ -17,7 +17,7 @@ import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/cordis-plugin-timer'
 import type { MemoryStore } from '../memory-store.js'
 import { peerForHeader } from '../peer.js'
-import type { ResolvedConfig } from '../config.js'
+import type { MemoryDeps } from '../tool-utils.js'
 import type { StatusTracker } from '../status.js'
 import { MEMORY_CATEGORIES } from '../types.js'
 import { slugify, summaryOf } from '../memory-store.js'
@@ -87,9 +87,9 @@ export interface ExtractionSessionLike {
 }
 
 /** Register the extraction channel for the lifetime of `ctx`. */
-export function applyExtraction(ctx: Context, config: ResolvedConfig, store: MemoryStore, tracker: StatusTracker): void {
-  const ext = config.extraction
-  if (ext.mode === 'off') return
+export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusTracker): void {
+  const ext = () => deps.config().extraction
+  if (ext().mode === 'off') return
 
   const states = new Map<string, ExtractionState>()
 
@@ -110,19 +110,19 @@ export function applyExtraction(ctx: Context, config: ResolvedConfig, store: Mem
   }
 
   function resetIdle(session: Session, state: ExtractionState): void {
-    if (ext.mode !== 'incremental') return
+    if (ext().mode !== 'incremental') return
     state.idleDispose?.()
     state.idleDispose = null
     state.idleDispose = ctx.timeout(() => {
       if (shouldExtractIdle(state.pending)) maybeSchedule(session, state)
-    }, ext.idleTimeoutMin * 60_000)
+    }, ext().idleTimeoutMin * 60_000)
   }
 
   function maybeSchedule(session: Session, state: ExtractionState): void {
-    if (ext.mode !== 'incremental') return
+    if (ext().mode !== 'incremental') return
     if (state.inFlight) return
     state.inFlight = true
-    runExtraction(session, state, ctx, store, config, tracker)
+    runExtraction(session, state, ctx, deps, tracker)
   }
 
   ctx.on('session/event', (session, event) => {
@@ -131,27 +131,27 @@ export function applyExtraction(ctx: Context, config: ResolvedConfig, store: Mem
     const state = stateOf(session)
     state.pending += 1
     resetIdle(session, state)
-    if (shouldExtractWindow(state.pending, ext.windowTurns)) maybeSchedule(session, state)
+    if (shouldExtractWindow(state.pending, ext().windowTurns)) maybeSchedule(session, state)
   })
 
   ctx.on('agent/turn-stopping', ({ agent }) => {
     // Disabled 2026-08-25 (方案 C): turn-boundary extraction turned off to cut
     // LLM calls; the 30-min idle timer remains the timeliness backstop. Re-enable
     // by setting extraction.turnStoppingTrigger back to true (IMPLEMENTATION.md §13.2 偏差 12).
-    if (!ext.turnStoppingTrigger) return
+    if (!ext().turnStoppingTrigger) return
     const session = agent.session
     if (session.header.origin === 'subagent') return
     const state = stateOf(session)
-    if (shouldExtractTurn(state.pending, Date.now(), state.lastExtractAt, ext.minTurnExtract, ext.turnDebounceMs)) {
+    if (shouldExtractTurn(state.pending, Date.now(), state.lastExtractAt, ext().minTurnExtract, ext().turnDebounceMs)) {
       maybeSchedule(session, state)
     }
   })
 
   ctx.on('session/flush', (session) => {
-    if (!ext.flushTrigger) return
+    if (!ext().flushTrigger) return
     if (session.header.origin === 'subagent') return
     const state = stateOf(session)
-    if (shouldExtractTurn(state.pending, Date.now(), state.lastExtractAt, ext.minTurnExtract, ext.turnDebounceMs)) {
+    if (shouldExtractTurn(state.pending, Date.now(), state.lastExtractAt, ext().minTurnExtract, ext().turnDebounceMs)) {
       maybeSchedule(session, state)
     }
   })
@@ -171,8 +171,7 @@ function runExtraction(
   session: Session,
   state: ExtractionState,
   ctx: Context,
-  store: MemoryStore,
-  config: ResolvedConfig,
+  deps: MemoryDeps,
   tracker: StatusTracker,
 ): void {
   const controller = new AbortController()
@@ -182,7 +181,7 @@ function runExtraction(
   state.cancel = cancel
   void (async (): Promise<void> => {
     try {
-      await extractOnce(session, state, ctx, store, config, controller.signal, tracker)
+      await extractOnce(session, state, ctx, deps, controller.signal, tracker)
     } catch (error) {
       if (!controller.signal.aborted) {
         tracker.reportError(String(error))
@@ -201,12 +200,13 @@ export async function extractOnce(
   session: ExtractionSessionLike,
   state: ExtractionState,
   ctx: Context,
-  store: MemoryStore,
-  config: ResolvedConfig,
+  deps: MemoryDeps,
   signal: AbortSignal,
   tracker: StatusTracker,
 ): Promise<void> {
+  const config = deps.config()
   const ext = config.extraction
+  const store = deps.store
   const peer = peerForHeader(session.header as Parameters<typeof peerForHeader>[0], config)
   if (state.checkpoint.checkpoint.seq === 0 && state.checkpoint.audit.length === 0) {
     const raw = await store.readSessionCheckpoint(peer, session.id)

@@ -35,7 +35,7 @@ export function applyUpdateMemoryTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config)
+      const peer = peerForExec(exec, deps.config())
       const content = normalizeContent(args.content)
       if (content === '') throw new Error('content must be a non-empty string')
       await deps.store.updateCurrent(peer, args.path, content)

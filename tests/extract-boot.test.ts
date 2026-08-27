@@ -79,7 +79,7 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
     const store = new MemoryStore(tmp)
     const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
     const session = sessionLike('session-abc123', 30)
-    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, store, config, new AbortController().signal, createStatusTracker())
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
     const memoryPath = join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md')
     const memory = await readFile(memoryPath, 'utf8')
@@ -133,7 +133,7 @@ test('extractOnce recovers a prose answer via one bounded repair call', async ()
     const store = new MemoryStore(tmp)
     const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
     const session = sessionLike('session-abc789', 30)
-    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, store, config, new AbortController().signal, createStatusTracker())
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
     // One repair call on top of the original call; the memory is written.
     assert.equal(calls, 2)
@@ -163,7 +163,7 @@ test('extractOnce records a parse-error audit and advances the checkpoint', asyn
     const store = new MemoryStore(tmp)
     const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
     const session = sessionLike('session-abc456', 30)
-    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, store, config, new AbortController().signal, createStatusTracker())
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
     const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-abc456.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)

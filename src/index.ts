@@ -22,8 +22,9 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-client-connection'
+import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { Config, resolveConfig } from './config.js'
-import type { MemoryConfig } from './config.js'
+import type { MemoryConfig, ResolvedConfig } from './config.js'
 import { MemoryStore } from './memory-store.js'
 import type { MemoryDeps } from './tool-utils.js'
 import { applyReadMemoryTool } from './tools/read-memory.js'
@@ -46,25 +47,43 @@ export { Config }
 
 /** Register the memory capability for the lifetime of `ctx`. */
 export function apply(ctx: Context, config: MemoryConfig = {}): void {
-  const resolved = resolveConfig(config)
-  const store = new MemoryStore(resolved.root, resolved.sharing)
-  const deps: MemoryDeps = { config: resolved, store }
+  // The live config is a mutable reference; settings changes swap it in place
+  // (see installSettingsSection below), so every consumer reading through the
+  // deps getter sees the newest value without re-registering.
+  let live: ResolvedConfig = resolveConfig(config)
+  const store = new MemoryStore(live.root, live.sharing)
+  const deps: MemoryDeps = { config: () => live, store }
   const readTool = applyReadMemoryTool(ctx, deps)
   applySearchMemoryTool(ctx, deps)
   applyRememberTool(ctx, deps)
   applyUpdateMemoryTool(ctx, deps)
   applyForgetMemoryTool(ctx, deps)
-  applyMemoryCatalogInjection(ctx, resolved, store, readTool)
+  applyMemoryCatalogInjection(ctx, deps, readTool)
   const tracker = createStatusTracker()
-  applyExtraction(ctx, resolved, store, tracker)
-  // Browser indicator channel: the sidebar dot polls this snapshot.
+  applyExtraction(ctx, deps, tracker)
+
+  // Settings-backed overrides (方案 A, IMPLEMENTATION.md §16): the cordis row
+  // config is the composition base; user edits land in ~/.dsh/settings.yaml
+  // under the dsh-memory-lite namespace. root/sharing stay pinned to the store
+  // snapshot (restart-applies — MemoryStore holds them at construction); every
+  // other field resolves live on each change.
+  let source: () => MemoryConfig = () => config
+  installSettingsSection(ctx, settingsNamespace('dsh-memory-lite'), Config, config, {
+    setSource: (get) => { source = get },
+    onChange: () => {
+      const next = resolveConfig(source())
+      live = { ...next, root: live.root, sharing: live.sharing }
+    },
+  })
+
+  // Browser indicator channel: the header dot polls this snapshot.
   ctx.connection.rpc.handle(
     '/memory-status',
     async (_endpoint, _payload, _signal) => ({
       ok: true,
-      value: tracker.snapshot(resolved.extraction.mode),
+      value: tracker.snapshot(live.extraction.mode),
     }),
     { authority: 'loopback' },
   )
-  ctx.logger.info(`dsh-memory-lite: memory enabled (root ${resolved.root}, default peer ${resolved.defaultPeer}, extraction ${resolved.extraction.mode})`)
+  ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
 }

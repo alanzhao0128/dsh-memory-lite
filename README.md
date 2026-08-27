@@ -28,43 +28,33 @@ The bundle inserts the plugin row without configuration; defaults apply immediat
 
 ## Configuration
 
-Override the inserted row in your profile's `cordis.patch.yml` (same id `memory-lite`):
+All settings are edited in the **settings panel** (Settings → memory-lite). They persist to the harness settings document (`~/.dsh/settings.yaml`, section `dsh-memory-lite:`) and most take effect **immediately** — no restart, no YAML editing. The header indicator and extraction behavior react live.
+
+The plugin row in `cordis.patch.yml` carries **no configuration** (mount only); a row config, if present, acts as the deployment base layer under the settings document (settings values win). The full schema, with defaults, lives in [src/config.ts](src/config.ts):
 
 ```yaml
 - id: memory-lite
   name: dsh-memory-lite
-  config:
-    root: '~/.agent-memory'        # memory root (default)
-    defaultPeer: dsh-web           # peer when a session has no usable cwd
-    workspacePeers:
-      enabled: true                # derive the peer from each session's cwd
-      excludeSubagents: true       # unused; subagents are excluded at injection/extraction instead
-      cwdFallback: default_peer    # peer for cwd-less sessions
-    index:
-      maxTokens: 1200              # catalog size cap (approx tokens)
-    tools:
-      schemaMinimal: true          # reserved; schemas are minimal by construction
-    extraction:
-      mode: incremental            # incremental | explicit_only | off
-      windowTurns: 20              # new surface messages before an extraction run
-      idleTimeoutMin: 30           # idle backstop before the remaining window is extracted
-      turnStoppingTrigger: false   # shipped but off (cost); set true to re-enable
-      flushTrigger: false          # shipped but off (cost); set true to re-enable
-      # llm:                       # dedicated extraction model; unset = reuse the session model
-      #   provider: huoshan
-      #   model: deepseek-v4-flash
-    sharing:
-      enabled: false               # read-only cross-peer access at shared/<name>/...
-      mounts:
-        - name: dsh-test           # path prefix exposed to this peer's sessions
-          peer: dsh-test-72572e8b  # target peer whose memories root is shared
-          subpath: ''              # '' = the whole memories root
-          readonly: true           # write operations on shared/ are rejected
-    ui:
-      headerOrder: -1             # session-header utilities slot order (horizontal, ascending; -1 = left of the built-in "Session log" capsule)
+  # config:            # optional deployment defaults; settings override
+  #   root: '~/.agent-memory'
+  #   defaultPeer: dsh-web
+  #   extraction:
+  #     mode: incremental
+  #     turnStoppingTrigger: false
+  #     flushTrigger: false
+  #   sharing:
+  #     enabled: true
+  #     mounts:
+  #       - name: dsh-test
+  #         peer: dsh-test-72572e8b
+  #         subpath: ''
+  #         readonly: true
 ```
 
-Every field is optional. See [src/config.ts](src/config.ts) for the validated schema.
+Effect timing:
+
+- **Live** (apply on save): `extraction.*`, `index.maxTokens`, `defaultPeer`, `workspacePeers.*`, `ui.headerOrder` (after a refresh for the slot order).
+- **Restart** (persisted, apply on next boot): `root`, `sharing.*` — `MemoryStore` pins them at construction; the panel labels them accordingly.
 
 ## Tools
 
@@ -99,7 +89,7 @@ Each memory file uses `## Current` / `## History` / `## Related` sections; updat
 - **Implicit extraction** (Phase 2): once `windowTurns` (default 20) new surface messages accumulate — or after `idleTimeoutMin` (default 30 min) of idle — a background run feeds the new window to the LLM and applies a create/merge/update/skip decision (dedup against existing memories), then advances a per-session checkpoint and rolling digest. Turn-boundary and flush triggers are shipped but disabled by config (cost); subagent sessions are never extracted. Audit trails live in `peers/{peer}/sessions/`.
 - **Cross-peer sharing** (Phase 3): `sharing.mounts` expose another peer's memories read-only at `shared/<name>/...`; `search_memory` covers shared mounts and results keep the `shared/<name>` prefix. Shared entries stay out of the local catalog.
 - **Concurrent writes**: all mutations run through a serial queue with atomic tmp+rename replacement.
-- **Header status indicator** (browser half, `lib/client.js`): a compact "memory-lite" capsule in the session-header utilities row, left of the built-in "Session log" download button (position via `ui.headerOrder`). The dot polls the `/memory-status` RPC channel every 10s — green (last extraction run ok), red (last run failed or the plugin is unreachable), gray (extraction mode off / explicit_only). No data yet is green.
+- **Header status indicator** (browser half, `lib/client.js`): a compact "memory-lite" capsule in the session-header utilities row, left of the built-in "Session log" download button (position via `ui.headerOrder`, editable in the settings panel). The dot polls the `/memory-status` RPC channel every 10s — green (last extraction run ok), red (last run failed or the plugin is unreachable), gray (extraction mode off / explicit_only). No data yet is green.
 
 ## Model Experience
 

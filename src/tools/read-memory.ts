@@ -32,7 +32,7 @@ export function applyReadMemoryTool(ctx: Context, deps: MemoryDeps) {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config)
+      const peer = peerForExec(exec, deps.config())
       const { content, rel } = await deps.store.readFile(peer, args.path)
       return { path: rel, content }
     },

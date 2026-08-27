@@ -41,7 +41,7 @@ export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config)
+      const peer = peerForExec(exec, deps.config())
       const category = args.category as MemoryCategory
       if (!MEMORY_CATEGORIES.includes(category)) {
         throw new Error(`category must be one of ${MEMORY_CATEGORIES.join(', ')}`)

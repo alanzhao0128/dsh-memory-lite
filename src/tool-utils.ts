@@ -8,9 +8,11 @@ import type { ResolvedConfig } from './config.js'
 import type { MemoryStore } from './memory-store.js'
 import { peerForHeader } from './peer.js'
 
-/** What the tools and the injector need: the store plus fully defaulted config. */
+/** What the tools and the injector need: the store plus a config source.
+ *  The config is a getter so settings changes apply live without restarting
+ *  the plugin (root/sharing stay fixed at the store snapshot; see §16). */
 export interface MemoryDeps {
-  readonly config: ResolvedConfig
+  readonly config: () => ResolvedConfig
   readonly store: MemoryStore
 }
 

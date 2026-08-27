@@ -42,7 +42,7 @@ export function applySearchMemoryTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config)
+      const peer = peerForExec(exec, deps.config())
       const matches = await deps.store.search(peer, args.query)
       return { matches }
     },

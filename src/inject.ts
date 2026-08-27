@@ -9,8 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { ResolvedConfig } from './config.js'
-import type { MemoryStore } from './memory-store.js'
+import type { MemoryDeps } from './tool-utils.js'
 import type { IndexEntry } from './types.js'
 import { peerForHeader } from './peer.js'
 import { digestApproxTokens } from './extract/digest.js'
@@ -88,8 +87,7 @@ export function applyCatalogDecision(params: CatalogDecisionParams): PreStepDeci
 /** Register the pre-step catalog injector for the lifetime of `ctx`. */
 export function applyMemoryCatalogInjection(
   ctx: Context,
-  config: ResolvedConfig,
-  store: MemoryStore,
+  deps: MemoryDeps,
   readTool: ToolDefinition,
 ): void {
   ctx.on('agent/pre-step', async ({ agent, signal }, next): Promise<PreStepDecision> => {
@@ -101,8 +99,9 @@ export function applyMemoryCatalogInjection(
     // The anchor tool's exact definition is the visibility gate: a restriction
     // or scoped shadow of read_memory removes both the schema and the catalog.
     if (ctx.tools.get(readTool.name, agent) !== readTool) return decision
+    const config = deps.config()
     const peer = peerForHeader(agent.session.header, config)
-    const entries = capCatalogEntries(await store.readIndex(peer), config.index.maxTokens)
+    const entries = capCatalogEntries(await deps.store.readIndex(peer), config.index.maxTokens)
     const sharedMounts = config.sharing.enabled
       ? config.sharing.mounts
           .filter(mount => mount.peer !== peer)

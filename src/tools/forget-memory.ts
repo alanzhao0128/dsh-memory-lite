@@ -30,7 +30,7 @@ export function applyForgetMemoryTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config)
+      const peer = peerForExec(exec, deps.config())
       const { rel } = await deps.store.resolve(peer, args.path)
       await deps.store.softDelete(peer, args.path)
       await deps.store.removeIndexEntry(peer, args.path)
