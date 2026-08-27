@@ -670,3 +670,124 @@ package.json：dsh.client（inject runtime/connection/locale, platform web）+ e
 - 生效：重启 dsh 后浏览器半区随 dsh.client 清单加载；profile 已加 `ui.headerOrder` 注释示例。
 - **人工验收（2026-08-27，用户重启后确认）**：✅ 会话标题栏最右端、"Session log" 胶囊左侧出现 memory-lite 小胶囊，用户确认"看样子正常"。三色验证（红/灰）与 `ui.headerOrder` 左右位置调整留待后续需要时复测。
 
+
+---
+
+## 16. 设置面板方案（方案 A，2026-08-27 规划）
+
+> 目标：不再手改 cordis.patch.yml 调参。通过 harness 官方设置通道提供可视化设置面板；配置落盘 harness settings 文档（~/.dsh/settings.yaml）；包内 cordis.patch.yml 成为默认层；用户 profile 的 cordis.patch.yml 移除 memory-lite 全部内容。
+>
+> 本节是**动手前规划**（含调研结论与工作量评估），实施记录后续补写。
+
+### 16.1 调研结论（2026-08-27 实查）
+
+参考项目做法：
+
+| 项目 | 设置面板入口 | 配置存储 | 生效方式 |
+|---|---|---|---|
+| dsh-harbor | `settings.section` 槽（设置面板导航加页） | 只读清单，不编辑 | — |
+| dsh-better-sidebar | `settings.section` 槽（Side card 设置页） | **harness 官方 settings 服务 namespace**（`dsh-better-sidebar`），落盘 `~/.dsh/settings.yaml` | **即时生效**（`applies: 'live'` + `scope.watch`） |
+| harness 官方（ui-settings-plugins） | `settings.plugin.item` 槽（Plugins → Configurable 标签页卡片） | settings 服务 namespace | 即时生效 |
+
+**环境实证**（用户机器 ~/.dsh/settings.yaml 已存在且在用）：
+
+```yaml
+ui-theme: { preference: dark }
+locale: { preference: zh }
+llm-pi-ai: { providers: {...} }
+dsh-better-sidebar:
+  tabsEnabled: { git: true }
+  defaultWidthPercent: 20
+  openByDefault: true
+agent-presets: { default: code }
+```
+
+→ better-sidebar 的设置面板改动已实时写入该文件；memory-lite 将占用 `dsh-memory-lite:` 段，互不干扰。
+
+**挂载通道实证**：harbor/better-sidebar 的挂载声明在**各自 npm 包内的 cordis.patch.yml**（`dsh.bundle.patch` 层），经 `package.json` 的 `dsh.profile.bundles` 在启动时合并——所以用户 profile 的 cordis.patch.yml 里没有它们的行。memory-lite **包内已有 cordis.patch.yml**（`- insert: - id: memory-lite / name: dsh-memory-lite`）且已在 bundles 里，因此 profile 侧挂载行可以删除。
+
+### 16.2 目标形态
+
+- 设置入口：**设置面板新增 "memory-lite" 页面**（`settings.section` 槽，order 置于 General/Plugins 之后），自绘表单（不依赖官方卡片控件——memory-lite 客户端是手写 classic script，跨包值导入受 client bundle purity gate 限制，且引入 tsdown 构建属于更大的改造）。
+- 配置存储：`~/.dsh/settings.yaml` 的 `dsh-memory-lite:` section（settings 服务 namespace）。
+- 生效分层：
+  - `live` 参数（extraction.* 运行参数、index.maxTokens、defaultPeer、workspacePeers.*、ui.headerOrder）：保存即生效。
+  - `restart` 参数（root、sharing.*）：保存写盘 + UI 标注"重启后生效"（settings 服务原生 `applies: 'restart'`）。
+- 挂载：删除 profile 的 memory-lite 挂载行 + 配置块；包内 cordis.patch.yml 保留（无 config，纯挂载）。
+
+### 16.3 配置分层模型
+
+```
+生效值 = settings.yaml user 层 > 包内 patch base 层 > schema 默认值
+```
+
+- **包内 cordis.patch.yml**：纯挂载行（现状已是），不写 config —— 默认值全部由 schema 兜底；如需部署级默认可将来在 patch config 里补。
+- **settings.yaml `dsh-memory-lite:` 段**：用户通过设置面板修改的值（迁移自现有 profile 配置）。
+- 迁移动作：现有 profile yml 里的 `root / defaultPeer / extraction / sharing / ui` 值先写入 settings.yaml 的 `dsh-memory-lite:` 段，再删 profile 挂载行（一次性重启生效）。
+
+### 16.4 字段分组与控件
+
+**live 生效（保存即用）**
+
+| 字段 | 控件 | 说明 |
+|---|---|---|
+| extraction.mode | 下拉（incremental/explicit_only/off） | |
+| extraction.windowTurns | 数字 | 触发窗口 |
+| extraction.idleTimeoutMin | 数字 | 空闲兜底 |
+| extraction.maxMessages | 数字 | 单次上限 |
+| extraction.toolResultMaxBytes | 数字 | |
+| extraction.minTurnExtract | 数字 | |
+| extraction.turnDebounceMs | 数字 | |
+| extraction.maxConcurrentRequests | 数字 | |
+| extraction.includeDigest / dedup / turnStoppingTrigger / flushTrigger / parseRetry / auditLog | 开关 | |
+| index.maxTokens | 数字 | |
+| ui.headerOrder | 数字 | |
+| defaultPeer / workspacePeers.enabled / workspacePeers.cwdFallback | 文本/开关 | |
+
+**restart 生效（保存后重启）**
+
+| 字段 | 控件 | 说明 |
+|---|---|---|
+| root | 文本 | MemoryStore 构造快照，需重建 store 才 live |
+| sharing.enabled | 开关 | 同上 |
+| sharing.mounts | 数组（增删行） | 同上 |
+
+### 16.5 动态配置源改造（宿主侧）
+
+现状：`apply()` 里 `resolveConfig(config)` 一次，`MemoryStore` 构造快照 root/sharing，`applyExtraction` 里 `const ext = config.extraction` 快照。
+
+改造：
+1. `installSettingsSection(ctx, settingsNamespace('dsh-memory-lite'), Config, entry, hooks)` 接入（官方 helper，entry=当前行配置作 base 层）。
+2. hooks.onChange：重新解析动态配置；对 live 参数热更新：
+   - extraction 参数 → applyExtraction 内部从"快照 ext"改为"每次读取动态源"（事件回调里读 `source()`；timer 重建）。
+   - index.maxTokens / defaultPeer / workspacePeers → 已按需读取处（inject.ts / peer.ts）改为读动态源。
+   - root / sharing → 不 live：`applies: 'restart'`，scope.watch 仅更新 UI 状态。
+3. apply() 里 `config` 从"固定对象"改为"getter"：`deps.config = () => currentResolved`，所有消费点改函数调用。
+
+### 16.6 客户端设置页（lib/client.js）
+
+- 新增注册：`ctx.slots.inject('settings.section', ...)` 注册 id `memory-lite`、order 靠后（如 100）、label "memory-lite"。
+- 页面组件：手写 React（jsx 调用，沿用现有 StatusDot 风格），表单元素用原生 `<input>`/`<select>`/`<button>`。
+- 读写：`ctx.settingsScope.bind({ namespace: 'dsh-memory-lite' })` → `getSnapshot()` 渲染当前值、`set()/unset()` 保存。
+- `ui.headerOrder` 状态灯改为从 settingsScope 读取（不再只读行配置）。
+- 控件清单见 16.4。
+
+### 16.7 实施步骤（顺序）
+
+1. 宿主侧接入 settings：devDep 加 `@deepseek-ai/dsh-settings`；apply() 接入 installSettingsSection + 动态配置源（先不改消费点，仅接入口）。
+2. 动态消费点改造：extract/index.ts（快照→getter）、inject.ts、peer.ts。
+3. 测试：fake settings 服务（测试双）+ 动态配置生效断言（live 参数改后行为变化）。
+4. 客户端设置页：client.js 注册 settings.section + 表单 + settingsScope 读写。
+5. 测试：client.test.ts 断言 settings.section 注册；设置页渲染回归。
+6. 配置迁移：现有 profile 值写入 ~/.dsh/settings.yaml 的 dsh-memory-lite 段；删 profile 挂载行；更新 profile 注释。
+7. 文档：README 配置章节改写（settings 面板优先、yml 仅挂载）；IMPLEMENTATION.md 补实施记录。
+8. 验收：重启后设置面板出现 memory-lite 页；改 live 参数即时生效（指示灯/日志佐证）；改 root/sharing 显示"重启生效"且重启后生效。
+
+### 16.8 工作量与风险
+
+- 工作量：宿主侧接入 ~0.5 天；动态配置源改造 ~0.5-1 天；客户端设置页 ~1 天；迁移+测试+文档 ~1 天。合计 **~3 天**。
+- 风险：
+  - 动态配置源改造面广（extract/index.ts 多处解构），回归风险——用现有 96 测试 + 新增动态断言兜底。
+  - 手写 client.js 表单可维护性差——若后续复杂度上升，再评估引入 tsdown 构建（better-sidebar 模式）。
+  - settings.yaml 为整个 profile 共享文档，误写风险低（revision 防护），但迁移时注意不要覆盖其他插件段（只动 dsh-memory-lite 键）。
+  - `applies: 'restart'` 的 UI 提示需自绘（官方卡片控件不依赖时无现成提示组件）。
