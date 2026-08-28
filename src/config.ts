@@ -252,8 +252,11 @@ export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
   }
   const llmRoute = extraction.llm.route
   if (llmRoute !== '') {
-    const parts = llmRoute.split('/')
-    if (parts.length !== 2 || parts[0] === '' || parts[1] === '' || parts.some(part => part.includes('\\'))) {
+    // "provider/model-id": the model id itself may contain a slash (pi-ai
+    // routes like commandcode/deepseek/deepseek-v4-flash), so only the first
+    // segment is the provider and the rest is the model id.
+    const slash = llmRoute.indexOf('/')
+    if (slash <= 0 || slash === llmRoute.length - 1 || llmRoute.includes('\\')) {
       throw new Error(`dsh-memory-lite: extraction.llm.route must be "provider/model", got ${JSON.stringify(llmRoute)}`)
     }
   }

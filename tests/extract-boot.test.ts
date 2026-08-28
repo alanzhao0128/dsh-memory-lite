@@ -332,3 +332,36 @@ test('extractOnce falls back to the session header when no route and no global d
     await rm(tmp, { recursive: true, force: true })
   }
 })
+
+
+test('extractOnce splits a route whose model id contains a slash (§17, pi-ai style)', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => mockStreamText('{"decision":"skip"}'))
+    const store = new MemoryStore(tmp)
+    // commandcode provider, model id "deepseek/deepseek-v4-flash" — the provider is the
+    // first segment, the model is everything after it.
+    const config = resolveConfig({
+      root: tmp,
+      defaultPeer: 'test-peer',
+      extraction: { llm: { route: 'commandcode/deepseek/deepseek-v4-flash', reasoningEffort: 'high' } },
+    })
+    const session = sessionLike('session-slash-route', 30)
+    await extractOnce(
+      session,
+      { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null },
+      ctx,
+      { config: () => config, store },
+      new AbortController().signal,
+      createStatusTracker(),
+    )
+    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-slash-route.json'), 'utf8')
+    const checkpoint = JSON.parse(checkpointText)
+    assert.deepEqual(checkpoint.audit[0].route, { provider: 'commandcode', model: 'deepseek/deepseek-v4-flash', reasoningEffort: 'high' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})

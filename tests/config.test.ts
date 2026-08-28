@@ -95,9 +95,11 @@ test('extraction.llm.route and reasoningEffort default empty and validate', () =
   assert.equal(legacy.extraction.llm.model, 'deepseek-v4-flash')
   assert.equal(legacy.extraction.llm.route, '')
 
+  // Model ids may contain a slash (pi-ai routes like commandcode/deepseek/deepseek-v4-flash),
+  // so 'provider/model-with/slash' is legal; only provider-less or empty-segment routes fail.
+  assert.equal(resolveConfig({ extraction: { llm: { route: 'a/b/c' } } }).extraction.llm.route, 'a/b/c')
   // Invalid routes fail loud.
   assert.throws(() => resolveConfig({ extraction: { llm: { route: 'nope' } } }), /route/)
-  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a/b/c' } } }), /route/)
   assert.throws(() => resolveConfig({ extraction: { llm: { route: '/model' } } }), /route/)
   assert.throws(() => resolveConfig({ extraction: { llm: { route: 'provider/' } } }), /route/)
   assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a\\b/c' } } }), /route/)
