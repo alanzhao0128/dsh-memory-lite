@@ -971,3 +971,12 @@ extraction:
 **验收**：tsc build + client.js `node --check` + 103/103 全绿。
 
 **注意**：客户端 `useModelOptions` 只在设置页打开时拉取（`api.llm.models` + agent-default scope），每次打开重新拉（本地内存查询，无网络开销）。推理强度下拉随选中模型联动；无 reasoning 元数据的模型只显示「跟随全局默认」。
+
+### 17.10 修复记录（2026-08-27，用户验收反馈：下拉只有"跟随全局默认"）
+
+用户重启后打开设置面板，提取模型下拉只有「跟随全局默认」，看不到任何模型。排查后两个根因：
+
+1. **dynamic 标记缺失**：FIELDS 里 route/reasoningEffort 两个 dynamic-select 项没写 `dynamic: 'route'` / `dynamic: 'effort'`，FieldRow 把两个都当成 effort 处理（`effortOptionsFor` 对未选 route 返回只有「跟随全局默认」）。修复：补上 dynamic 标记。
+2. **模型 id 本身含斜杠**：用户的 pi-ai 渠道（commandcode）模型 id 是 `deepseek/deepseek-v4-flash`（带 `/`），route 拼成 `commandcode/deepseek/deepseek-v4-flash`（三段）。config 的 route 校验原来要求恰好一个 `/`，会拒绝保存。修复：放宽为「provider = 第一个斜杠前，model = 剩余全部」，`resolveRoute` 本就按第一个斜杠拆分，天然兼容。
+
+附带：llm.models 拉取失败时 console.error 诊断日志（排查用）。测试 103 → 104（新增：config 接受 a/b/c 三段 route；extract 拆分斜杠模型 id）。
