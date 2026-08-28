@@ -980,3 +980,19 @@ extraction:
 2. **模型 id 本身含斜杠**：用户的 pi-ai 渠道（commandcode）模型 id 是 `deepseek/deepseek-v4-flash`（带 `/`），route 拼成 `commandcode/deepseek/deepseek-v4-flash`（三段）。config 的 route 校验原来要求恰好一个 `/`，会拒绝保存。修复：放宽为「provider = 第一个斜杠前，model = 剩余全部」，`resolveRoute` 本就按第一个斜杠拆分，天然兼容。
 
 附带：llm.models 拉取失败时 console.error 诊断日志（排查用）。测试 103 → 104（新增：config 接受 a/b/c 三段 route；extract 拆分斜杠模型 id）。
+
+### 17.11 提取空回复根因与修复（2026-08-28：reasoningEffort=high 吃光 maxTokens）
+
+**现象**：设置 `extraction.llm.reasoningEffort: high` 后，parse-error-recovered 率飙到 ~85%（commandcode/deepseek-v4-flash）。
+
+**诊断**（新增 failed-answers.log 落盘）：12 条失败记录全部 `error: extraction answer contains no JSON object` 且 **textLen=0（空文本）**。对照成功/失败 token 数：成功运行 output 502–631，失败运行 output 1173–1531。
+
+**根因**：`EXTRACTION_MAX_TOKENS = 1024` + `reasoningEffort: high` ——模型先把 1024 token 输出预算全花在推理（thinking）上，正文（JSON 决策）一个字都出不来 → 空回复 → parse 失败 → 走 repair（repair 输入短、推理短，所以能出正文，表现为 recover 后成功）。
+
+**修复**：`EXTRACTION_MAX_TOKENS` 1024 → 4096（commit 768ce42），给推理 + 正文都留空间。
+
+**验证**：重启后（03:48 起）5 次提取全部 `llmCalls=1` 直接成功，failed-answers 零新增。
+
+**附带发现**（旧代码下）：还有 6 条非空失败是"create decision requires category/title/content"（模型输出 JSON 但缺字段）；4096 后未再出现。
+
+**诊断设施**：`MemoryStore.appendFailedAnswer`（peers/{peer}/sessions/failed-answers.log，封顶滚动）——parse 失败时把原始模型输出落盘，便于排查同类问题。
