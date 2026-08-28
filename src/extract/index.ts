@@ -31,7 +31,12 @@ import { buildExtractionUser, extractionSystem } from './prompt.js'
 const DIGEST_MAX_TOKENS = 100
 const MAX_KEYWORDS = 8
 const MAX_GREP_HITS = 8
-const EXTRACTION_MAX_TOKENS = 1024
+// Bumped 1024 -> 4096 (2026-08-28): with extraction.llm.reasoningEffort = high
+// the model's reasoning pass consumed the whole 1024-token budget and the
+// answer text came back empty (every failed answer logged textLen=0), forcing
+// the repair path on ~85% of runs. 4096 leaves room for both reasoning and the
+// JSON decision body.
+const EXTRACTION_MAX_TOKENS = 4096
 
 interface Route {
   readonly provider: string
