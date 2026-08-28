@@ -371,6 +371,33 @@ export class MemoryStore {
     })
   }
 
+  /**
+   * Diagnostic: append one failed extraction answer (the raw model output that
+   * parseDecision rejected) to peers/{peer}/sessions/failed-answers.log, capped.
+   * Only written when the answer was not salvageable; used to debug parse-error
+   * spikes. Not part of the functional path — callers tolerate failures.
+   */
+  failedAnswerLogPath(peer: string): string {
+    return join(this.sessionsDir(peer), 'failed-answers.log')
+  }
+
+  appendFailedAnswer(peer: string, entry: object): Promise<void> {
+    const abs = this.failedAnswerLogPath(peer)
+    return this.queue.enqueue(async () => {
+      await ensureDir(dirname(abs))
+      let existing = ''
+      try {
+        existing = await readFileNode(abs, 'utf8')
+      } catch {
+        // first entry
+      }
+      const lines = existing === '' ? [] : existing.split('\n').filter(l => l.trim() !== '')
+      lines.push(JSON.stringify(entry))
+      if (lines.length > MAX_LOG_LINES) lines.splice(0, lines.length - MAX_LOG_LINES)
+      await writeFileAtomic(abs, lines.join('\n') + '\n', { mode: 0o600, dirMode: 0o700 })
+    }).catch(() => {})
+  }
+
   /** Soft-delete: move the file under root/.trash/<date>/, never overwriting. */
   softDelete(peer: string, relPath: string): Promise<void> {
     return this.queue.enqueue(async () => {

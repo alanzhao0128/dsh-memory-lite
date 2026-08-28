@@ -260,6 +260,17 @@ export async function extractOnce(
     decision = parseDecision(text)
   } catch (error) {
     const note = 'parse-error: ' + String(error).slice(0, 200)
+    // Diagnostic: persist the raw failed answer so a parse-error spike can be
+    // investigated (the model's output shape decides whether the repair is
+    // helping). Best-effort; never blocks the run.
+    void store.appendFailedAnswer(peer, {
+      at: new Date().toISOString(),
+      session: session.id,
+      win: [windowStart, windowEnd],
+      route: route === undefined ? null : route,
+      error: String(error).slice(0, 300),
+      text,
+    })
     // Bounded one-shot repair (Phase 2.1): re-ask the model to emit valid JSON
     // from the failed answer only — cheap, no window resend. A second failure
     // is accepted and the checkpoint still advances (no infinite retry loop).
