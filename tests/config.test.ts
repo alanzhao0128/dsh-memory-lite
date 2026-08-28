@@ -72,3 +72,33 @@ test('ui.headerOrder defaults to -1 and validates', () => {
   // Non-integers fail loud.
   assert.throws(() => resolveConfig({ ui: { headerOrder: 1.5 } }), /headerOrder/)
 })
+
+
+test('extraction.llm.route and reasoningEffort default empty and validate', () => {
+  // Defaults: empty route = follow the global default model.
+  const config = resolveConfig({})
+  assert.equal(config.extraction.llm.route, '')
+  assert.equal(config.extraction.llm.reasoningEffort, '')
+
+  // Explicit route resolves and effort passes through.
+  const explicit = resolveConfig({
+    extraction: { llm: { route: 'deepseek-official/deepseek-v4-flash', reasoningEffort: 'low' } },
+  })
+  assert.equal(explicit.extraction.llm.route, 'deepseek-official/deepseek-v4-flash')
+  assert.equal(explicit.extraction.llm.reasoningEffort, 'low')
+
+  // Legacy provider/model fields still resolve for pre-§17 configs.
+  const legacy = resolveConfig({
+    extraction: { llm: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } },
+  })
+  assert.equal(legacy.extraction.llm.provider, 'deepseek-official')
+  assert.equal(legacy.extraction.llm.model, 'deepseek-v4-flash')
+  assert.equal(legacy.extraction.llm.route, '')
+
+  // Invalid routes fail loud.
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'nope' } } }), /route/)
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a/b/c' } } }), /route/)
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: '/model' } } }), /route/)
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'provider/' } } }), /route/)
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a\\b/c' } } }), /route/)
+})

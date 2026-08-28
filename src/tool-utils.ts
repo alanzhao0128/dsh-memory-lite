@@ -14,6 +14,9 @@ import { peerForHeader } from './peer.js'
 export interface MemoryDeps {
   readonly config: () => ResolvedConfig
   readonly store: MemoryStore
+  /** Live global default model selection (agent-default-model), read when
+   *  extraction.llm.route is unset. Absent = fall back to session header. */
+  readonly defaultModel?: () => { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }
 }
 
 /** Reject calls from subagent sessions (locked decision; see IMPLEMENTATION.md §7). */

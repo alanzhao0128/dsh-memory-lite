@@ -858,3 +858,116 @@ agent-presets: { default: code }
 - 方案：client.js 新增 DEFAULTS 表（镜像 src/config.ts 全部默认值），渲染时 `readPath(value, path) ?? DEFAULTS[key]`。已用宿主 resolveConfig({}) 实测核对一致（root 显示 ~/.agent-memory 原始值，更友好）。
 - 语义：未覆盖字段显示默认值；保存时 draft 为空 → 不写（保持默认）；清空输入 → unset → 回默认。用户显式设置的值（如 settings.yaml 里 turnStoppingTrigger: false）仍显示实际值。
 - 测试 98 全绿。
+
+
+## 17. 隐式提取 LLM 模型可配置（Phase 6，2026-08-27 规划）
+
+### 17.1 需求（用户原话归纳）
+
+隐式提取（后台提取运行）的 LLM 调用，默认复用当前会话的渠道/模型。用户希望可配置，但**不做 baseURL/apiKey**——只做「选择 dsh 已注册的模型」+「推理强度」：
+
+1. **模型下拉**：渠道与模型合并成一个下拉（`<provider> / <model>` 形式，如 `DeepSeek / deepseek-v4-flash`），用户只选一次。
+2. **推理强度下拉**：选项不写死，**按所选模型的配置（adapter 声明的 reasoning.efforts）读取**；默认项 = 该模型的 default（不传 reasoningEffort，让 adapter 用 default）。
+3. **默认语义**（用户明确）：**配置为空 → 用全局默认模型（agent-default-model，活值）；配置了 → 固定用配置的，不随 agent-default-model 变化。**推理强度同理。
+4. 放弃"跟随当前会话模型"（用户拍板：用全局默认而非会话模型）。
+
+### 17.2 调研结论（2026-08-27 实查 harness 源码）
+
+- **`GenerateOptions`（dsh-llm）没有 baseURL/apiKey 字段**——自定义端点需自建 HTTP 客户端（方案 A），但用户明确不做，排除。
+- **已注册模型目录**：`api.llm.models` RPC（`dsh-host-apiproxy`）返回 `{ groups: [{ id, name, models: [{ id, name, description?, reasoning? }] }] }`——provider 分组 + 每模型携带 **reasoning 元数据**（efforts + defaultEffort），一次请求拿全，纯本地内存查询。
+- **全局默认模型**：`agent-default-model` settings 段（`ctx.agentDefaultModel.currentSelection()` 返回 provider/model/reasoningEffort）。用户观察：会话内切模型会**写回**该段 → 全局默认 = 最近一次切换的会话模型，是活值。
+- **客户端侧**：`dsh-client-ui-settings-models` 已消费 `api.llm.*`；官方已有 `llm.providers` / `llm.models` RPC，无需自建。
+- **推理强度**：模型级元数据（非 provider 级），`reasoning.efforts`（id/name/description）+ `defaultEffort`。deepseek 官方取值 `low|high|max`，但**下拉选项一律来自 adapter 声明**，不硬编码。
+
+### 17.3 配置形态
+
+在现有 `extraction.llm`（已有 `provider`/`model`）上扩展，**语义改为"已注册 route"**（不再有自定义端点）：
+
+```yaml
+extraction:
+  llm:
+    route: ""            # "provider/model"，如 "deepseek-official/deepseek-v4-flash"；空 = 用全局默认模型
+    reasoningEffort: ""  # 空 = 跟随全局默认的推理强度；否则存具体 effort id（如 "low"）
+```
+
+- `route` 取代原 `provider`/`model`（旧字段保留兼容读法，但面板只写 route）。
+- 两者皆空 → `resolveRoute()` 读 `ctx.agentDefaultModel.currentSelection()`。
+- 配置了 route → 固定用 route 的 provider/model；推理强度配置了 → 覆盖，否则用全局默认的（若配置模型不支持该 effort → 报错并回退）。
+
+### 17.4 生效时机
+
+- **live**：提取运行开始时读 `deps.config()`（现有机制），下一次触发即生效。
+- agent-default-model 是活值，未配置时每次运行都读当前值（非启动快照）。
+
+### 17.5 设置面板 UI
+
+记忆提取组新增子分组 **「提取模型」**（放在 提取内容 与 可靠性 之间）：
+
+1. **模型下拉**（`extraction.llm.route`）：
+   - 选项 = 「跟随全局默认（当前：<provider> / <model>）」 + `api.llm.models` 拼出的全部 `<provider> / <model>` 项。
+   - 选中"跟随全局默认" → 清空 route。
+2. **推理强度下拉**（`extraction.llm.reasoningEffort`）：
+   - 选中模型后，选项 = 该模型的 `reasoning.efforts`（label 用 name，可选带 description），首项「跟随全局默认」。
+   - 无 reasoning 元数据的模型 → 仅「跟随全局默认」并禁用。
+   - 数据来自 `api.llm.models` 返回里每个模型的 `reasoning`（无需额外 RPC）。
+
+### 17.6 实现改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `src/config.ts` | `ExtractionLlmConfig` 增加 `route?: string`、`reasoningEffort?: string`；`resolveConfig` 解析 route（校验格式 `provider/model`）、默认空；兼容读旧 `provider`/`model` |
+| `src/extract/index.ts` | `resolveRoute()` 改为：route 配置优先 → 否则 `ctx.agentDefaultModel.currentSelection()`（缺服务时回退现有 header 逻辑）；`callExtraction` 传 `reasoningEffort`（配置的或全局默认的，经 `validateConfig` 校验） |
+| `src/tool-utils.ts` | `MemoryDeps` 增加 `defaultModel?: () => {provider, model, reasoningEffort?}`（宿主注入） |
+| `lib/client.js` | 新子分组「提取模型」+ 两个下拉；拉取 `api.llm.models` + `api.agentDefaultModel.currentSelection()`（注入 `connection`）；DEFAULTS 表加 `extraction.llm.route`/`extraction.llm.reasoningEffort`（空串） |
+| `tests/` | `extract-decision`/`extract-boot` 增加 resolveRoute 用例（未配置→全局默认、配置→固定、推理强度传递）；config.test 加 route 校验；client.test 断言新字段 |
+| `IMPLEMENTATION.md` | §17 实施记录（实现后追加） |
+
+### 17.7 风险与已知限制
+
+- **推理强度是模型级的**：不同模型 efforts 不同，下拉选项随选中模型联动；若配置了 route 但该模型无 reasoning，则只显示「跟随全局默认」。
+- **`api.llm.models` 数据是静态 catalog**（adapter 声明），非会话实时——下拉选项不会随会话切换变化，但默认项「跟随全局默认」会。
+- 客户端调用 `api.llm.models` / `api.agentDefaultModel` 的注入路径实现时确认（`connection.api.*` 或注入 store），不影响方案。
+- 旧配置迁移：settings.yaml 当前未配 `extraction.llm`，无迁移需求；若用户已有 `llm.provider/model`（旧版）则兼容读取。
+
+### 17.8 验收标准
+
+1. 面板出现「提取模型」子分组，模型下拉含「跟随全局默认（当前：…）」+ 全部已注册 `<provider> / <model>`。
+2. 推理强度下拉选项 = 选中模型的 efforts（首项跟随全局默认）；无 efforts 的模型禁用。
+3. 未配置 → 提取日志 route 显示 agent-default-model 当前值；改全局默认后，下一次提取用新值。
+4. 配置 route → 提取日志 route 固定为配置值；改 agent-default-model 不影响。
+5. 推理强度配置 → 请求带该 effort；空 → 不带（adapter 用 default）。
+6. 测试全绿。
+
+### 17.9 实施记录（2026-08-27）
+
+**实现内容**：隐式提取模型选择（route + reasoningEffort），配置为空 → 全局默认模型（agent-default-model），配置了 → 固定。
+
+**宿主侧改动**：
+
+- `src/config.ts`：`ExtractionLlmConfig` 增加 `route?: string`（"provider/model"）、`reasoningEffort?: string`；保留旧 `provider`/`model` 兼容读法（§17 前配置）。`resolveConfig` 校验 route 格式（必须恰好一个 `/`，两端非空，不含反斜杠），非法抛错；route/reasoningEffort 默认空串。
+- `src/tool-utils.ts`：`MemoryDeps` 增加可选 `defaultModel?: () => {provider, model, reasoningEffort?}`（getter，每次运行读活值）。
+- `src/index.ts`：`apply()` 里从 `ctx.get('agentDefaultModel')` 取 `currentSelection()` 注入 deps.defaultModel（服务缺失/异常 → 返回空对象，回退会话 header）。
+- `src/extract/index.ts`：`resolveRoute()` 重写为三级优先级：
+  1. `extraction.llm.route` 显式配置（固定，忽略全局默认；effort 用配置的）
+  2. `deps.defaultModel()` 全局默认（活值；effort 用配置的，空则用全局默认的）
+  3. 回退会话 `requestHeader().config`（旧行为）
+  `Route` 增加 `reasoningEffort?`（`ReasoningEffortId` brand），`callExtraction` 透传给 `ctx.llm.stream`（`GenerateOptions.reasoningEffort`）。
+
+**客户端侧改动**（`lib/client.js`）：
+
+- FIELDS 新增 2 项（sub=「提取模型」，type=`dynamic-select`）：
+  - `extraction.llm.route`（模型下拉）：选项 = 「跟随全局默认（当前：<provider> / <model>）」+ `api.llm.models` 返回的全部 `<provider> / <model>`
+  - `extraction.llm.reasoningEffort`（推理强度下拉）：选项 = 「跟随全局默认」+ 选中模型的 `reasoning.efforts`（联动）
+- 新增 `useModelOptions(connection, agentDefaultScope)` hook：拉 `connection.api.llm.models({})` 拿 catalog；`settingsScope.bind({namespace:'agent-default-model'})` 读全局默认模型（活值，订阅刷新）。
+- 保存逻辑：dynamic-select 空串 → `unset`（回跟随全局默认）。
+- DEFAULTS 表加 `extraction.llm.route`/`extraction.llm.reasoningEffort`（空串）。
+
+**测试**（98 → 103）：
+
+- `config.test.ts`：route 默认空、合法解析、旧 provider/model 兼容、非法 route 抛错（无斜杠/多斜杠/空段/反斜杠）。
+- `extract-boot.test.ts`：3 个集成用例——未配置 → 用 deps.defaultModel（audit route 含 reasoningEffort）；配置 route → 固定（忽略全局默认，effort 用配置的）；无 route 无 defaultModel → 回退会话 header。
+- `client.test.ts`：apply 同时 bind `dsh-memory-lite` 和 `agent-default-model` 两个 namespace。
+
+**验收**：tsc build + client.js `node --check` + 103/103 全绿。
+
+**注意**：客户端 `useModelOptions` 只在设置页打开时拉取（`api.llm.models` + agent-default scope），每次打开重新拉（本地内存查询，无网络开销）。推理强度下拉随选中模型联动；无 reasoning 元数据的模型只显示「跟随全局默认」。

@@ -69,11 +69,15 @@ export interface SharingConfig {
   mounts: SharingMountConfig[]
 }
 
-/** Dedicated extraction model; when both are unset the session's current model is reused. */
+/** Extraction model selection: an explicit route wins; empty = the global default model (agent-default-model). */
 export interface ExtractionLlmConfig {
-  /** Provider route key, e.g. 'huoshan'. */
+  /** Combined "provider/model" route, e.g. 'deepseek-official/deepseek-v4-flash'. Empty = global default. */
+  route?: string
+  /** Adapter-owned reasoning effort id (e.g. 'low'); empty = follow the global default selection. */
+  reasoningEffort?: string
+  /** Legacy provider key (kept for compatibility with pre-§17 configs); superseded by route. */
   provider?: string
-  /** Exact model id, e.g. 'deepseek-v4-flash'. */
+  /** Legacy model id (kept for compatibility with pre-§17 configs); superseded by route. */
   model?: string
 }
 
@@ -95,7 +99,7 @@ export interface ExtractionConfig {
   includeDigest: boolean
   /** Grep existing memories for dedup/contradiction. Defaults to true. */
   dedup: boolean
-  /** Dedicated extraction model; unset = reuse the session's current model. */
+  /** Extraction model selection; empty route = the global default model (agent-default-model). */
   llm: ExtractionLlmConfig
   /** agent/turn-stopping backstop trigger. Defaults to true. */
   turnStoppingTrigger: boolean
@@ -164,6 +168,8 @@ export const Config: z<MemoryConfig> = z.object({
     includeDigest: z.boolean(),
     dedup: z.boolean(),
     llm: z.object({
+      route: z.string(),
+      reasoningEffort: z.string(),
       provider: z.string(),
       model: z.string(),
     }),
@@ -218,6 +224,8 @@ export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
     includeDigest: config.extraction?.includeDigest ?? true,
     dedup: config.extraction?.dedup ?? true,
     llm: {
+      route: config.extraction?.llm?.route ?? '',
+      reasoningEffort: config.extraction?.llm?.reasoningEffort ?? '',
       provider: config.extraction?.llm?.provider,
       model: config.extraction?.llm?.model,
     },
@@ -240,6 +248,13 @@ export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
   ] as const) {
     if (!Number.isInteger(value) || value < 0) {
       throw new Error(`dsh-memory-lite: extraction.${key} must be a non-negative integer, got ${value}`)
+    }
+  }
+  const llmRoute = extraction.llm.route
+  if (llmRoute !== '') {
+    const parts = llmRoute.split('/')
+    if (parts.length !== 2 || parts[0] === '' || parts[1] === '' || parts.some(part => part.includes('\\'))) {
+      throw new Error(`dsh-memory-lite: extraction.llm.route must be "provider/model", got ${JSON.stringify(llmRoute)}`)
     }
   }
   const sharing = {

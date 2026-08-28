@@ -63,7 +63,13 @@ function applyWith(): { entries: SlotEntry[]; inject: string[] } {
   const entries: SlotEntry[] = []
   const fakeCtx = {
     get: (name: string) => {
-      if (name === 'connection') return { rpc: { call: async () => ({ ok: true, value: null }) }, api: { settings: { mutate: async () => ({ result: { ok: true } }) } } }
+      if (name === 'connection') return {
+        rpc: { call: async () => ({ ok: true, value: null }) },
+        api: {
+          settings: { mutate: async () => ({ result: { ok: true } }) },
+          llm: { models: async () => ({ result: { ok: true, value: { groups: [], failures: [] } } }) },
+        },
+      }
       if (name === 'settingsScope') return { bind: () => fakeScope }
       return null
     },
@@ -94,4 +100,24 @@ test('client.js evaluates and registers the header indicator + settings page', (
 test('client.js binds the settingsScope namespace service', () => {
   const { inject } = applyWith()
   assert.ok(inject.includes('settingsScope'), 'inject declares settingsScope')
+})
+
+test('client.js binds both the memory-lite and agent-default-model scopes', () => {
+  const { factory } = loadClient()
+  const plugin = factory(fakeRequire) as { apply: (ctx: unknown) => void }
+  const bound: string[] = []
+  const fakeCtx = {
+    get: (name: string) => {
+      if (name === 'connection') return {
+        rpc: { call: async () => ({ ok: true, value: null }) },
+        api: { settings: { mutate: async () => ({ result: { ok: true } }) }, llm: { models: async () => ({ result: { ok: true, value: { groups: [], failures: [] } } }) } },
+      }
+      if (name === 'settingsScope') return { bind: (opts: { namespace: string }) => { bound.push(opts.namespace); return fakeScope } }
+      return null
+    },
+    slots: { inject: () => {}, register: (opts: SlotEntry, component: unknown) => ({ ...opts, component }) },
+  }
+  plugin.apply(fakeCtx, {})
+  assert.ok(bound.includes('dsh-memory-lite'), 'memory-lite namespace bound')
+  assert.ok(bound.includes('agent-default-model'), 'agent-default-model namespace bound for the model dropdown')
 })

@@ -52,7 +52,16 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // deps getter sees the newest value without re-registering.
   let live: ResolvedConfig = resolveConfig(config)
   const store = new MemoryStore(live.root, live.sharing)
-  const deps: MemoryDeps = { config: () => live, store }
+  const defaultModel = (): { provider: string; model: string; reasoningEffort?: string } => {
+    const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string; reasoningEffort?: string } } | undefined
+    if (svc?.currentSelection === undefined) return { provider: '', model: '' }
+    try {
+      return svc.currentSelection()
+    } catch {
+      return { provider: '', model: '' }
+    }
+  }
+  const deps: MemoryDeps = { config: () => live, store, defaultModel }
   const readTool = applyReadMemoryTool(ctx, deps)
   applySearchMemoryTool(ctx, deps)
   applyRememberTool(ctx, deps)

@@ -240,3 +240,95 @@ test('/memory-status RPC channel serves the tracker snapshot', async () => {
   }
 })
 
+
+
+test('extractOnce uses the global default model when route is unset (§17)', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}'))
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const session = sessionLike('session-global-default', 30)
+    // No extraction.llm.route; deps.defaultModel supplies the global default.
+    const defaultModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
+    await extractOnce(
+      session,
+      { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null },
+      ctx,
+      { config: () => config, store, defaultModel },
+      new AbortController().signal,
+      createStatusTracker(),
+    )
+
+    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-global-default.json'), 'utf8')
+    const checkpoint = JSON.parse(checkpointText)
+    assert.deepEqual(checkpoint.audit[0].route, { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('extractOnce prefers an explicit route over the global default and passes the effort (§17)', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => mockStreamText('{"decision":"skip"}'))
+    const store = new MemoryStore(tmp)
+    // Route configured: fixed, ignores the global default.
+    const config = resolveConfig({
+      root: tmp,
+      defaultPeer: 'test-peer',
+      extraction: { llm: { route: 'huoshan/deepseek-v4-flash', reasoningEffort: 'high' } },
+    })
+    const session = sessionLike('session-explicit-route', 30)
+    const defaultModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'max' })
+    await extractOnce(
+      session,
+      { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null },
+      ctx,
+      { config: () => config, store, defaultModel },
+      new AbortController().signal,
+      createStatusTracker(),
+    )
+
+    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-explicit-route.json'), 'utf8')
+    const checkpoint = JSON.parse(checkpointText)
+    assert.deepEqual(checkpoint.audit[0].route, { provider: 'huoshan', model: 'deepseek-v4-flash', reasoningEffort: 'high' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('extractOnce falls back to the session header when no route and no global default (§17)', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => mockStreamText('{"decision":"skip"}'))
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const session = sessionLike('session-header-fallback', 30)
+    // defaultModel returns empty (e.g. service absent) -> falls back to requestHeader.
+    const defaultModel = () => ({ provider: '', model: '' })
+    await extractOnce(
+      session,
+      { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null },
+      ctx,
+      { config: () => config, store, defaultModel },
+      new AbortController().signal,
+      createStatusTracker(),
+    )
+
+    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-header-fallback.json'), 'utf8')
+    const checkpoint = JSON.parse(checkpointText)
+    assert.deepEqual(checkpoint.audit[0].route, { provider: 'huoshan', model: 'deepseek-v4-flash' })
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})

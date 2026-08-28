@@ -12,7 +12,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/cordis-plugin-timer'
 import type { MemoryStore } from '../memory-store.js'
@@ -36,6 +36,8 @@ const EXTRACTION_MAX_TOKENS = 1024
 interface Route {
   readonly provider: string
   readonly model: string
+  /** Adapter-owned reasoning effort; absent = adapter/provider default. */
+  readonly reasoningEffort?: import('@deepseek-ai/dsh-llm').ReasoningEffortId
 }
 
 interface GrepHit {
@@ -228,7 +230,7 @@ export async function extractOnce(
 
   const startedAt = Date.now()
   const metrics: RunMetrics = { llmCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
-  const route = resolveRoute(ext.llm.provider, ext.llm.model, session)
+  const route = resolveRoute(ext.llm.route, ext.llm.reasoningEffort, deps.defaultModel, session)
   const rc: RunRecordCtx = {
     ctx, state, store, peer, sessionId: session.id, windowStart, windowEnd, hits, route, metrics, startedAt,
     auditLog: ext.auditLog, tracker,
@@ -415,14 +417,44 @@ export async function applyDecision(
   }
 }
 
-/** Model route: dedicated config wins, else the session's current model. */
+/**
+ * Model route resolution order (§17):
+ * 1. extraction.llm.route (explicit "provider/model") — fixed, ignores the global default.
+ * 2. The global default model selection (agent-default-model), read live each run.
+ * 3. Fallback: the session's current request-header model (legacy behavior).
+ * Reasoning effort travels with whichever route won: explicit config first,
+ * else the selection's own effort.
+ */
 function resolveRoute(
-  configuredProvider: string | undefined,
-  configuredModel: string | undefined,
+  configuredRoute: string | undefined,
+  configuredEffort: string | undefined,
+  defaultModel: (() => { readonly provider: string; readonly model: string; readonly reasoningEffort?: string }) | undefined,
   session: ExtractionSessionLike,
 ): Route | undefined {
-  if (configuredProvider !== undefined && configuredModel !== undefined) {
-    return { provider: configuredProvider, model: configuredModel }
+  if (configuredRoute !== undefined && configuredRoute !== '') {
+    const slash = configuredRoute.indexOf('/')
+    if (slash > 0 && slash < configuredRoute.length - 1) {
+      return {
+        provider: configuredRoute.slice(0, slash),
+        model: configuredRoute.slice(slash + 1),
+        ...(configuredEffort !== undefined && configuredEffort !== '' ? { reasoningEffort: ReasoningEffortId(configuredEffort) } : {}),
+      }
+    }
+  }
+  if (defaultModel !== undefined) {
+    const selection = defaultModel()
+    if (selection !== undefined && selection.provider !== '' && selection.model !== '') {
+      return {
+        provider: selection.provider,
+        model: selection.model,
+        ...(configuredEffort !== undefined && configuredEffort !== '' ? { reasoningEffort: ReasoningEffortId(configuredEffort) } : {}),
+        ...(configuredEffort === undefined || configuredEffort === ''
+          ? selection.reasoningEffort !== undefined && selection.reasoningEffort !== ''
+            ? { reasoningEffort: ReasoningEffortId(selection.reasoningEffort) }
+            : {}
+          : {}),
+      }
+    }
   }
   const headerConfig = session.requestHeader()?.config
   if (headerConfig !== undefined && headerConfig.provider !== undefined && headerConfig.model !== undefined) {
@@ -464,6 +496,7 @@ async function callExtraction(
   const options = {
     provider: route.provider,
     model: route.model,
+    ...(route.reasoningEffort !== undefined ? { reasoningEffort: route.reasoningEffort } : {}),
     messages: [createUserMessage({
       content: [{ type: 'text', text: user }],
       source: { kind: 'plugin', plugin: 'dsh-memory-lite' },
