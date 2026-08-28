@@ -232,6 +232,10 @@ export async function extractOnce(
     const keywords = extractKeywords(windowText, MAX_KEYWORDS)
     hits = await grepHits(store, peer, keywords, MAX_GREP_HITS)
   }
+  // Full-memory index for de-fragmentation: lets the model merge into an
+  // existing file instead of creating a new one for the same topic. Already
+  // sorted newest-first; read failures fall back to an empty index.
+  const indexEntries = await store.readIndex(peer).catch(() => [])
 
   const startedAt = Date.now()
   const metrics: RunMetrics = { llmCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
@@ -246,7 +250,12 @@ export async function extractOnce(
   }
 
   const system = extractionSystem()
-  const user = buildExtractionUser(state.checkpoint.digest === '' ? undefined : state.checkpoint.digest, windowText, hits)
+  const user = buildExtractionUser(
+    state.checkpoint.digest === '' ? undefined : state.checkpoint.digest,
+    windowText,
+    indexEntries,
+    hits,
+  )
   let text = ''
   try {
     metrics.llmCalls += 1

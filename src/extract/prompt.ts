@@ -30,6 +30,12 @@ export function extractionSystem(): string {
     '',
     'PRIORITY: when in doubt, prefer skip over create. Only record facts/decisions that would still be useful to a future agent weeks later. If a window is mostly process, skip is the correct answer.',
     '',
+    'EXISTING MEMORY RULES (the user turn lists the memory index of existing files):',
+    '- Before create, check the index. If an existing file covers the same topic (same entity/project/event/person), use merge into that file instead of create.',
+    '- create only when no existing file covers the topic.',
+    '- merge must add only NEW facts not already present in that file (no duplicates).',
+    '- If the new fact contradicts an existing file, use update (old content moves to History).',
+    '',
     'Reply with exactly ONE JSON object matching this schema (choose one of the four):',
     '{"decision":"create","category":"preferences|entities|events|experiences","title":"...","content":"..."}',
     '{"decision":"merge","path":"...","content":"..."}',
@@ -45,10 +51,17 @@ export function extractionSystem(): string {
   ].join('\n')
 }
 
-/** The user turn: digest + window + existing hits. */
+/** One line of the memory index: path plus one-line summary. */
+export interface IndexEntryLike {
+  readonly path: string
+  readonly summary: string
+}
+
+/** The user turn: digest + window + memory index + existing hits. */
 export function buildExtractionUser(
   digest: string | undefined,
   windowText: string,
+  indexEntries: readonly IndexEntryLike[],
   grepHits: readonly GrepHitLike[],
 ): string {
   const sections: string[] = []
@@ -56,6 +69,9 @@ export function buildExtractionUser(
     sections.push('## 会话滚动摘要（前序窗口）', digest)
   }
   sections.push('## 本轮对话窗口', windowText)
+  if (indexEntries.length > 0) {
+    sections.push('## 记忆库现有文件（全库索引）', indexEntries.map(entry => `- ${entry.path}: ${entry.summary}`).join('\n'))
+  }
   if (grepHits.length > 0) {
     sections.push('## 已存在的相关记忆（grep 命中）', grepHits.map(hit => `- ${hit.path}: ${hit.line}`).join('\n'))
   }
