@@ -187,6 +187,16 @@ export class MemoryStore {
     return join(this.root, 'peers')
   }
 
+  /** Existing peer directory names (plain names, no path), tolerant of a missing/empty root. */
+  async listPeers(): Promise<string[]> {
+    try {
+      const entries = await readdir(this.peersDir(), { withFileTypes: true })
+      return entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name)
+    } catch {
+      return []
+    }
+  }
+
   memoriesRoot(peer: string): string {
     return join(this.root, 'peers', peer, 'memories')
   }

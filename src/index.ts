@@ -94,5 +94,19 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
     }),
     { authority: 'loopback' },
   )
+
+  // Settings UI: list existing peers so sharing.mounts can be edited as
+  // checkboxes instead of raw YAML (IMPLEMENTATION.md §16.9 known limit).
+  ctx.connection.rpc.handle(
+    '/memory-peers',
+    async (_endpoint, _payload, _signal) => ({
+      ok: true,
+      value: {
+        peers: await store.listPeers(),
+        mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
+      },
+    }),
+    { authority: 'loopback' },
+  )
   ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
 }

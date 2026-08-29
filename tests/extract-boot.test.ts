@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -234,6 +234,33 @@ test('/memory-status RPC channel serves the tracker snapshot', async () => {
     // Fresh tracker in the booted plugin: no data yet = ok (green).
     assert.equal(result.value.status, 'ok')
     assert.equal(result.value.last, null)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('/memory-peers RPC channel lists peers and configured mounts', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  // Seed two peer directories so the RPC has something to list.
+  await mkdir(join(tmp, 'peers', 'alpha-12345678', 'memories'), { recursive: true })
+  await mkdir(join(tmp, 'peers', 'beta-87654321', 'memories'), { recursive: true })
+  const ctx = await bootCtx(tmp)
+  try {
+    const conn = ctx.get('connection') as FakeConnectionService
+    const handler = conn.handlers.get('/memory-peers')
+    assert.ok(handler, 'memory-lite registered the /memory-peers channel')
+    const result = await handler!('snapshot', {}, new AbortController().signal) as {
+      ok: boolean
+      value: { peers: string[]; mounts: Array<{ name: string; peer: string; subpath: string; readonly: boolean }> }
+    }
+    assert.equal(result.ok, true)
+    const peers = result.value.peers
+    assert.ok(peers.includes('alpha-12345678'), 'lists alpha peer: ' + peers.join(','))
+    assert.ok(peers.includes('beta-87654321'), 'lists beta peer: ' + peers.join(','))
+    // No mounts configured in the boot row config -> empty mounts list.
+    assert.deepEqual(result.value.mounts, [])
   } finally {
     await ctx.fiber.dispose()
     await rm(tmp, { recursive: true, force: true })
