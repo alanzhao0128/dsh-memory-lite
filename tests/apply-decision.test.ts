@@ -53,3 +53,17 @@ test('create writes a new file when none exists', async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('create strips a trailing .md from the title (no double extension)', async () => {
+  const { store, root, peer } = await makeStore()
+  try {
+    const path = await applyDecision(store, peer, {
+      kind: 'create', category: 'entities', title: 'officecli 说明.md', content: '官方原版',
+    })
+    assert.equal(path, 'entities/officecli-说明.md')
+    const text = await readFile(join(root, 'peers', peer, 'memories', 'entities', 'officecli-说明.md'), 'utf8')
+    assert.match(text, /- 官方原版/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

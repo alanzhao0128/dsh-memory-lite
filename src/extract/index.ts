@@ -417,7 +417,10 @@ export async function applyDecision(
       if (!MEMORY_CATEGORIES.includes(decision.category as never)) {
         throw new Error('unknown category: ' + decision.category)
       }
-      const path = decision.category + '/' + slugify(decision.title) + '.md'
+      // Model sometimes writes a title ending in ".md"; strip it so the
+      // slug does not produce a double extension (e.g. foo.md.md).
+      const title = decision.title.replace(/\.md$/i, '')
+      const path = decision.category + '/' + slugify(title) + '.md'
       // Conservative implicit-channel rule: never overwrite an existing memory
       // (it may hold explicit user content); merge into it instead.
       if (await store.fileExists(peer, path)) {
