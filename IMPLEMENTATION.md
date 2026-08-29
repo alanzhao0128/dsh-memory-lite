@@ -654,6 +654,19 @@ package.json：dsh.client + exports["./client"]
 - client.js 新增 DEFAULTS 表（镜像 config.ts）；渲染时 `readPath ?? DEFAULTS[key]`。
 - 语义：未覆盖显示默认值；保存时 draft 空 → 不写；清空 → unset → 回默认。
 
+### 16.13 共享挂载勾选式 UI（2026-08-29，commit fc81ad1）
+
+**背景**：此前 sharing.mounts 只能手改 settings.yaml（§16.9 已知限制）。用户提出：把每个工作区列出来打钩即可。
+
+**语义澄清**（用户确认）：sharing.mounts 是**全局配置**，与当前会话在哪个工作区无关——每条挂载 = 「该 peer 的记忆对所有工作区会话只读公开」。列表平铺全部 peer，无"当前"概念；代码里 `mount.peer === peer` 跳过自访问只是读取时的防御，配置时不需要排除任何 peer。
+
+**实现**：
+- 后端：`MemoryStore.listPeers()`（扫描 `peers/` 目录，容忍缺失）+ 新 RPC `/memory-peers`（loopback 权威，返回 `{ peers, mounts }`，只列目录名不读内容）。
+- 前端：设置面板「存储与共享」组的只读块 → 每 peer 一个 checkbox；挂载时拉 `/memory-peers`，当前 mounts 默认勾选；勾选变化 → 保存时组装 `sharing.mounts`（`{name, peer, subpath:'', readonly:true}`）走现有 settings mutate（revision 保护）；保存/放弃后状态重置；RPC 失败降级显示错误。
+- 测试：新增 /memory-peers boot 测试（预置 2 个 peer 断言列表 + 空 mounts），107 → 107 全绿（新增 1 例）。
+
+**生效**：后端重启 dsh；前端刷新浏览器。
+
 ---
 
 ## 17. 隐式提取 LLM 模型可配置（Phase 6，2026-08-27 规划）
