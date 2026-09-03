@@ -11,7 +11,7 @@ Design: [《Light Memory for DSH 设计方案》](https://github.com/deepseek-ai
 Install into a profile and add it to that profile's bundle list:
 
 ```sh
-dsh plugin --profile web add dsh-memory-lite
+dsh plugin --profile web add @alanzhao/dsh-memory-lite
 ```
 
 or, for a local checkout, add a linked dependency and bundle:
@@ -19,8 +19,8 @@ or, for a local checkout, add a linked dependency and bundle:
 ```jsonc
 // $DSH_HOME/profiles/web/package.json
 {
-  "dependencies": { "dsh-memory-lite": "link:/path/to/dsh-memory-lite" },
-  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-memory-lite"] } }
+  "dependencies": { "@alanzhao/dsh-memory-lite": "^0.1.1" },
+  "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@alanzhao/dsh-memory-lite"] } }
 }
 ```
 
@@ -34,7 +34,7 @@ The plugin row in `cordis.patch.yml` carries **no configuration** (mount only); 
 
 ```yaml
 - id: memory-lite
-  name: dsh-memory-lite
+  name: @alanzhao/dsh-memory-lite
   # config:            # optional deployment defaults; settings override
   #   root: '~/.agent-memory'
   #   defaultPeer: dsh-web
