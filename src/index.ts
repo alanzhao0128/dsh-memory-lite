@@ -22,7 +22,10 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-client-connection'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+// dsh-settings >= 0.1.2 exposes SettingsProvider.installSection (the old
+// module-level installSettingsSection moved onto the provider). The host
+// settings service is that provider, so we call the method directly.
+import type { SettingsProvider, SettingsSectionHooks } from '@deepseek-ai/dsh-settings'
 import { Config, resolveConfig } from './config.js'
 import type { MemoryConfig, ResolvedConfig } from './config.js'
 import { MemoryStore } from './memory-store.js'
@@ -44,6 +47,23 @@ export const name = 'dsh-memory-lite'
 export const inject = ['tools', 'agents', 'llm', 'timer', 'connection']
 
 export { Config }
+
+/**
+ * Install the memory-lite settings namespace on the host SettingsProvider
+ * (dsh-settings >= 0.1.2). `installSection` registers the namespace with the
+ * composition entry as the base layer, points the source thunk at the
+ * resolved scope, and falls back to the entry when the service detaches.
+ *
+ * Rides ctx.inject so an absent settings service (host without one) is a
+ * silent no-op rather than a hard inject failure.
+ */
+function installSettingsCompat<T>(ctx: Context, ns: string, schema: unknown, entry: T, hooks: SettingsSectionHooks<T>): void {
+  void ctx.inject(['settings'], (sctx) => {
+    const settings = sctx.settings as SettingsProvider | undefined
+    if (settings === undefined) return
+    settings.installSection(sctx, ns as never, schema as never, entry, hooks)
+  })
+}
 
 /** Register the memory capability for the lifetime of `ctx`. */
 export function apply(ctx: Context, config: MemoryConfig = {}): void {
@@ -77,7 +97,7 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // snapshot (restart-applies — MemoryStore holds them at construction); every
   // other field resolves live on each change.
   let source: () => MemoryConfig = () => config
-  installSettingsSection(ctx, settingsNamespace('dsh-memory-lite'), Config, config, {
+  installSettingsCompat(ctx, 'dsh-memory-lite', Config, config, {
     setSource: (get) => { source = get },
     onChange: () => {
       const next = resolveConfig(source())
@@ -92,7 +112,6 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       ok: true,
       value: tracker.snapshot(live.extraction.mode),
     }),
-    { authority: 'loopback' },
   )
 
   // Settings UI: list existing peers so sharing.mounts can be edited as
@@ -106,7 +125,59 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
         mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
       },
     }),
-    { authority: 'loopback' },
+  )
+
+  // Settings UI: model catalog for the extraction-model dropdown (§17). rc.1
+  // removed the browser connection.api.llm.models aggregate; rebuild the same
+  // {groups:[{id,name,models:[{id,name,reasoning?}]}]} shape host-side from
+  // ctx.llm (listProviders + listModels + resolveModelInfo) so the client
+  // settings page keeps working across host versions over our own RPC.
+  ctx.connection.rpc.handle(
+    '/memory-models',
+    async (_endpoint, _payload, _signal) => {
+      const groups: unknown[] = []
+      try {
+        const llm = ctx.llm as {
+          listProviders?: () => readonly { readonly id: string; readonly name: string }[]
+          listModels?: (provider: string) => Promise<readonly { readonly id: string; readonly name: string; readonly description?: string }[]>
+          resolveModelInfo?: (provider: string, model: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }>
+        } | undefined
+        if (llm?.listProviders !== undefined) {
+          const providers = llm.listProviders()
+          for (const provider of providers) {
+            const models = llm.listModels !== undefined ? await llm.listModels(provider.id) : []
+            groups.push({ id: provider.id, name: provider.name, models })
+          }
+        }
+      } catch (error) {
+        ctx.logger.warn('dsh-memory-lite: /memory-models failed: ' + String(error))
+      }
+      return { ok: true, value: { groups } }
+    },
+  )
+
+  // Per-route reasoning efforts for the effort dropdown: resolved lazily so
+  // the catalog RPC stays cheap (resolveModelInfo per model would be N calls).
+  ctx.connection.rpc.handle(
+    '/memory-model-efforts',
+    async (_endpoint, payload, _signal) => {
+      const route = String((payload as { route?: unknown } | null)?.route ?? '')
+      const slash = route.indexOf('/')
+      if (slash <= 0) return { ok: true, value: { efforts: [], defaultEffort: undefined } }
+      const provider = route.slice(0, slash)
+      const model = route.slice(slash + 1)
+      let efforts: readonly { readonly id: string; readonly name: string; readonly description?: string }[] = []
+      let defaultEffort: string | undefined
+      try {
+        const llm = ctx.llm as { resolveModelInfo?: (p: string, m: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }> } | undefined
+        const info = llm?.resolveModelInfo !== undefined ? await llm.resolveModelInfo(provider, model) : undefined
+        efforts = info?.reasoning?.efforts ?? []
+        defaultEffort = info?.reasoning?.defaultEffort
+      } catch (error) {
+        ctx.logger.warn('dsh-memory-lite: /memory-model-efforts failed: ' + String(error))
+      }
+      return { ok: true, value: { efforts, defaultEffort } }
+    },
   )
   ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
 }

@@ -89,8 +89,16 @@ interface ExtractionState {
 export interface ExtractionSessionLike {
   readonly id: string
   readonly header: { readonly cwd?: string; readonly origin?: 'subagent' }
-  readonly events: readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
+  /** dsh-session <= 0.1.1 exposed the full log as `events`; >= 0.1.2 uses snapshotEvents(). */
+  readonly events?: readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
+  snapshotEvents?(fromSeq?: number, toSeqExclusive?: number): readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
   requestHeader(): { readonly config?: { readonly provider?: string; readonly model?: string } } | undefined
+}
+
+/** Read a session's full event log across dsh-session versions (events vs snapshotEvents). */
+function sessionEvents(session: ExtractionSessionLike): readonly { readonly type: string; readonly seq: number; readonly data: unknown }[] {
+  if (session.snapshotEvents !== undefined) return session.snapshotEvents()
+  return session.events ?? []
 }
 
 /** Register the extraction channel for the lifetime of `ctx`. */
@@ -220,7 +228,7 @@ export async function extractOnce(
     if (raw !== undefined) state.checkpoint = parseCheckpoint(raw)
   }
   const fromSeq = state.checkpoint.checkpoint.seq
-  const events = session.events
+  const events = sessionEvents(session)
   const windowEvents = selectWindow(events, fromSeq, ext.maxMessages)
   if (windowEvents.length === 0) return
   const windowStart = windowEvents[0]!.seq

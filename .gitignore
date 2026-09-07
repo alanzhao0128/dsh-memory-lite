@@ -21,3 +21,4 @@ lib/*
 .idea/
 .vscode/
 *.swp
+.npmrc

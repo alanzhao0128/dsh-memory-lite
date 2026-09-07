@@ -104,7 +104,12 @@ export function readCatalogEntries(source: unknown): readonly IndexEntry[] | und
  */
 export function catalogHistory(agent: Agent): { visibleDigest?: string; published: boolean } {
   const visible = new Set(agent.session.surface.nodes)
-  const events = agent.session.events
+  // dsh-session >= 0.1.2 replaced the `events` property with snapshotEvents()
+  // and narrowed seq to a branded SessionSeq; both shapes are read-only event
+  // arrays with {type, seq, data} and seq stays comparable with surface.nodes.
+  type EventLike = { type: string; seq: unknown; data: { source?: { kind?: unknown } } }
+  const sessionAny = agent.session as { events?: readonly EventLike[]; snapshotEvents?: () => readonly EventLike[] }
+  const events = sessionAny.snapshotEvents !== undefined ? sessionAny.snapshotEvents() : (sessionAny.events ?? [])
   for (let index = events.length - 1; index >= 0; index -= 1) {
     // The loop bound proves the read-only event view contains this index.
     const event = events[index]!
@@ -113,7 +118,7 @@ export function catalogHistory(agent: Agent): { visibleDigest?: string; publishe
     if (typeof source !== 'object' || source === null || source.kind !== 'memory-catalog') continue
     const entries = readCatalogEntries(source)
     if (entries === undefined) continue
-    if (visible.has(event.seq)) return { visibleDigest: digestIndexEntries(entries), published: true }
+    if (visible.has(event.seq as never)) return { visibleDigest: digestIndexEntries(entries), published: true }
     return { published: true }
   }
   return { published: false }
