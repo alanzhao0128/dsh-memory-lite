@@ -6,4 +6,4 @@
 # config documented in README.md.
 - insert:
     - id: memory-lite
-      name: @alanzhao/dsh-memory-lite
+      name: "@alanzhao/dsh-memory-lite"
