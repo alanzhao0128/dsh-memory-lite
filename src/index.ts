@@ -21,7 +21,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-client-connection'
+import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
 // dsh-settings >= 0.1.2 exposes SettingsProvider.installSection (the old
 // module-level installSettingsSection moved onto the provider). The host
 // settings service is that provider, so we call the method directly.
@@ -29,6 +29,7 @@ import type { SettingsProvider, SettingsSectionHooks } from '@deepseek-ai/dsh-se
 import { Config, resolveConfig } from './config.js'
 import type { MemoryConfig, ResolvedConfig } from './config.js'
 import { MemoryStore } from './memory-store.js'
+import { peerForHeader } from './peer.js'
 import type { MemoryDeps } from './tool-utils.js'
 import { applyReadMemoryTool } from './tools/read-memory.js'
 import { applySearchMemoryTool } from './tools/search-memory.js'
@@ -65,6 +66,78 @@ function installSettingsCompat<T>(ctx: Context, ns: string, schema: unknown, ent
   })
 }
 
+interface ClientRequestEnvelope {
+  readonly type: 'client-request'
+  readonly rpcId: string
+  readonly method: string
+  readonly payload: unknown
+}
+
+function isClientRequest(value: unknown): value is ClientRequestEnvelope {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return record.type === 'client-request' && typeof record.rpcId === 'string' && typeof record.method === 'string'
+}
+
+function rpcErrorResponse(rpcId: string, code: string, message: string, status: number): Response {
+  return Response.json({
+    type: 'server-response',
+    rpcId,
+    result: { ok: false, error: { code, message, details: {} } },
+  }, { status })
+}
+
+function rpcSuccessResponse(rpcId: string, result: unknown): Response {
+  return Response.json({ type: 'server-response', rpcId, result })
+}
+
+/**
+ * dsh 0.1.5 channel migration: connection.rpc.handle 对第三方插件不可用
+ * （官方 #5926：connection 顶层 inject 不再声明 webServer，注册时抛
+ * "cannot get property webServer without inject"，master 未修）。插件 RPC
+ * 改为 /api 共享通道的精确 Fetch 路由（connection.fetch.register），信封
+ * 协议与旧 rpc.handle 一致（复刻官方 rpcFetchHandler）。
+ *
+ * 与官方 rpcFetchHandler 的差异（有意）：handler 抛错时返回 200 + 结构化
+ * error envelope（官方为 500 纯文本），让浏览器端 rpc.call 能拿到
+ * { ok:false, error } 而不是 transport failure。
+ */
+function rpcRoute(
+  endpoint: string,
+  handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
+): ConnectionFetchRoute {
+  return {
+    path: '/api/' + endpoint,
+    methods: ['POST'],
+    requestBody: 'buffered',
+    fetch: async (request: Request): Promise<Response> => {
+      if (request.method !== 'POST') return new Response('not found', { status: 404 })
+      const mediaType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+      if (mediaType !== 'application/json') {
+        return new Response('content type must be application/json', { status: 415 })
+      }
+      let message: unknown
+      try {
+        message = await request.json()
+      } catch {
+        return new Response('body is not JSON', { status: 400 })
+      }
+      if (!isClientRequest(message)) {
+        return rpcErrorResponse('invalid-request', 'gateway/bad-request', 'invalid client-request message', 400)
+      }
+      if (message.method !== endpoint) {
+        return rpcErrorResponse(message.rpcId, 'gateway/bad-request', 'method ' + JSON.stringify(message.method) + ' does not match endpoint ' + JSON.stringify(endpoint), 400)
+      }
+      try {
+        const result = await handler(endpoint, message.payload, request.signal)
+        return rpcSuccessResponse(message.rpcId, result)
+      } catch (error) {
+        return rpcErrorResponse(message.rpcId, 'gateway/internal', 'handler failure: ' + String(error), 200)
+      }
+    },
+  }
+}
+
 /** Register the memory capability for the lifetime of `ctx`. */
 export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // The live config is a mutable reference; settings changes swap it in place
@@ -91,6 +164,17 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   const tracker = createStatusTracker()
   applyExtraction(ctx, deps, tracker)
 
+  // Peer UI annotations: whenever a session with a working directory is seen,
+  // ensure its peer carries a human-readable displayName (e.g. 健康分析 behind
+  // workspace-aad65ea5). Idempotent and async — rememberPeerCwd reads first
+  // and writes exactly once per peer.
+  ctx.on('session/event', (session) => {
+    const header = session.header as { cwd?: string; origin?: string } | undefined
+    if (header?.cwd === undefined || header?.origin === 'subagent') return
+    const peer = peerForHeader(header as Parameters<typeof peerForHeader>[0], live)
+    void store.rememberPeerCwd(peer, header.cwd)
+  })
+
   // Settings-backed overrides (方案 A, IMPLEMENTATION.md §16): the cordis row
   // config is the composition base; user edits land in ~/.dsh/settings.yaml
   // under the dsh-memory-lite namespace. root/sharing stay pinned to the store
@@ -106,25 +190,25 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   })
 
   // Browser indicator channel: the header dot polls this snapshot.
-  ctx.connection.rpc.handle(
-    '/memory-status',
-    async (_endpoint, _payload, _signal) => ({
+  ctx.effect(
+    () => ctx.connection.fetch.register(rpcRoute('memory-status/snapshot', async (_endpoint, _payload, _signal) => ({
       ok: true,
       value: tracker.snapshot(live.extraction.mode),
-    }),
+    }))),
+    'dsh-memory-lite: /api/memory-status/snapshot',
   )
 
   // Settings UI: list existing peers so sharing.mounts can be edited as
   // checkboxes instead of raw YAML (IMPLEMENTATION.md §16.9 known limit).
-  ctx.connection.rpc.handle(
-    '/memory-peers',
-    async (_endpoint, _payload, _signal) => ({
+  ctx.effect(
+    () => ctx.connection.fetch.register(rpcRoute('memory-peers/snapshot', async (_endpoint, _payload, _signal) => ({
       ok: true,
       value: {
         peers: await store.listPeers(),
         mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
       },
-    }),
+    }))),
+    'dsh-memory-lite: /api/memory-peers/snapshot',
   )
 
   // Settings UI: model catalog for the extraction-model dropdown (§17). rc.1
@@ -132,9 +216,8 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // {groups:[{id,name,models:[{id,name,reasoning?}]}]} shape host-side from
   // ctx.llm (listProviders + listModels + resolveModelInfo) so the client
   // settings page keeps working across host versions over our own RPC.
-  ctx.connection.rpc.handle(
-    '/memory-models',
-    async (_endpoint, _payload, _signal) => {
+  ctx.effect(
+    () => ctx.connection.fetch.register(rpcRoute('memory-models/snapshot', async (_endpoint, _payload, _signal) => {
       const groups: unknown[] = []
       try {
         const llm = ctx.llm as {
@@ -153,14 +236,14 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
         ctx.logger.warn('dsh-memory-lite: /memory-models failed: ' + String(error))
       }
       return { ok: true, value: { groups } }
-    },
+    })),
+    'dsh-memory-lite: /api/memory-models/snapshot',
   )
 
   // Per-route reasoning efforts for the effort dropdown: resolved lazily so
   // the catalog RPC stays cheap (resolveModelInfo per model would be N calls).
-  ctx.connection.rpc.handle(
-    '/memory-model-efforts',
-    async (_endpoint, payload, _signal) => {
+  ctx.effect(
+    () => ctx.connection.fetch.register(rpcRoute('memory-model-efforts/snapshot', async (_endpoint, payload, _signal) => {
       const route = String((payload as { route?: unknown } | null)?.route ?? '')
       const slash = route.indexOf('/')
       if (slash <= 0) return { ok: true, value: { efforts: [], defaultEffort: undefined } }
@@ -177,7 +260,8 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
         ctx.logger.warn('dsh-memory-lite: /memory-model-efforts failed: ' + String(error))
       }
       return { ok: true, value: { efforts, defaultEffort } }
-    },
+    })),
+    'dsh-memory-lite: /api/memory-model-efforts/snapshot',
   )
   ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
 }

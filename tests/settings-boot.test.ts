@@ -16,11 +16,24 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { boot } from '@deepseek-ai/dsh-app-boot'
 import type { FakeSettingsProvider } from './fixtures/fake-settings.js'
+import { FakeConnectionService } from './fixtures/fake-connection.js'
 
 const PROJECT_ROOT = resolve(fileURLToPath(import.meta.url), '../..')
 const PLUGIN_ENTRY = join(PROJECT_ROOT, 'lib', 'index.js')
 const FAKE_CONNECTION_ENTRY = join(PROJECT_ROOT, 'tests', 'fixtures', 'fake-connection.ts')
 const FAKE_SETTINGS_ENTRY = join(PROJECT_ROOT, 'tests', 'fixtures', 'fake-settings.ts')
+
+async function callRpc(conn: FakeConnectionService, endpoint: string, payload: unknown): Promise<any> {
+  const route = conn.fetchRoutes.get('/api/' + endpoint)
+  assert.ok(route, 'memory-lite registered /api/' + endpoint)
+  const response = await route!.fetch(new Request('http://host/api/' + endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'test-rpc', method: endpoint, payload }),
+  }))
+  const body = await response.json() as { result: unknown }
+  return body.result
+}
 
 test('settings edits apply live to extraction.mode but root/sharing stay pinned', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'dsh-settings-boot-'))
@@ -47,19 +60,18 @@ test('settings edits apply live to extraction.mode but root/sharing stay pinned'
     ].join('\n'))
     const ctx = await boot('dsh-memory-lite-settings-test', configPath, [], undefined, PROJECT_ROOT)
     try {
-      const connection = ctx.get('connection') as { handlers: Map<string, (e: unknown, p: unknown, s: unknown) => Promise<unknown>> }
+      const connection = ctx.get('connection') as FakeConnectionService
       const settings = ctx.get('settings') as FakeSettingsProvider
 
       // Baseline: incremental mode.
-      const statusHandler = connection.handlers.get('/memory-status')!
-      const before = await statusHandler(undefined, undefined, undefined) as { value: { mode: string } }
+      const before = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
       assert.equal(before.value.mode, 'incremental')
 
       // Simulate a user edit in the settings panel: mode -> off.
       await settings.update('dsh-memory-lite', { extraction: { mode: 'off' } })
 
       // The RPC handler reads the live config, so the mode flips without a restart.
-      const after = await statusHandler(undefined, undefined, undefined) as { value: { mode: string } }
+      const after = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
       assert.equal(after.value.mode, 'off')
 
       // The user edit persisted into the fake document.
@@ -69,7 +81,7 @@ test('settings edits apply live to extraction.mode but root/sharing stay pinned'
       // root/sharing are restart-applies: editing them in settings must NOT
       // move the live config (the store snapshot stays authoritative).
       await settings.update('dsh-memory-lite', { root: join(cwd, 'other-root') })
-      const afterRoot = await statusHandler(undefined, undefined, undefined) as { value: { mode: string } }
+      const afterRoot = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
       assert.equal(afterRoot.value.mode, 'off', 'root edit must not disturb live config')
       const section2 = settings.sections.get('dsh-memory-lite')
       assert.equal(section2?.root, join(cwd, 'other-root'), 'root edit persisted for the next restart')
@@ -111,11 +123,10 @@ test('a pre-seeded settings document is the config source when the row config is
     ].join("\n"))
     const ctx = await boot('dsh-memory-lite-seed-test', configPath, [], undefined, PROJECT_ROOT)
     try {
-      const connection = ctx.get('connection') as { handlers: Map<string, (e: unknown, p: unknown, s: unknown) => Promise<unknown>> }
-      const statusHandler = connection.handlers.get('/memory-status')!
+      const connection = ctx.get('connection') as FakeConnectionService
       // The seeded settings value (explicit_only) wins over the schema default
       // (incremental) because the row config carries nothing.
-      const snap = await statusHandler(undefined, undefined, undefined) as { value: { mode: string } }
+      const snap = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
       assert.equal(snap.value.mode, 'explicit_only')
     } finally {
       await ctx.fiber.dispose()

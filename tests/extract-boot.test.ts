@@ -37,6 +37,18 @@ function sessionLike(id: string, seq: number): ExtractionSessionLike {
   }
 }
 
+/** Drive one registered fetch route as the browser rpc.call would. */
+async function callRpc(conn: FakeConnectionService, endpoint: string, payload: unknown): Promise<any> {
+  const route = conn.fetchRoutes.get('/api/' + endpoint)
+  assert.ok(route, 'memory-lite registered /api/' + endpoint)
+  const response = await route!.fetch(new Request('http://host/api/' + endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'test-rpc', method: endpoint, payload }),
+  }))
+  const body = await response.json() as { result: unknown }
+  return body.result
+}
 async function bootCtx(memoryRoot: string): Promise<Awaited<ReturnType<typeof boot>>> {
   const cwd = await mkdtemp(join(tmpdir(), 'dsh-extract-boot-'))
   const configPath = join(cwd, 'cordis.yml')
@@ -53,6 +65,8 @@ async function bootCtx(memoryRoot: string): Promise<Awaited<ReturnType<typeof bo
     '  config:',
     '    root: ' + memoryRoot,
     '    defaultPeer: test-peer',
+    '    extraction:',
+    '      windowTurns: 20',
     '',
   ].join('\n'))
   return boot('dsh-extract-boot', configPath, [], undefined, PROJECT_ROOT)
@@ -77,7 +91,7 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
       { inputTokens: 1234, outputTokens: 42 },
     ))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc123', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
@@ -131,7 +145,7 @@ test('extractOnce recovers a prose answer via one bounded repair call', async ()
         : mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}')
     })
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc789', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
@@ -161,7 +175,7 @@ test('extractOnce records a parse-error audit and advances the checkpoint', asyn
   try {
     ctx.on('llm/stream', () => mockStreamText('not json at all'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc456', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
@@ -223,9 +237,7 @@ test('/memory-status RPC channel serves the tracker snapshot', async () => {
   const ctx = await bootCtx(tmp)
   try {
     const conn = ctx.get('connection') as FakeConnectionService
-    const handler = conn.handlers.get('/memory-status')
-    assert.ok(handler, 'memory-lite registered the /memory-status channel')
-    const result = await handler!('snapshot', {}, new AbortController().signal) as {
+    const result = await callRpc(conn, 'memory-status/snapshot', {}) as {
       ok: boolean
       value: { mode: string; status: string; last: unknown }
     }
@@ -249,16 +261,17 @@ test('/memory-peers RPC channel lists peers and configured mounts', async () => 
   const ctx = await bootCtx(tmp)
   try {
     const conn = ctx.get('connection') as FakeConnectionService
-    const handler = conn.handlers.get('/memory-peers')
-    assert.ok(handler, 'memory-lite registered the /memory-peers channel')
-    const result = await handler!('snapshot', {}, new AbortController().signal) as {
+    const result = await callRpc(conn, 'memory-peers/snapshot', {}) as {
       ok: boolean
-      value: { peers: string[]; mounts: Array<{ name: string; peer: string; subpath: string; readonly: boolean }> }
+      value: { peers: Array<{ name: string; displayName: string }>; mounts: Array<{ name: string; peer: string; subpath: string; readonly: boolean }> }
     }
     assert.equal(result.ok, true)
-    const peers = result.value.peers
+    const peers = result.value.peers.map(p => p.name)
     assert.ok(peers.includes('alpha-12345678'), 'lists alpha peer: ' + peers.join(','))
     assert.ok(peers.includes('beta-87654321'), 'lists beta peer: ' + peers.join(','))
+    // displayName defaults to the storage name when no .peer-meta.json exists.
+    const alpha = result.value.peers.find(p => p.name === 'alpha-12345678')!
+    assert.equal(alpha.displayName, 'alpha-12345678')
     // No mounts configured in the boot row config -> empty mounts list.
     assert.deepEqual(result.value.mounts, [])
   } finally {
@@ -269,6 +282,49 @@ test('/memory-peers RPC channel lists peers and configured mounts', async () => 
 
 
 
+
+test('/memory-status fetch route rejects bad requests like the official rpcFetchHandler', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-err-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    const conn = ctx.get('connection') as FakeConnectionService
+    const route = conn.fetchRoutes.get('/api/memory-status/snapshot')
+    assert.ok(route, 'memory-lite registered the /api/memory-status/snapshot route')
+    // Non-POST -> 404 (official behavior).
+    const notPost = await route!.fetch(new Request('http://host/api/memory-status/snapshot', { method: 'GET' }))
+    assert.equal(notPost.status, 404)
+    // Wrong content-type -> 415 (official behavior).
+    const badMedia = await route!.fetch(new Request('http://host/api/memory-status/snapshot', {
+      method: 'POST', headers: { 'content-type': 'text/plain' }, body: '{}',
+    }))
+    assert.equal(badMedia.status, 415)
+    // Body is not JSON -> 400.
+    const badBody = await route!.fetch(new Request('http://host/api/memory-status/snapshot', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'not-json',
+    }))
+    assert.equal(badBody.status, 400)
+    // Malformed envelope -> 400 + gateway/bad-request.
+    const badEnvelope = await route!.fetch(new Request('http://host/api/memory-status/snapshot', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'nope', rpcId: 7 }),
+    }))
+    assert.equal(badEnvelope.status, 400)
+    const envelopeBody = await badEnvelope.json() as { result: { ok: boolean; error: { code: string } } }
+    assert.equal(envelopeBody.result.ok, false)
+    assert.equal(envelopeBody.result.error.code, 'gateway/bad-request')
+    // Method mismatch -> 400 (official behavior).
+    const badMethod = await route!.fetch(new Request('http://host/api/memory-status/snapshot', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'memory-other/snapshot', payload: {} }),
+    }))
+    assert.equal(badMethod.status, 400)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('extractOnce uses the global default model when route is unset (§17)', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
@@ -276,7 +332,7 @@ test('extractOnce uses the global default model when route is unset (§17)', asy
   try {
     ctx.on('llm/stream', () => mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-global-default', 30)
     // No extraction.llm.route; deps.defaultModel supplies the global default.
     const defaultModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
@@ -338,7 +394,7 @@ test('extractOnce falls back to the session header when no route and no global d
   try {
     ctx.on('llm/stream', () => mockStreamText('{"decision":"skip"}'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer' })
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-header-fallback', 30)
     // defaultModel returns empty (e.g. service absent) -> falls back to requestHeader.
     const defaultModel = () => ({ provider: '', model: '' })

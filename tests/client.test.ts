@@ -88,7 +88,9 @@ test('client.js evaluates and registers the header indicator + settings page', (
   const header = entries.find(e => e.name === 'conversation.session.header.utilities')
   assert.ok(header, 'header indicator entry registered')
   assert.equal(header!.id, 'memory-lite-status')
-  assert.equal(header!.order, -1)
+  // -20 < open-in-app (-10): the status pill sits left of the workspace
+  // open-in-app split button (Finder/VSCode/Xcode).
+  assert.equal(header!.order, -20)
   assert.equal(typeof header!.component, 'function')
 
   const settings = entries.find(e => e.name === 'settings.section')
