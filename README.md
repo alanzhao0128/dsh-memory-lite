@@ -8,6 +8,8 @@ Design: [《Light Memory for DSH 设计方案》](https://github.com/deepseek-ai
 
 ## Install
 
+> **Requires dsh ≥ 0.1.5.** v0.2.0 migrated the plugin RPC channels to the `/api` shared Fetch-route registry (`connection.fetch.register`); `connection.rpc.handle` is unusable for third-party plugins since 0.1.3-alpha.2 (official issue #5926, unfixed on master).
+
 Install into a profile and add it to that profile's bundle list:
 
 ```sh
@@ -19,7 +21,7 @@ or, for a local checkout, add a linked dependency and bundle:
 ```jsonc
 // $DSH_HOME/profiles/web/package.json
 {
-  "dependencies": { "@alanzhao/dsh-memory-lite": "^0.1.1" },
+  "dependencies": { "@alanzhao/dsh-memory-lite": "^0.2.0" },
   "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@alanzhao/dsh-memory-lite"] } }
 }
 ```
@@ -34,12 +36,14 @@ The plugin row in `cordis.patch.yml` carries **no configuration** (mount only); 
 
 ```yaml
 - id: memory-lite
-  name: @alanzhao/dsh-memory-lite
+  name: "@alanzhao/dsh-memory-lite"
   # config:            # optional deployment defaults; settings override
   #   root: '~/.agent-memory'
   #   defaultPeer: dsh-web
   #   extraction:
   #     mode: incremental
+  #     windowTurns: 50
+  #     messageScope: [user, assistant]   # count/feed only conversation turns
   #     turnStoppingTrigger: false
   #     flushTrigger: false
   #   sharing:
@@ -85,11 +89,12 @@ Each memory file uses `## Current` / `## History` / `## Related` sections; updat
 
 - **L0 catalog injection** (`agent/pre-step` waterfall, copied from `@deepseek-ai/dsh-tool-skill`): the peer's `_index.md` is rendered into one durable `user/message` with a typed `memory-catalog` source and re-published when the index changes or compaction moves it off the visible surface. A fresh empty index publishes nothing (unless sharing mounts are enabled — then only the `## shared` hint is published). Subagent sessions get no catalog.
 - **Peer isolation**: each session's cwd derives its peer name (sanitized basename + short hash); cwd-less sessions fall back to `defaultPeer`.
+- **Peer display names**: Chinese and other non-ASCII workspace directories collapse to hash-suffixed ASCII names (e.g. `workspace-aad65ea5`). The plugin records a human-readable `.peer-meta.json` (`displayName`, e.g. 健康分析) per peer the first time a session with that cwd is seen; the sharing settings list shows `健康分析 (workspace-aad65ea5)`.
 - **Path safety**: every file access goes through a containment boundary — relative paths only, `..` / absolute / symlink escapes rejected at the executor.
-- **Implicit extraction** (Phase 2): once `windowTurns` (default 20) new surface messages accumulate — or after `idleTimeoutMin` (default 30 min) of idle — a background run feeds the new window to the LLM and applies a create/merge/update/skip decision (dedup against existing memories), then advances a per-session checkpoint and rolling digest. Turn-boundary and flush triggers are shipped but disabled by config (cost); subagent sessions are never extracted. Audit trails live in `peers/{peer}/sessions/`.
+- **Implicit extraction** (Phase 2): once `windowTurns` (default 50) new in-scope conversation messages accumulate — or after `idleTimeoutMin` (default 30 min) of idle — a background run feeds the new window to the LLM and applies a create/merge/update/skip decision (dedup against existing memories), then advances a per-session checkpoint and rolling digest. Turn-boundary and flush triggers are shipped but disabled by config (cost); subagent sessions are never extracted. Only `messageScope` event kinds count toward the trigger and enter the window (default `['user','assistant']`; raw tool results excluded — their output adds token cost and noise while the assistant message already carries the interpretation). Audit trails live in `peers/{peer}/sessions/`.
 - **Cross-peer sharing** (Phase 3): `sharing.mounts` expose another peer's memories read-only at `shared/<name>/...`; `search_memory` covers shared mounts and results keep the `shared/<name>` prefix. Shared entries stay out of the local catalog.
 - **Concurrent writes**: all mutations run through a serial queue with atomic tmp+rename replacement.
-- **Header status indicator** (browser half, `lib/client.js`): a compact "memory-lite" capsule in the session-header utilities row, left of the built-in "Session log" download button (position via `ui.headerOrder`, editable in the settings panel). The dot polls the `/memory-status` RPC channel every 10s — green (last extraction run ok), red (last run failed or the plugin is unreachable), gray (extraction mode off / explicit_only). No data yet is green.
+- **Header status indicator** (browser half, `lib/client.js`): a compact "memory-lite" capsule in the session-header utilities row, left of the built-in "open workspace" split button (order -20 vs the button's -10). The dot polls the `/api/memory-status/snapshot` RPC channel every 10s — green (last extraction run ok), red (last run failed or the plugin is unreachable), gray (extraction mode off / explicit_only). No data yet is green.
 
 ## Model Experience
 
