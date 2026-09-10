@@ -27,6 +27,22 @@ export class MutationQueue {
 /** Cap on retained summary-log lines per peer (bounds the rolling log). */
 export const MAX_LOG_LINES = 5000
 
+/** UI-annotation metadata for one peer directory (never a path segment). */
+export interface PeerMeta {
+  /** Human-readable source directory basename, e.g. "健康分析". */
+  readonly displayName: string
+  /** Absolute source working directory the peer was derived from. */
+  readonly sourceCwd?: string
+}
+
+/** One existing peer directory as surfaced to the settings UI. */
+export interface PeerSummary {
+  /** Stable storage name (ASCII, hash-suffixed); used as path/mount identity. */
+  readonly name: string
+  /** Human-readable annotation; equals the name when no annotation exists. */
+  readonly displayName: string
+}
+
 /** One line-level search hit. */
 export interface SearchMatch {
   /** Memory path relative to the peer's memories root. */
@@ -187,11 +203,51 @@ export class MemoryStore {
     return join(this.root, 'peers')
   }
 
-  /** Existing peer directory names (plain names, no path), tolerant of a missing/empty root. */
-  async listPeers(): Promise<string[]> {
+  /** Absolute path of one peer's UI-annotation metadata file. */
+  peerMetaPath(peer: string): string {
+    return join(this.root, 'peers', peer, '.peer-meta.json')
+  }
+
+  /** Read one peer's annotation metadata, or undefined when absent/unreadable. */
+  async readPeerMeta(peer: string): Promise<PeerMeta | undefined> {
+    try {
+      const raw = await readFileNode(this.peerMetaPath(peer), 'utf8')
+      const parsed = JSON.parse(raw) as { displayName?: unknown; sourceCwd?: unknown }
+      if (typeof parsed.displayName !== 'string') return undefined
+      return {
+        displayName: parsed.displayName,
+        ...(typeof parsed.sourceCwd === 'string' ? { sourceCwd: parsed.sourceCwd } : {}),
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Remember the human-readable source directory behind a peer. Written once
+   * (first time a peer is seen with a cwd); later calls are no-ops so a rename
+   * of the source directory never rewrites an established annotation.
+   */
+  async rememberPeerCwd(peer: string, cwd: string): Promise<void> {
+    if (await this.readPeerMeta(peer) !== undefined) return
+    const meta: PeerMeta = { displayName: basename(cwd) || 'workspace', sourceCwd: cwd }
+    await this.queue.enqueue(async () => {
+      await ensureDir(dirname(this.peerMetaPath(peer)))
+      await writeFileAtomic(this.peerMetaPath(peer), JSON.stringify(meta, null, 2), { mode: 0o600, dirMode: 0o700 })
+    })
+  }
+
+  /** One existing peer directory: its storage name plus the UI displayName. */
+  async listPeers(): Promise<PeerSummary[]> {
     try {
       const entries = await readdir(this.peersDir(), { withFileTypes: true })
-      return entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name)
+      const names = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name)
+      const out: PeerSummary[] = []
+      for (const name of names) {
+        const meta = await this.readPeerMeta(name)
+        out.push({ name, displayName: meta?.displayName ?? name })
+      }
+      return out
     } catch {
       return []
     }

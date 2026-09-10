@@ -279,3 +279,40 @@ test('shared paths are rejected when sharing is disabled', async () => {
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('peer meta: displayName annotations round-trip and rememberPeerCwd writes once', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-mem-peer-meta-'))
+  const store = new MemoryStore(root)
+  try {
+    // listPeers with no peers -> empty.
+    assert.deepEqual(await store.listPeers(), [])
+
+    // Create two peer dirs; one gets a manual meta annotation.
+    const peerA = 'workspace-aad65ea5'
+    const peerB = 'dsh-test-72572e8b'
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    await mkdir(join(root, 'peers', peerA, 'memories'), { recursive: true })
+    await mkdir(join(root, 'peers', peerB, 'memories'), { recursive: true })
+    await writeFile(join(root, 'peers', peerA, '.peer-meta.json'), JSON.stringify({ displayName: '健康分析', sourceCwd: '/Users/alan/Documents/健康分析' }))
+
+    const peers = await store.listPeers()
+    const byName = Object.fromEntries(peers.map(p => [p.name, p.displayName]))
+    assert.equal(byName[peerA], '健康分析')
+    // No meta file -> displayName falls back to the storage name.
+    assert.equal(byName[peerB], peerB)
+
+    // rememberPeerCwd writes the annotation on first sight of a cwd.
+    await store.rememberPeerCwd(peerB, '/Users/alan/code/dsh-test')
+    const after = await store.listPeers()
+    const bAfter = after.find(p => p.name === peerB)!
+    assert.equal(bAfter.displayName, 'dsh-test')
+    assert.equal((await store.readPeerMeta(peerB))?.sourceCwd, '/Users/alan/code/dsh-test')
+
+    // Idempotent: an existing annotation (even for another cwd) is never rewritten.
+    await store.rememberPeerCwd(peerA, '/somewhere/else')
+    const aAfter = (await store.listPeers()).find(p => p.name === peerA)!
+    assert.equal(aAfter.displayName, '健康分析')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

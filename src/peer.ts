@@ -32,6 +32,16 @@ export function peerFromCwd(cwd: string): string {
   return `${name}-${hash}`
 }
 
+/**
+ * Human-readable display name for a working directory: the directory's own
+ * basename, unmodified (CJK and other non-ASCII spellings survive verbatim).
+ * Peer *directory names* stay ASCII (see peerFromCwd); this value only feeds
+ * UI annotations and is never used as a path segment.
+ */
+export function displayNameFromCwd(cwd: string): string {
+  return basename(cwd) || 'workspace'
+}
+
 /** Sanitize a configured peer name for use as one directory segment. */
 export function sanitizePeerName(name: string): string {
   const slug = name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
