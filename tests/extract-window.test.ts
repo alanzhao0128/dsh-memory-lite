@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   SURFACE_TYPES, isSurfaceType, takeTail, selectWindow, truncateBytes,
   messageBlocksOf, blockText, renderBlocks, renderEventText, isConversationEvent,
+  DEFAULT_MESSAGE_SCOPE, scopeOfType, inScope,
 } from '../src/extract/window.js'
 
 function ev(type: string, seq: number, data: Record<string, unknown> = {}): any {
@@ -23,7 +24,7 @@ test('takeTail keeps the trailing items', () => {
   assert.deepEqual(takeTail([1, 2, 3], 0), [])
 })
 
-test('selectWindow filters surface types, applies seq boundary and tail cap', () => {
+test('selectWindow default scope excludes tool results (conversation only)', () => {
   const events = [
     ev('turn/start', 1),
     ev('user/message', 2, { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }),
@@ -32,18 +33,21 @@ test('selectWindow filters surface types, applies seq boundary and tail cap', ()
     ev('assistant/chunk', 5),
     ev('user/message', 6, { content: [], source: { kind: 'user' } }),
   ]
-  // seq > 1 excludes turn/start and the first user message (seq 2) is included.
+  assert.deepEqual(DEFAULT_MESSAGE_SCOPE, ['user', 'assistant'])
+  // Default scope: tool/result (seq 4) excluded; seq > 1 drops turn/start (seq 1).
   const win = selectWindow(events, 1, 10)
-  assert.deepEqual(win.map(e => e.seq), [2, 3, 4, 6])
+  assert.deepEqual(win.map(e => e.seq), [2, 3, 6])
   // seq boundary excludes messages at or before it.
-  assert.deepEqual(selectWindow(events, 3, 10).map(e => e.seq), [4, 6])
-  // tail cap keeps the most recent.
-  assert.deepEqual(selectWindow(events, 0, 2).map(e => e.seq), [4, 6])
+  assert.deepEqual(selectWindow(events, 3, 10).map(e => e.seq), [6])
+  // Explicit full scope (incl. tool_result) restores the legacy behavior.
+  assert.deepEqual(selectWindow(events, 1, 10, ['user', 'assistant', 'tool_result']).map(e => e.seq), [2, 3, 4, 6])
+  // tail cap keeps the most recent (conversation only by default).
+  assert.deepEqual(selectWindow(events, 0, 2).map(e => e.seq), [3, 6])
   // zero cap yields nothing.
   assert.deepEqual(selectWindow(events, 0, 0), [])
 })
 
-test('selectWindow excludes system-injected user messages by source kind', () => {
+test('selectWindow excludes system-injected user messages regardless of scope', () => {
   const events = [
     ev('user/message', 1, { content: [{ type: 'text', text: 'real' }], source: { kind: 'user' } }),
     ev('user/message', 2, { content: [{ type: 'text', text: 'runtime context...' }], source: { kind: 'plugin' } }),
@@ -54,10 +58,23 @@ test('selectWindow excludes system-injected user messages by source kind', () =>
     ev('assistant/message', 7, { message: { content: [{ type: 'text', text: 'ok' }] } }),
     ev('tool/result', 8, { message: { content: [] } }),
   ]
-  // Only the real user message plus assistant/tool results remain.
-  assert.deepEqual(selectWindow(events, 0, 10).map(e => e.seq), [1, 7, 8])
+  // Default: real user message + assistant (tool results excluded).
+  assert.deepEqual(selectWindow(events, 0, 10).map(e => e.seq), [1, 7])
+  // Injections stay excluded even when tool_result is explicitly enabled.
+  assert.deepEqual(selectWindow(events, 0, 10, ['user', 'assistant', 'tool_result']).map(e => e.seq), [1, 7, 8])
   // Tail cap applies after exclusion.
-  assert.deepEqual(selectWindow(events, 0, 2).map(e => e.seq), [7, 8])
+  assert.deepEqual(selectWindow(events, 0, 2).map(e => e.seq), [1, 7])
+})
+
+test('scopeOfType and inScope map surface types to messageScope keys', () => {
+  assert.equal(scopeOfType('user/message'), 'user')
+  assert.equal(scopeOfType('assistant/message'), 'assistant')
+  assert.equal(scopeOfType('tool/result'), 'tool_result')
+  assert.equal(scopeOfType('turn/start'), undefined)
+  assert.equal(inScope('tool/result', DEFAULT_MESSAGE_SCOPE), false)
+  assert.equal(inScope('tool/result', ['user', 'assistant', 'tool_result']), true)
+  assert.equal(inScope('user/message', ['user']), true)
+  assert.equal(inScope('assistant/message', ['user']), false)
 })
 
 test('isConversationEvent accepts only real user input for user/message', () => {

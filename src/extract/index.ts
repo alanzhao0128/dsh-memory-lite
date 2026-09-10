@@ -21,7 +21,7 @@ import type { MemoryDeps } from '../tool-utils.js'
 import type { StatusTracker } from '../status.js'
 import { MEMORY_CATEGORIES } from '../types.js'
 import { slugify, summaryOf } from '../memory-store.js'
-import { isSurfaceType, selectWindow, renderEventText } from './window.js'
+import { isSurfaceType, inScope, selectWindow, renderEventText } from './window.js'
 import { shouldExtractIdle, shouldExtractTurn, shouldExtractWindow } from './triggers.js'
 import { parseDecision, type ExtractionDecision } from './decision.js'
 import { digestApproxTokens, rollDigest } from './digest.js'
@@ -143,6 +143,7 @@ export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusT
   ctx.on('session/event', (session, event) => {
     if (session.header.origin === 'subagent') return
     if (!isSurfaceType(event.type)) return
+    if (!inScope(event.type, ext().messageScope)) return
     const state = stateOf(session)
     state.pending += 1
     resetIdle(session, state)
@@ -229,7 +230,7 @@ export async function extractOnce(
   }
   const fromSeq = state.checkpoint.checkpoint.seq
   const events = sessionEvents(session)
-  const windowEvents = selectWindow(events, fromSeq, ext.maxMessages)
+  const windowEvents = selectWindow(events, fromSeq, ext.maxMessages, ext.messageScope)
   if (windowEvents.length === 0) return
   const windowStart = windowEvents[0]!.seq
   const windowEnd = windowEvents[windowEvents.length - 1]!.seq

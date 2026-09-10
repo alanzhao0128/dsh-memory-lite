@@ -10,6 +10,30 @@
 export const SURFACE_TYPES = ['user/message', 'assistant/message', 'tool/result'] as const
 export type SurfaceEventType = (typeof SURFACE_TYPES)[number]
 
+/** One entry of extraction.messageScope: which event kinds feed the window and the trigger counter. */
+export type MessageScope = 'user' | 'assistant' | 'tool_result'
+
+/** The default scope: real conversation only. Tool results are excluded (their raw
+ * output adds token cost and noise; the assistant message already carries the
+ * interpretation — see IMPLEMENTATION.md). */
+export const DEFAULT_MESSAGE_SCOPE: readonly MessageScope[] = ['user', 'assistant']
+
+/** Map a surface event type to its messageScope key (undefined = not mappable). */
+export function scopeOfType(type: string): MessageScope | undefined {
+  switch (type) {
+    case 'user/message': return 'user'
+    case 'assistant/message': return 'assistant'
+    case 'tool/result': return 'tool_result'
+    default: return undefined
+  }
+}
+
+/** Whether a messageScope list admits a surface event type. */
+export function inScope(type: string, scope: readonly MessageScope[]): boolean {
+  const key = scopeOfType(type)
+  return key !== undefined && scope.includes(key)
+}
+
 /** Minimal structural view of a session-log event; DSH SessionEvent satisfies it. */
 export interface SurfaceEventLike {
   readonly type: string
@@ -43,15 +67,24 @@ export function isConversationEvent(event: SurfaceEventLike): boolean {
 }
 
 /**
- * Select the extraction window: real conversation surface events with seq
- * strictly after `fromSeqExclusive`, capped to the trailing `maxMessages`.
+ * Select the extraction window: conversation events admitted by scope with
+ * seq strictly after `fromSeqExclusive`, capped to the trailing
+ * `maxMessages`. Tool results are only admitted when 'tool_result' is in
+ * scope (default: excluded — see DEFAULT_MESSAGE_SCOPE). Injection-origin
+ * user messages (runtime context, catalogs, …) never enter the window
+ * regardless of scope.
  */
 export function selectWindow(
   events: readonly SurfaceEventLike[],
   fromSeqExclusive: number,
   maxMessages: number,
+  scope: readonly MessageScope[] = DEFAULT_MESSAGE_SCOPE,
 ): SurfaceEventLike[] {
-  const selected = events.filter(event => isSurfaceType(event.type) && isConversationEvent(event) && event.seq > fromSeqExclusive)
+  const selected = events.filter(event =>
+    isSurfaceType(event.type)
+    && inScope(event.type, scope)
+    && isConversationEvent(event)
+    && event.seq > fromSeqExclusive)
   return takeTail(selected, maxMessages)
 }
 

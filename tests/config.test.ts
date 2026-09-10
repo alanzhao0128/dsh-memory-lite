@@ -104,3 +104,22 @@ test('extraction.llm.route and reasoningEffort default empty and validate', () =
   assert.throws(() => resolveConfig({ extraction: { llm: { route: 'provider/' } } }), /route/)
   assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a\\b/c' } } }), /route/)
 })
+
+test('extraction.windowTurns and messageScope defaults follow the conversation-only design', () => {
+  const config = resolveConfig({})
+  assert.equal(config.extraction.windowTurns, 50)
+  assert.deepEqual(config.extraction.messageScope, ['user', 'assistant'])
+  // Explicit overrides survive.
+  const custom = resolveConfig({ extraction: { windowTurns: 7, messageScope: ['user', 'assistant', 'tool_result'] } })
+  assert.equal(custom.extraction.windowTurns, 7)
+  assert.deepEqual(custom.extraction.messageScope, ['user', 'assistant', 'tool_result'])
+})
+
+test('extraction.messageScope validates entries and drops duplicates', () => {
+  assert.throws(() => resolveConfig({ extraction: { messageScope: ['bogus'] as never } }), /messageScope/)
+  assert.throws(() => resolveConfig({ extraction: { messageScope: ['user', 'wat'] as never } }), /messageScope/)
+  const dedup = resolveConfig({ extraction: { messageScope: ['user', 'user', 'assistant'] } })
+  assert.deepEqual(dedup.extraction.messageScope, ['user', 'assistant'])
+  const empty = resolveConfig({ extraction: { messageScope: [] } })
+  assert.deepEqual(empty.extraction.messageScope, ['user', 'assistant'])
+})

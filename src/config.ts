@@ -85,13 +85,17 @@ export interface ExtractionLlmConfig {
 export interface ExtractionConfig {
   /** incremental | explicit_only | off. Defaults to incremental. */
   mode: 'incremental' | 'explicit_only' | 'off'
-  /** New surface messages >= this count triggers an extraction. Defaults to 20. */
+  /** New in-scope conversation messages >= this count triggers an extraction. Defaults to 50. */
   windowTurns: number
   /** Idle minutes before the remaining window is extracted. Defaults to 30. */
   idleTimeoutMin: number
   /** Max messages fed to the extraction LLM per run. Defaults to 20. */
   maxMessages: number
-  /** Which event kinds count and feed the window (fixed to the three surface types). */
+  /** Which event kinds count toward windowTurns and feed the extraction window.
+   * 'user' = real user messages (injections never count), 'assistant' = assistant
+   * messages, 'tool_result' = raw tool results. Tool results are excluded by
+   * default: their raw output adds token cost and noise while the assistant
+   * message already carries the interpretation. Defaults to ['user','assistant']. */
   messageScope: ('user' | 'assistant' | 'tool_result')[]
   /** Per tool/result content truncation before feeding the LLM. Defaults to 2048. */
   toolResultMaxBytes: number
@@ -195,6 +199,20 @@ export const Config: z<MemoryConfig> = z.object({
   }),
 })
 
+/** Validate and normalize extraction.messageScope. Invalid entries throw; an
+ * absent value yields the default (conversation only, no raw tool results). */
+function normalizeMessageScope(scope: readonly ('user' | 'assistant' | 'tool_result')[] | undefined): ('user' | 'assistant' | 'tool_result')[] {
+  if (scope === undefined || scope.length === 0) return ['user', 'assistant']
+  const valid = new Set(['user', 'assistant', 'tool_result'])
+  for (const entry of scope) {
+    if (!valid.has(entry)) {
+      throw new Error('dsh-memory-lite: extraction.messageScope entries must be user | assistant | tool_result, got ' + JSON.stringify(entry))
+    }
+  }
+  // Drop duplicates while preserving order.
+  return [...new Set(scope)]
+}
+
 /** Normalize and default a raw configuration; throws on invalid values. */
 export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
   const root = resolve(expandHomePath(config.root ?? DEFAULT_MEMORY_ROOT))
@@ -216,10 +234,10 @@ export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
   }
   const extraction = {
     mode: config.extraction?.mode ?? 'incremental',
-    windowTurns: config.extraction?.windowTurns ?? 20,
+    windowTurns: config.extraction?.windowTurns ?? 50,
     idleTimeoutMin: config.extraction?.idleTimeoutMin ?? 30,
     maxMessages: config.extraction?.maxMessages ?? 20,
-    messageScope: config.extraction?.messageScope ?? (['user', 'assistant', 'tool_result'] as const),
+    messageScope: normalizeMessageScope(config.extraction?.messageScope),
     toolResultMaxBytes: config.extraction?.toolResultMaxBytes ?? 2048,
     includeDigest: config.extraction?.includeDigest ?? true,
     dedup: config.extraction?.dedup ?? true,
