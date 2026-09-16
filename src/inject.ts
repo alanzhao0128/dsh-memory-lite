@@ -13,13 +13,13 @@ import type { MemoryDeps } from './tool-utils.js'
 import type { IndexEntry } from './types.js'
 import { peerForHeader } from './peer.js'
 import { digestApproxTokens } from './extract/digest.js'
-import { catalogHistory, catalogMessage, digestIndexEntries, renderCatalogMessage, renderCatalogUpdate, type SharedMountNotice } from './catalog.js'
+import { catalogHistory, catalogMessage, isCurrentCatalogText, renderCatalogMessage, renderCatalogUpdate, type SharedMountNotice } from './catalog.js'
 
 /** Inputs to the catalog decision; all derived state is resolved by the caller. */
 export interface CatalogDecisionParams {
   readonly decision: PreStepDecision
-  readonly history: { readonly visibleDigest?: string; readonly published: boolean }
-  readonly existing: { readonly message: UserMessage; readonly entries: readonly IndexEntry[] } | undefined
+  readonly history: { readonly published: boolean; readonly visibleText?: string }
+  readonly existing: { readonly message: UserMessage; readonly text: string } | undefined
   readonly entries: readonly IndexEntry[]
   /** Shared mounts to advertise (Phase 3); drives the empty-index exception. */
   readonly sharedMounts: readonly SharedMountNotice[]
@@ -59,13 +59,16 @@ export function capCatalogEntries(entries: readonly IndexEntry[], maxTokens: num
 export function applyCatalogDecision(params: CatalogDecisionParams): PreStepDecision {
   const { decision, history, existing, entries, sharedMounts = [], peer } = params
   if (decision.kind === 'reject') return decision
-  const digest = digestIndexEntries(entries)
-  if (history.visibleDigest === digest) {
+  // The official `plugin` + `catalog` source carries no payload, so "already
+  // published and still current" is decided by the published message text.
+  const current = (text: string | undefined): boolean =>
+    text !== undefined && isCurrentCatalogText(text, entries, peer, sharedMounts)
+  if (current(history.visibleText)) {
     return existing === undefined
       ? decision
       : { kind: 'enter', messages: decision.messages.filter(message => message.id !== existing.message.id) }
   }
-  if (existing !== undefined && digestIndexEntries(existing.entries) === digest) return decision
+  if (existing !== undefined && current(existing.text)) return decision
   // Phase 3: an empty local index still publishes a catalog when there are
   // shared mounts to advertise (otherwise the shared region is undiscoverable).
   if (!history.published && entries.length === 0 && sharedMounts.length === 0) {

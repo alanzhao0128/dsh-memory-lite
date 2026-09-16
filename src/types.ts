@@ -20,21 +20,8 @@ export interface IndexEntry {
 }
 
 /**
- * Durable provider record for one published memory catalog message: the
- * entries it published beside the model-facing prose, so a consumer never
- * re-parses the `<system-reminder>` framing, whose prose exists for the model.
+ * The injected catalog message uses the OFFICIAL `plugin` source kind with the
+ * `catalog` form (see catalog.ts), so released session-format migrations can
+ * always classify and carry it. The private `memory-catalog` kind written
+ * before 0.2.3 is read back for old sessions but never written again.
  */
-export interface MemoryCatalogSource {
-  readonly kind: 'memory-catalog'
-  readonly form: 'catalog'
-  /** Marks a replacement catalog rather than this session's first publication. */
-  readonly update?: true
-  /** Exactly the entries this message published, in catalog order. */
-  readonly entries: readonly IndexEntry[]
-}
-
-declare module '@deepseek-ai/dsh-llm' {
-  interface MessageSourceMap {
-    'memory-catalog': MemoryCatalogSource
-  }
-}

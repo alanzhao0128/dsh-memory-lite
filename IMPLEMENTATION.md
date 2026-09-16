@@ -157,19 +157,23 @@ interface MemoryStore {
 
 ## 5. Catalog 与注入（照 `dsh-tool-skill`）
 
-### 5.1 typed source（merge-extensible）
+### 5.1 source（官方词汇，不使用私有 kind）
 
 ```ts
-interface MemoryCatalogSource {
-  readonly kind: 'memory-catalog'
-  readonly form: 'catalog'
-  readonly update?: true
-  readonly entries: readonly { category, path, summary }[]
-}
-declare module '@deepseek-ai/dsh-llm' {
-  interface MessageSourceMap { 'memory-catalog': MemoryCatalogSource }
-}
+// 注入消息使用官方 plugin 来源 + 官方 catalog form（0.2.3 起）：
+source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' }
 ```
+
+官方 `MessageSourceMap['plugin']` = `{ kind:'plugin', plugin:string } & ContextFormed`，
+`form` 可取 instructions / catalog / snapshot / notice / relay / recall。选 `catalog` 且不带
+payload 的原因：它是官方释放过的来源词汇，任何 released 迁移都能分类并搬运；
+而私有 kind（0.2.3 前的 `memory-catalog`）会被官方迁移的封闭审计集合拒绝，造成旧会话
+加载失败（见 SESSION_LOAD_FIX.md）。
+
+代价与对策：官方 `catalog` form 不携带 payload，所以「已发布目录是否仍是当前内容」
+改为**按消息正文比对**（`isCurrentCatalogText`）——entries/mounts 变化必然改变渲染文本，
+首次发布与 update 两种框版各自匹配。旧会话里的 `memory-catalog` 消息仍被识别（只读兼容），
+不会因此重复注入。
 
 ### 5.2 索引文件格式
 
@@ -205,7 +209,7 @@ You have long-term memory tools (read_memory / search_memory / remember / update
 ```
 
 - 首次发布 = `renderCatalogMessage`；索引变更且旧 catalog 在可见面 = `renderCatalogUpdate`。
-- digest：条目规范串 → sha256 hex（照 tool-skill）。
+- 已发布状态：官方 catalog form 无 payload，改为比对渲染正文（entries/mounts 变化必然改变文本）。
 
 ### 5.4 pre-step 注入逻辑
 
@@ -217,19 +221,18 @@ ctx.on('agent/pre-step', ...):
   可见性锚 = ctx.tools.get('read_memory', agent) === readMemoryTool；不可见 → 原样返回
   peer = sessionPeer(agent.session.header, config)
   entries = await store.readIndex(peer)
-  digest = digestIndexEntries(entries)
   history = catalogHistory(agent)
   existing = catalogMessage(decision.messages)
-  分支（与 tool-skill 完全一致）：
-    history.visibleDigest === digest → 移掉多余同源 catalog 或不动
-    existing 存在且 digest 相同 → 不动
-    !history.published && entries.length === 0 → 不注入（空索引）
+  分支：
+    history.visibleText 仍是当前渲染 → 移掉多余同源 catalog 或不动
+    existing 存在且正文仍是当前渲染 → 不动
+    !history.published && entries.length === 0 && 无 shared mount → 不注入（空索引）
     history.published → renderCatalogUpdate 替换/追加
     否则 → renderCatalogMessage 追加
 ```
 
-- `catalogHistory`：自尾向前扫 `agent.session.events`，找 `source.kind === 'memory-catalog'` 的最后一条，`surface.nodes` 集合判可见性。
-- 注入消息 = `createUserMessage({ content: [{type:'text', text}], source: {kind:'memory-catalog', ...} })`。
+- `catalogHistory`：自尾向前扫 `agent.session.events`，找最新一条 catalog 消息（新形态 `kind:'plugin'` + `plugin:'dsh-memory-lite'` + `form:'catalog'`；旧形态 `kind:'memory-catalog'` 兼容只读），`surface.nodes` 集合判可见性，并回传其正文。
+- 注入消息 = `createUserMessage({ content: [{type:'text', text}], source: {kind:'plugin', plugin:'dsh-memory-lite', form:'catalog'} })`。
 
 ## 6. 工具集（5 个，schema 精简）
 

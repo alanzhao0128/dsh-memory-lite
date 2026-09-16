@@ -1,23 +1,25 @@
 /**
- * L0 catalog rendering, digest, and session-history tracking. The pattern is
- * copied from `@deepseek-ai/dsh-tool-skill` (the verified reference).
+ * L0 catalog rendering and session-history tracking.
+ *
+ * The injected message uses the OFFICIAL `plugin` source kind with the
+ * `catalog` form, so a released session-format migration can classify and
+ * carry it (the private `memory-catalog` kind written before 0.2.3 is still read
+ * back for old sessions). The official source form carries no payload, so the
+ * published state is recovered by comparing the message text itself.
  * @module dsh-memory-lite/src/catalog
  */
 
-import { createHash } from 'node:crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-import type { IndexEntry, MemoryCatalogSource } from './types.js'
+import type { IndexEntry } from './types.js'
 
-/** Catalog identity over the entry list (not the prose); stable across renders. */
-export function digestIndexEntries(entries: readonly IndexEntry[]): string {
-  const canonical = [...entries]
-    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-    .map(entry => JSON.stringify([entry.category, entry.path, entry.summary]))
-    .join('\n')
-  return createHash('sha256').update(canonical).digest('hex')
-}
+/**
+ * The `plugin` name stamped on the catalog source: the official `plugin` kind
+ * plus the official `catalog` form mark one plugin-published catalog without
+ * inventing a source kind outside the released vocabulary.
+ */
+export const MEMORY_CATALOG_PLUGIN = 'dsh-memory-lite'
 
 const GUIDANCE =
   'You have long-term memory tools (read_memory / search_memory / remember / update_memory / forget_memory). ' +
@@ -43,6 +45,35 @@ function renderSharedMounts(mounts: readonly SharedMountNotice[]): string[] {
   ]
 }
 
+/** The single model-facing text block of one message content array. */
+function textOfContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  for (const block of content) {
+    if (typeof block !== 'object' || block === null) continue
+    const record = block as { readonly type?: unknown; readonly text?: unknown }
+    if (record.type === 'text' && typeof record.text === 'string') return record.text
+  }
+  return undefined
+}
+
+/**
+ * Whether one message source is a memory catalog this plugin published. New
+ * messages carry the official `plugin` kind with the `catalog` form; sessions
+ * written before that change carry the private `memory-catalog` kind and stay
+ * readable, so an already-published catalog is never published twice.
+ */
+export function isMemoryCatalogSource(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const record = source as { readonly kind?: unknown; readonly plugin?: unknown; readonly form?: unknown }
+  if (record.kind === 'memory-catalog') return true
+  return record.kind === 'plugin' && record.plugin === MEMORY_CATALOG_PLUGIN && record.form === 'catalog'
+}
+
+/** The text one rendered catalog message publishes. */
+function catalogText(message: UserMessage): string | undefined {
+  return textOfContent((message as { readonly content?: unknown }).content)
+}
+
 /** The catalog message for this session's first publication. */
 export function renderCatalogMessage(entries: readonly IndexEntry[], peer: string, sharedMounts: readonly SharedMountNotice[] = []): UserMessage {
   return createUserMessage({
@@ -59,7 +90,7 @@ export function renderCatalogMessage(entries: readonly IndexEntry[], peer: strin
         '</system-reminder>',
       ].join('\n'),
     }],
-    source: { kind: 'memory-catalog', form: 'catalog', entries },
+    source: { kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' },
   })
 }
 
@@ -78,63 +109,63 @@ export function renderCatalogUpdate(entries: readonly IndexEntry[], peer: string
         '</system-reminder>',
       ].join('\n'),
     }],
-    source: { kind: 'memory-catalog', form: 'catalog', update: true, entries },
+    source: { kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' },
   })
 }
 
-/** Entries of one durable catalog message, or undefined when the record is unusable. */
-export function readCatalogEntries(source: unknown): readonly IndexEntry[] | undefined {
-  const entries = (source as { entries?: unknown }).entries
-  if (!Array.isArray(entries)) return undefined
-  const readable: IndexEntry[] = []
-  for (const entry of entries as readonly unknown[]) {
-    if (typeof entry !== 'object' || entry === null) return undefined
-    const { category, path, summary } = entry as { category?: unknown; path?: unknown; summary?: unknown }
-    if (typeof category !== 'string' || category === '' || typeof path !== 'string' || path === '' || typeof summary !== 'string') {
-      return undefined
-    }
-    readable.push({ category, path, summary })
-  }
-  return readable
+/**
+ * Whether a published catalog text is still this plugin's current rendering.
+ * An unchanged catalog matches whichever framing it was published with, so a
+ * first publication and an update that carry the same entries and mounts both
+ * count as current.
+ */
+export function isCurrentCatalogText(
+  text: string,
+  entries: readonly IndexEntry[],
+  peer: string,
+  sharedMounts: readonly SharedMountNotice[] = [],
+): boolean {
+  return text === catalogText(renderCatalogMessage(entries, peer, sharedMounts))
+    || text === catalogText(renderCatalogUpdate(entries, peer, sharedMounts))
 }
 
 /**
- * The latest memory-catalog message this session published and whether its
- * digest is still on the visible surface (compaction may have moved it off).
+ * The latest catalog message this session published, plus the text it
+ * published while that message is still on the visible surface (compaction may
+ * have moved it off).
  */
-export function catalogHistory(agent: Agent): { visibleDigest?: string; published: boolean } {
+export function catalogHistory(agent: Agent): { published: boolean; visibleText?: string } {
   const visible = new Set(agent.session.surface.nodes)
   // dsh-session >= 0.1.2 replaced the `events` property with snapshotEvents()
   // and narrowed seq to a branded SessionSeq; both shapes are read-only event
   // arrays with {type, seq, data} and seq stays comparable with surface.nodes.
-  type EventLike = { type: string; seq: unknown; data: { source?: { kind?: unknown } } }
+  type EventLike = { type: string; seq: unknown; data: { content?: unknown; source?: unknown } }
   const sessionAny = agent.session as { events?: readonly EventLike[]; snapshotEvents?: () => readonly EventLike[] }
   const events = sessionAny.snapshotEvents !== undefined ? sessionAny.snapshotEvents() : (sessionAny.events ?? [])
   for (let index = events.length - 1; index >= 0; index -= 1) {
     // The loop bound proves the read-only event view contains this index.
     const event = events[index]!
     if (event.type !== 'user/message') continue
-    const source = event.data.source
-    if (typeof source !== 'object' || source === null || source.kind !== 'memory-catalog') continue
-    const entries = readCatalogEntries(source)
-    if (entries === undefined) continue
-    if (visible.has(event.seq as never)) return { visibleDigest: digestIndexEntries(entries), published: true }
+    if (!isMemoryCatalogSource(event.data.source)) continue
+    const text = textOfContent(event.data.content)
+    if (text === undefined) continue
+    if (visible.has(event.seq as never)) return { published: true, visibleText: text }
     return { published: true }
   }
   return { published: false }
 }
 
-/** The memory-catalog message already in the entering batch, if any. */
+/** The catalog message already in the entering batch, if any. */
 export function catalogMessage(
   messages: readonly UserMessage[],
-): { message: UserMessage; entries: readonly IndexEntry[] } | undefined {
+): { message: UserMessage; text: string } | undefined {
   for (const message of messages) {
     // A message without a stamped source (created before the loop or by hand)
     // is not this plugin's catalog; treat it like any other message.
-    const source = (message as { source?: unknown }).source
-    if (typeof source !== 'object' || source === null || (source as { kind?: unknown }).kind !== 'memory-catalog') continue
-    const entries = readCatalogEntries(source)
-    if (entries !== undefined) return { message, entries }
+    const source = (message as { readonly source?: unknown }).source
+    if (!isMemoryCatalogSource(source)) continue
+    const text = textOfContent((message as { readonly content?: unknown }).content)
+    if (text !== undefined) return { message, text }
   }
   return undefined
 }
