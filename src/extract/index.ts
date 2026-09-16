@@ -21,7 +21,7 @@ import type { MemoryDeps } from '../tool-utils.js'
 import type { StatusTracker } from '../status.js'
 import { MEMORY_CATEGORIES } from '../types.js'
 import { slugify, summaryOf } from '../memory-store.js'
-import { isSurfaceType, inScope, selectWindow, renderEventText } from './window.js'
+import { countsTowardExtraction, selectWindow, renderEventText } from './window.js'
 import { shouldExtractIdle, shouldExtractTurn, shouldExtractWindow } from './triggers.js'
 import { parseDecision, type ExtractionDecision } from './decision.js'
 import { digestApproxTokens, rollDigest } from './digest.js'
@@ -142,8 +142,10 @@ export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusT
 
   ctx.on('session/event', (session, event) => {
     if (session.header.origin === 'subagent') return
-    if (!isSurfaceType(event.type)) return
-    if (!inScope(event.type, ext().messageScope)) return
+    // One predicate for both the counter and the window: injections (memory
+    // catalog, runtime context, …) must neither count toward windowTurns nor
+    // keep re-arming the idle timer.
+    if (!countsTowardExtraction(event, ext().messageScope)) return
     const state = stateOf(session)
     state.pending += 1
     resetIdle(session, state)
@@ -228,10 +230,25 @@ export async function extractOnce(
     const raw = await store.readSessionCheckpoint(peer, session.id)
     if (raw !== undefined) state.checkpoint = parseCheckpoint(raw)
   }
-  const fromSeq = state.checkpoint.checkpoint.seq
   const events = sessionEvents(session)
+  // The checkpoint records a session-log seq. A released session-format
+  // migration (v0 -> v1 -> v2 -> v3) renumbers every event, so a bookmark
+  // written under the previous numbering sits beyond the log's end and the
+  // window would silently select nothing forever. Detect that rebase and
+  // resume from the recent window instead of staying dead.
+  let maxSeq = 0
+  for (const event of events) {
+    if (event.seq > maxSeq) maxSeq = event.seq
+  }
+  const storedSeq = state.checkpoint.checkpoint.seq
+  const fromSeq = storedSeq > maxSeq ? 0 : storedSeq
   const windowEvents = selectWindow(events, fromSeq, ext.maxMessages, ext.messageScope)
-  if (windowEvents.length === 0) return
+  if (windowEvents.length === 0) {
+    // Nothing new to read: clear the pending count so an oversized counter
+    // cannot re-schedule an empty scan on every subsequent event.
+    state.pending = 0
+    return
+  }
   const windowStart = windowEvents[0]!.seq
   const windowEnd = windowEvents[windowEvents.length - 1]!.seq
   const windowText = windowEvents.map(event => renderEventText(event, ext.toolResultMaxBytes)).join('\n')
@@ -254,7 +271,7 @@ export async function extractOnce(
     auditLog: ext.auditLog, tracker,
   }
   if (route === undefined) {
-    await recordRun(rc, 'no-route', undefined, undefined, undefined)
+    await recordRun(rc, 'no-route', undefined, undefined, undefined, false)
     return
   }
 
@@ -273,7 +290,7 @@ export async function extractOnce(
     addUsage(metrics, call)
   } catch (error) {
     metrics.inputTokens += digestApproxTokens(system) + digestApproxTokens(user)
-    await recordRun(rc, 'llm-error: ' + String(error).slice(0, 200), undefined, undefined, undefined)
+    await recordRun(rc, 'llm-error: ' + String(error).slice(0, 200), undefined, undefined, undefined, false)
     return
   }
 
@@ -309,16 +326,16 @@ export async function extractOnce(
           recovered = true
           text = repaired.text
         } catch {
-          await recordRun(rc, note, undefined, undefined, undefined)
+          await recordRun(rc, note, undefined, undefined, undefined, false)
           return
         }
       } else {
         metrics.inputTokens += digestApproxTokens(repairSystem) + digestApproxTokens(repairUser)
-        await recordRun(rc, note, undefined, undefined, undefined)
+        await recordRun(rc, note, undefined, undefined, undefined, false)
         return
       }
     } else {
-      await recordRun(rc, note, undefined, undefined, undefined)
+      await recordRun(rc, note, undefined, undefined, undefined, false)
       return
     }
   }
@@ -327,12 +344,12 @@ export async function extractOnce(
   try {
     path = await applyDecision(store, peer, decision)
   } catch (error) {
-    await recordRun(rc, 'apply-error: ' + String(error).slice(0, 200), decision.kind, undefined, undefined)
+    await recordRun(rc, 'apply-error: ' + String(error).slice(0, 200), decision.kind, undefined, undefined, false)
     return
   }
 
   const digest = rollDigest(state.checkpoint.digest, windowText, DIGEST_MAX_TOKENS)
-  await recordRun(rc, recovered ? 'parse-error-recovered' : undefined, decision.kind, path, digest)
+  await recordRun(rc, recovered ? 'parse-error-recovered' : undefined, decision.kind, path, digest, true)
 }
 
 /** The repair turn: convert a failed non-JSON answer into a valid JSON decision. */
@@ -358,6 +375,7 @@ async function recordRun(
   decision: string | undefined,
   path: string | undefined,
   digest: string | undefined,
+  advance: boolean,
 ): Promise<void> {
   const { ctx, state, store, peer, sessionId, windowStart, windowEnd, hits, route, metrics, startedAt, auditLog, tracker } = rc
   const durationMs = Date.now() - startedAt
@@ -379,9 +397,13 @@ async function recordRun(
     ...(metrics.cacheWriteTokens > 0 ? { cacheWriteTokens: metrics.cacheWriteTokens } : {}),
     durationMs,
   }
+  // A failed run keeps the previous checkpoint so the same window is retried
+  // on the next trigger; only a completed decision advances past it. The audit
+  // entry is appended either way (the failure is the evidence).
+  const nextSeq = advance ? windowEnd : state.checkpoint.checkpoint.seq
   state.checkpoint = auditLog
-    ? withRun(state.checkpoint, windowEnd, entry)
-    : { ...state.checkpoint, checkpoint: { seq: windowEnd } }
+    ? withRun(state.checkpoint, nextSeq, entry)
+    : { ...state.checkpoint, checkpoint: { seq: nextSeq } }
   if (digest !== undefined) {
     state.checkpoint = { ...state.checkpoint, digest }
   }

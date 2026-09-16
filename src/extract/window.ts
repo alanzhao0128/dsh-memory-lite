@@ -67,6 +67,17 @@ export function isConversationEvent(event: SurfaceEventLike): boolean {
 }
 
 /**
+ * Whether one event belongs to extraction at all: a surface type admitted by
+ * scope and, for user messages, real conversation input rather than a system
+ * injection. This is the single predicate shared by the pending trigger
+ * counter and the window selector, so an injection can never inflate the
+ * trigger count while being excluded from the window it would schedule.
+ */
+export function countsTowardExtraction(event: SurfaceEventLike, scope: readonly MessageScope[]): boolean {
+  return isSurfaceType(event.type) && inScope(event.type, scope) && isConversationEvent(event)
+}
+
+/**
  * Select the extraction window: conversation events admitted by scope with
  * seq strictly after `fromSeqExclusive`, capped to the trailing
  * `maxMessages`. Tool results are only admitted when 'tool_result' is in
@@ -81,10 +92,7 @@ export function selectWindow(
   scope: readonly MessageScope[] = DEFAULT_MESSAGE_SCOPE,
 ): SurfaceEventLike[] {
   const selected = events.filter(event =>
-    isSurfaceType(event.type)
-    && inScope(event.type, scope)
-    && isConversationEvent(event)
-    && event.seq > fromSeqExclusive)
+    countsTowardExtraction(event, scope) && event.seq > fromSeqExclusive)
   return takeTail(selected, maxMessages)
 }
 

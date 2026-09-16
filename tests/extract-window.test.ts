@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   SURFACE_TYPES, isSurfaceType, takeTail, selectWindow, truncateBytes,
   messageBlocksOf, blockText, renderBlocks, renderEventText, isConversationEvent,
-  DEFAULT_MESSAGE_SCOPE, scopeOfType, inScope,
+  DEFAULT_MESSAGE_SCOPE, scopeOfType, inScope, countsTowardExtraction,
 } from '../src/extract/window.js'
 
 function ev(type: string, seq: number, data: Record<string, unknown> = {}): any {
@@ -16,6 +16,26 @@ test('isSurfaceType accepts exactly the three surface event types', () => {
   for (const t of ['turn/start', 'step/start', 'assistant/chunk', 'request/header', 'session/title', 'tool/call']) {
     assert.equal(isSurfaceType(t), false)
   }
+})
+
+test('countsTowardExtraction is the single counter/window predicate (injections never count)', () => {
+  const real = ev('user/message', 1, { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } })
+  const injected = ev('user/message', 2, { content: [{ type: 'text', text: 'memory index' }], source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' } })
+  const assistant = ev('assistant/message', 3, { message: { content: [{ type: 'text', text: 'yo' }] } })
+  const toolResult = ev('tool/result', 4, { message: { content: [] } })
+  const other = ev('turn/start', 5)
+  // Real conversation counts; injections do not, even though they are user/message.
+  assert.equal(countsTowardExtraction(real, DEFAULT_MESSAGE_SCOPE), true)
+  assert.equal(countsTowardExtraction(injected, DEFAULT_MESSAGE_SCOPE), false)
+  assert.equal(countsTowardExtraction(assistant, DEFAULT_MESSAGE_SCOPE), true)
+  // Scope decides tool results; non-surface events never count.
+  assert.equal(countsTowardExtraction(toolResult, DEFAULT_MESSAGE_SCOPE), false)
+  assert.equal(countsTowardExtraction(toolResult, ['user', 'assistant', 'tool_result']), true)
+  assert.equal(countsTowardExtraction(other, ['user', 'assistant', 'tool_result']), false)
+  // The counter admits exactly what selectWindow would include (same predicate).
+  const events = [other, real, injected, assistant, toolResult]
+  const counted = events.filter(e => countsTowardExtraction(e, DEFAULT_MESSAGE_SCOPE)).map(e => e.seq)
+  assert.deepEqual(counted, selectWindow(events, 0, 10).map(e => e.seq))
 })
 
 test('takeTail keeps the trailing items', () => {
@@ -52,7 +72,7 @@ test('selectWindow excludes system-injected user messages regardless of scope', 
     ev('user/message', 1, { content: [{ type: 'text', text: 'real' }], source: { kind: 'user' } }),
     ev('user/message', 2, { content: [{ type: 'text', text: 'runtime context...' }], source: { kind: 'plugin' } }),
     ev('user/message', 3, { content: [{ type: 'text', text: 'skill list' }], source: { kind: 'skill-catalog' } }),
-    ev('user/message', 4, { content: [{ type: 'text', text: 'memory index' }], source: { kind: 'memory-catalog' } }),
+    ev('user/message', 4, { content: [{ type: 'text', text: 'memory index' }], source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' } }),
     ev('user/message', 5, { content: [{ type: 'text', text: 'agent instructions' }], source: { kind: 'agent-instructions' } }),
     ev('user/message', 6, { content: [{ type: 'text', text: 'goal' }], source: { kind: 'goal' } }),
     ev('assistant/message', 7, { message: { content: [{ type: 'text', text: 'ok' }] } }),
@@ -79,10 +99,13 @@ test('scopeOfType and inScope map surface types to messageScope keys', () => {
 
 test('isConversationEvent accepts only real user input for user/message', () => {
   const real = { type: 'user/message', seq: 1, data: { source: { kind: 'user' } } }
-  const injected = { type: 'user/message', seq: 2, data: { source: { kind: 'memory-catalog' } } }
+  const injected = { type: 'user/message', seq: 2, data: { source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' } } }
+  // Sessions written before 0.2.3 carry the private kind; it stays excluded too.
+  const legacy = { type: 'user/message', seq: 6, data: { source: { kind: 'memory-catalog' } } }
   const sourceless = { type: 'user/message', seq: 3, data: {} }
   assert.equal(isConversationEvent(real), true)
   assert.equal(isConversationEvent(injected), false)
+  assert.equal(isConversationEvent(legacy), false)
   assert.equal(isConversationEvent(sourceless), false)
   assert.equal(isConversationEvent({ type: 'assistant/message', seq: 4, data: {} }), true)
   assert.equal(isConversationEvent({ type: 'tool/result', seq: 5, data: {} }), true)

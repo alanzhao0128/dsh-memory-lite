@@ -168,7 +168,7 @@ test('extractOnce recovers a prose answer via one bounded repair call', async ()
   }
 })
 
-test('extractOnce records a parse-error audit and advances the checkpoint', async () => {
+test('extractOnce records a parse-error audit but keeps the checkpoint for retry', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
   const ctx = await bootCtx(tmp)
@@ -181,7 +181,9 @@ test('extractOnce records a parse-error audit and advances the checkpoint', asyn
 
     const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-abc456.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
-    assert.equal(checkpoint.checkpoint.seq, 30)
+    // A failed run must NOT advance the bookmark: the window is retried on the
+    // next trigger instead of being silently dropped.
+    assert.equal(checkpoint.checkpoint.seq, 0)
     assert.match(checkpoint.audit[0].note, /parse-error/)
     // Main call + one bounded repair call both failed to parse.
     assert.equal(checkpoint.audit[0].llmCalls, 2)
@@ -319,6 +321,70 @@ test('/memory-status fetch route rejects bad requests like the official rpcFetch
       body: JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'memory-other/snapshot', payload: {} }),
     }))
     assert.equal(badMethod.status, 400)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('extractOnce recovers when a session-format migration renumbered the event seq', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}'))
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const session = sessionLike('session-rebased', 30)
+    // A bookmark written under the PREVIOUS numbering (v0 log, before the
+    // v0->v1->v2->v3 migration renumbered events) sits past the log's end.
+    const state = { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1 as const, checkpoint: { seq: 1720443 }, digest: '', audit: [] }, idleDispose: null, cancel: null }
+    await extractOnce(session, state, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    // The stale bookmark was discarded and the recent window extracted.
+    await access(join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md'), constants.F_OK)
+    assert.equal(state.checkpoint.checkpoint.seq, 30)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('extractOnce clears pending and records nothing when the window is empty', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const session = sessionLike('session-empty', 5)
+    // Counter stuck above the threshold with an already-extracted log: the
+    // bookmark is valid (seq 5 == last event), so nothing can be selected.
+    const state = { pending: 120, lastExtractAt: null, inFlight: true, checkpoint: { version: 1 as const, checkpoint: { seq: 5 }, digest: '', audit: [] }, idleDispose: null, cancel: null }
+    await extractOnce(session, state, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    assert.equal(state.pending, 0)
+    // No run was recorded (no LLM call, no checkpoint file).
+    await assert.rejects(() => access(join(tmp, 'peers', 'test-peer', 'sessions', 'session-empty.json'), constants.F_OK))
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('extractOnce keeps the checkpoint when the llm stream fails', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => (async function* (): AsyncIterable<any> { throw new Error('provider down') })())
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const session = sessionLike('session-llmerr', 30)
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-llmerr.json'), 'utf8'))
+    assert.match(checkpoint.audit[0].note, /llm-error/)
+    assert.equal(checkpoint.checkpoint.seq, 0)
+    const logLine = JSON.parse((await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0])
+    assert.equal(logLine.outcome, 'llm-error')
   } finally {
     await ctx.fiber.dispose()
     await rm(tmp, { recursive: true, force: true })
