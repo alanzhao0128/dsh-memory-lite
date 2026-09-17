@@ -123,3 +123,112 @@ test('client.js binds both the memory-lite and agent-default-model scopes', () =
   assert.ok(bound.includes('dsh-memory-lite'), 'memory-lite namespace bound')
   assert.ok(bound.includes('agent-default-model'), 'agent-default-model namespace bound for the model dropdown')
 })
+
+/* ------------------------------------------------------------------ *
+ * Stale stored value (2026-09-17): a route whose model was renamed or
+ * removed from the provider must stay visible in the dropdown — flagged —
+ * instead of letting the select fall back to its first entry (跟随全局默认)
+ * and hide the breakage. The same guard covers a stale reasoning effort.
+ * ------------------------------------------------------------------ */
+
+interface JsxNode { type: unknown; props: Record<string, unknown> }
+
+/** Minimal React hook runtime: renders the settings page twice in one test. */
+function makeHookRuntime() {
+  const cells: unknown[] = []
+  let cursor = 0
+  const useState = (init: unknown): [unknown, (next: unknown) => void] => {
+    const index = cursor
+    cursor += 1
+    if (!(index in cells)) cells[index] = typeof init === 'function' ? (init as () => unknown)() : init
+    return [cells[index], (next: unknown) => {
+      cells[index] = typeof next === 'function' ? (next as (prev: unknown) => unknown)(cells[index]) : next
+    }]
+  }
+  const useEffect = (fn: () => unknown): void => { cursor += 1; void fn() }
+  const useCallback = (fn: unknown): unknown => { cursor += 1; return fn }
+  return {
+    react: { useState, useEffect, useCallback },
+    render<T>(fn: () => T): T { cursor = 0; return fn() },
+  }
+}
+
+/** Render one element tree, expanding function components like React would. */
+function renderTree(node: unknown, out: JsxNode[] = []): JsxNode[] {
+  if (Array.isArray(node)) { for (const child of node) renderTree(child, out); return out }
+  if (node === null || typeof node !== 'object') return out
+  const element = node as JsxNode
+  if (typeof element.type === 'function') return renderTree((element.type as (props: unknown) => unknown)(element.props), out)
+  out.push(element)
+  return renderTree(element.props.children, out)
+}
+
+test('settings page flags a stored route whose model left the provider', async () => {
+  const STALE = 'huoshan/deepseek-v4-flash'
+  const hooks = makeHookRuntime()
+  const jsxStub2 = { jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }) }
+  const renderRequire = (name: string): unknown => {
+    if (name === 'react') return hooks.react
+    if (name === 'react/jsx-runtime') return { jsx: jsxStub2.jsx, jsxs: jsxStub2.jsx }
+    throw new Error('unexpected require: ' + name)
+  }
+  const { factory } = loadClient()
+  const plugin = factory(renderRequire) as { apply: (ctx: unknown, config: unknown) => void }
+
+  const scope = {
+    getSnapshot: () => ({ status: 'ready', value: { extraction: { llm: { route: STALE } } }, revision: 1, writable: true }),
+    subscribe: () => () => {},
+    mutate: async () => {},
+  }
+  const connection = {
+    rpc: { call: async (_path: string, method: string) => {
+      if (method === 'memory-models/snapshot') return { ok: true, value: { groups: [{ id: 'huoshan', name: '火山', models: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }] }] } }
+      if (method === 'memory-peers/snapshot') return { ok: true, value: { peers: [], mounts: [] } }
+      if (method === 'memory-model-efforts/snapshot') return { ok: true, value: { efforts: [], defaultEffort: undefined } }
+      return { ok: false }
+    } },
+    api: { settings: { mutate: async () => ({ result: { ok: true } }) } },
+  }
+  const agentDefaultScope = {
+    getSnapshot: () => ({ status: 'ready', value: { provider: 'huoshan', model: 'deepseek-v4.1-flash' } }),
+    subscribe: () => () => {},
+  }
+  const registered: unknown[] = []
+  const fakeCtx = {
+    get: (name: string) => {
+      if (name === 'connection') return connection
+      if (name === 'settingsScope') return { bind: () => scope }
+      return null
+    },
+    slots: {
+      inject: (_name: string, fn: () => unknown) => { fn() },
+      register: (opts: { name?: string }, component: unknown) => {
+        if (opts.name === 'settings.section') registered.push(component)
+        return { ...opts, component }
+      },
+    },
+  }
+  plugin.apply(fakeCtx, {})
+  assert.equal(registered.length, 1, 'settings.section component captured')
+  const page = registered[0] as (props: unknown) => unknown
+  const props = { scope, connection, agentDefaultScope }
+
+  // Before the catalog answers, the stored value must already stay selected.
+  const before = renderTree(hooks.render(() => page(props)))
+  assert.ok(before.find((n) => n.type === 'select' && n.props.value === STALE), 'stored route stays selected while the catalog loads')
+
+  // Once it answers, the value is known to be missing and must be flagged.
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const nodes = renderTree(hooks.render(() => page(props)))
+  const select = nodes.find((n) => n.type === 'select' && n.props.value === STALE)
+  assert.ok(select, 'stored route still selected once the catalog has answered')
+  const options = (Array.isArray(select!.props.children) ? select!.props.children : [select!.props.children]) as JsxNode[]
+  assert.ok(
+    options.some((opt) => opt.props.value === STALE && String(opt.props.children).includes('已失效')),
+    'dead route is rendered as an option flagged 已失效',
+  )
+  assert.ok(
+    nodes.some((n) => typeof n.props.children === 'string' && String(n.props.children).includes('已不在 provider')),
+    'warning text explains the dead route',
+  )
+})

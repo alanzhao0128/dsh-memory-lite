@@ -58,6 +58,7 @@ The plugin row in `cordis.patch.yml` carries **no configuration** (mount only); 
 Effect timing:
 
 - **Live** (apply on save): `extraction.*`, `index.maxTokens`, `defaultPeer`, `workspacePeers.*`, `ui.headerOrder` (after a refresh for the slot order).
+- **Stale model values**: if `extraction.llm.route` (or `reasoningEffort`) points at a model the provider has renamed or removed, the panel shows it as a flagged *已失效* option with a warning instead of silently displaying *跟随全局默认*. The plugin never rewrites it for you — extraction keeps failing until you pick a new value.
 - **Restart** (persisted, apply on next boot): `root`, `sharing.*` — `MemoryStore` pins them at construction; the panel labels them accordingly.
 
 ## Tools

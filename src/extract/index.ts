@@ -522,13 +522,32 @@ function resolveRoute(
   return undefined
 }
 
+/**
+ * Provider-facing detail of a failed finish. The harness carries the real
+ * reason on `finish.failure` (unknown model, context overflow, transport
+ * error, …); without it the audit log only says "llm-error" and the cause has
+ * to be re-derived from scratch (the 2026-09-16 `UNKNOWN_MODEL` incident).
+ */
+function finishFailureDetail(finish: {
+  readonly failure?: { readonly message?: string; readonly code?: string; readonly status?: number }
+}): string {
+  const failure = finish.failure
+  if (failure === undefined) return ''
+  const message = typeof failure.message === 'string' ? failure.message : ''
+  const code = typeof failure.code === 'string' && failure.code !== '' ? failure.code : ''
+  const status = typeof failure.status === 'number' ? String(failure.status) : ''
+  if (message === '') return code === '' ? '' : code + (status === '' ? '' : ' ' + status)
+  return message + (code === '' ? '' : ' [' + code + (status === '' ? '' : ' ' + status) + ']')
+}
+
 /** Assemble the streamed text and real token usage; a non-success finish throws. */
 async function collectStream(stream: AsyncIterable<StreamChunk>): Promise<{ text: string; usage: TokenUsage | undefined }> {
   const assembler = new BlockAssembler()
   for await (const chunk of stream) assembler.push(chunk)
   const finish = assembler.finish
   if (finish.kind === 'aborted' || finish.kind === 'error') {
-    throw new Error('llm stream finished with ' + finish.kind)
+    const detail = finishFailureDetail(finish)
+    throw new Error('llm stream finished with ' + finish.kind + (detail === '' ? '' : ': ' + detail))
   }
   return {
     text: assembler

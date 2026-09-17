@@ -769,6 +769,28 @@ extraction:
 
 **诊断设施**：`MemoryStore.appendFailedAnswer`（failed-answers.log，封顶滚动）。
 
+### 17.12 悬空模型值与错误详情（2026-09-17，v0.2.4）
+
+**事故**：提取自 2026-09-16 15:51 起连续 `llm-error`（durationMs 2–4、无真实 usage）。不是 provider 抖动：
+`dsh-memory-lite.extraction.llm.route` 仍写着用户已从 provider 模型清单里删掉的 `huoshan/deepseek-v4-flash`；
+harness 本地解析直接抛 `UNKNOWN_MODEL`（火山接口本身仍接受该 id，纯属配置层的悬空值）。回退链可排除——
+全局默认与会话 request/header 当时都是 `huoshan/deepseek-v4.1-flash`（存在），只有写死的 route 会被删。
+
+**为什么难查**：面板下拉选项按「当前 provider 目录」实时生成；存的值不在选项里时受控 `<select>` 退化为
+选中第一项（跟随全局默认），页面看上去完全正常；审计日志又只写 `llm-error`，把 provider 原文吞了。
+
+**改动**：
+
+1. `lib/client.js` `withStoredValue()`：存的值不在选项列表时，把它作为第一项显式渲染（`已失效` 标记 +
+   红色说明），列表尚未加载（catalog/effort 未返回）时只保留原值、不标记；路由与推理强度两个下拉共用。
+   另补：挂载时按已存 route 触发一次 efforts 拉取（此前只有手动重选 route 才会拉，强度下拉经常是空的）。
+2. `src/extract/index.ts` `finishFailureDetail()`：`finish.kind` 为 `error`/`aborted` 时把
+   `finish.failure.message`（附 `[code status]`）拼进错误，audit note 形如
+   `llm-error: llm stream finished with error: pi-ai provider "huoshan" has no configured model "..." [UNKNOWN_MODEL]`。
+
+**测试**：`tests/client.test.ts`（跨层渲染：列表未到达时保留原值、到达后标记失效并渲染警告）、
+`tests/extract-boot.test.ts`（error finish 携带 failure → note 含 provider 原文与 code）。测试 116 → 118，全绿。
+
 ---
 
 ## 18. 提取治理（A/B/C，2026-08-28/29）

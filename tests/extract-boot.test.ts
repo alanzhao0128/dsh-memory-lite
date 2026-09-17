@@ -391,6 +391,37 @@ test('extractOnce keeps the checkpoint when the llm stream fails', async () => {
   }
 })
 
+test('extractOnce records the provider failure detail on a terminal error finish', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    ctx.on('llm/stream', () => (async function* (): AsyncIterable<any> {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: 'pi-ai provider "huoshan" has no configured model "deepseek-v4-flash"', code: 'UNKNOWN_MODEL' },
+        },
+      }
+    })())
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const session = sessionLike('session-llmdetail', 30)
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-llmdetail.json'), 'utf8'))
+    // The note carries the provider's own wording, so a dead model route is
+    // diagnosable from the audit log alone (it used to say only llm-error).
+    assert.match(checkpoint.audit[0].note, /llm-error/)
+    assert.match(checkpoint.audit[0].note, /no configured model/)
+    assert.match(checkpoint.audit[0].note, /UNKNOWN_MODEL/)
+    assert.equal(checkpoint.checkpoint.seq, 0)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('extractOnce uses the global default model when route is unset (§17)', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
