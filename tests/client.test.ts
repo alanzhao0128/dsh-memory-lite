@@ -232,3 +232,76 @@ test('settings page flags a stored route whose model left the provider', async (
     'warning text explains the dead route',
   )
 })
+
+/**
+ * Render the settings page twice for one stored scope value: once immediately
+ * (fetches in flight) and once after they resolve, expanding components.
+ */
+async function renderSettings(
+  value: Record<string, unknown>,
+  effortsFor: Record<string, unknown>,
+): Promise<JsxNode[]> {
+  const hooks = makeHookRuntime()
+  const jsxStub3 = { jsx: (type: unknown, props: Record<string, unknown>) => ({ type, props }) }
+  const renderRequire = (name: string): unknown => {
+    if (name === 'react') return hooks.react
+    if (name === 'react/jsx-runtime') return { jsx: jsxStub3.jsx, jsxs: jsxStub3.jsx }
+    throw new Error('unexpected require: ' + name)
+  }
+  const { factory } = loadClient()
+  const plugin = factory(renderRequire) as { apply: (ctx: unknown, config: unknown) => void }
+  const scope = {
+    getSnapshot: () => ({ status: 'ready', value, revision: 1, writable: true }),
+    subscribe: () => () => {},
+    mutate: async () => {},
+  }
+  const connection = {
+    rpc: { call: async (_path: string, method: string, payload: { route?: string }) => {
+      if (method === 'memory-models/snapshot') return { ok: true, value: { groups: [{ id: 'huoshan', name: '火山', models: [{ id: 'deepseek-v4.1-flash', name: 'deepseek-v4.1-flash' }] }] } }
+      if (method === 'memory-peers/snapshot') return { ok: true, value: { peers: [], mounts: [] } }
+      if (method === 'memory-model-efforts/snapshot') return { ok: true, value: effortsFor[payload.route ?? ''] ?? { efforts: [], defaultEffort: undefined } }
+      return { ok: false }
+    } },
+    api: { settings: { mutate: async () => ({ result: { ok: true } }) } },
+  }
+  const agentDefaultScope = {
+    getSnapshot: () => ({ status: 'ready', value: { provider: 'huoshan', model: 'deepseek-v4.1-flash' } }),
+    subscribe: () => () => {},
+  }
+  const registered: unknown[] = []
+  const fakeCtx = {
+    get: (name: string) => (name === 'connection' ? connection : name === 'settingsScope' ? { bind: () => scope } : null),
+    slots: {
+      inject: (_name: string, fn: () => unknown) => { fn() },
+      register: (opts: { name?: string }, component: unknown) => {
+        if (opts.name === 'settings.section') registered.push(component)
+        return { ...opts, component }
+      },
+    },
+  }
+  plugin.apply(fakeCtx, {})
+  const page = registered[0] as (props: unknown) => unknown
+  const props = { scope, connection, agentDefaultScope }
+  hooks.render(() => page(props))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  return renderTree(hooks.render(() => page(props)))
+}
+
+test('effort dropdown follows the global default model while the route is unset', async () => {
+  // The field hint promises 跟随全局默认 = the default model's own effort; the
+  // list used to collapse to the single empty option, so a user following the
+  // global default could not pick a concrete effort at all.
+  const nodes = await renderSettings({ extraction: { llm: {} } }, {
+    'huoshan/deepseek-v4.1-flash': {
+      efforts: [{ id: 'off', name: '关闭' }, { id: 'high', name: '高' }, { id: 'max', name: '最大' }],
+      defaultEffort: undefined,
+    },
+  })
+  // Match on the fake payload's labels: extraction.mode also has an 'off'
+  // option, so a value match alone would hit the wrong select.
+  const selects = nodes.filter((n) => n.type === 'select')
+  const effortSelect = selects.find((n) => Array.isArray(n.props.children)
+    && (n.props.children as JsxNode[]).some((opt) => opt.props.children === '关闭'))
+  assert.ok(effortSelect, 'effort select offers the default model efforts')
+  assert.equal(effortSelect!.props.value, '', 'still follows the global default until the user picks one')
+})

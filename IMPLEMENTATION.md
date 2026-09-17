@@ -710,7 +710,7 @@ extraction:
 
 - 「提取模型」子分组（提取内容 与 可靠性 之间）：
   1. 模型下拉：跟随全局默认（当前：…） + 全部 `<provider> / <model>`。
-  2. 推理强度下拉：选中模型的 efforts（首项跟随全局默认）；无元数据 → 禁用。
+  2. 推理强度下拉：所选 route 的 efforts（首项跟随全局默认）；route 为空时按 **agent-default-model 当前模型**取，因此不固定提取模型也能选具体强度（§17.13）；无元数据 → 仅首项。
 
 ### 17.6 实现改动清单
 
@@ -790,6 +790,25 @@ harness 本地解析直接抛 `UNKNOWN_MODEL`（火山接口本身仍接受该 i
 
 **测试**：`tests/client.test.ts`（跨层渲染：列表未到达时保留原值、到达后标记失效并渲染警告）、
 `tests/extract-boot.test.ts`（error finish 携带 failure → note 含 provider 原文与 code）。测试 116 → 118，全绿。
+
+### 17.13 推理强度下拉跟随全局默认模型（2026-09-17，v0.2.5）
+
+**问题**：route 为空（跟随全局默认）时，强度下拉只有「跟随全局默认」一项——`useModelOptions` 只在 route 非空时
+才去取 efforts，不固定提取模型就**无法指定任何具体强度**，与字段 hint 的承诺不符。直接后果：v4.1-flash 继承
+`agent-default-model` 的 `reasoningEffort: max`，4096 token 预算被思考吃光、正文为空，连续两次「空回复→修复重试」
+（§17.11 的复发），而用户想改强度却改不了。
+
+**改动**（`lib/client.js`）：
+
+- `useModelOptions(connection, agentDefaultScope, selectedRoute)` 接收当前选择；route 为空时把 efforts 的目标 route
+  解析为 live 的全局默认模型（`defRoute`），effect 依赖 `effortRouteTarget` 自动重取（不再有手动 re-target）。
+- `effortOptionsFor` / `effortsReadyFor` 用同一套归一化（`'' → defRoute`），失效值标记对强度同样生效。
+- 删除 `selectRoute` 与相关挂载 effect / onChange 调用：选择变化 → 重渲染 → hook 自动重取。
+- SettingsPage 把 snapshot/value/selectedRoute 的计算提前到 hook 调用之前（纯代码移动，hook 顺序不变）。
+
+**效果**：route 不固定也能选 `off/high/max`；全局默认模型换了，强度选项与失效标记跟着变。
+
+**测试**：新增「route 为空时强度下拉给出全局默认模型的 efforts」。测试 118 → 119，全绿。
 
 ---
 
