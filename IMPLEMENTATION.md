@@ -912,16 +912,41 @@ shim 包，装进干净 profile —— 无 shim 时工具调用正常走完；�
 
 ---
 
-## 20. 后续待办
+## 20. root/sharing 启动时序 + connection 可选注入（2026-09-20，v0.2.8）
 
-- **`root` / `sharing.*` 设置不生效（2026-09-20 实测确认）**：面板写「重启生效」，但 `index.ts` 里
-  `live = { ...next, root: live.root, sharing: live.sharing }` 把这两个字段钉在**初始 row config** 上，
-  设置层的值永远进不来（实测：设置 `root=/tmp/...` 后插件仍写 `~/.agent-memory`）。修法：让 store 延迟构造，
-  或在首次 `onChange` 时按设置层重建 store。
-- 插件 `inject` 含 `connection`，headless profile 加载不了（本轮实测：`pending (waiting for service: connection)`）。
-  若希望 headless 可用，需把 `connection` 改成可选依赖。
+### 20.1 设置里的 root / sharing 从 08-27 起静默失效
 
-- **重启 dsh** 加载新 lib（方案 A/B/C + 双重后缀修复生效）。
-- 观察新提取质量：extraction.log 中 `skip` 占比应上升、`merge` 占比应上升、`create` 下降。
+**时间线（会话日志实证）**：sync 工作区最后一个目录注入里带 `## shared` 的会话是 **08-27 18:36**；
+之后所有会话（含 09-20 最新一条）都是 0 命中。而 08-26 12:46 的会话里能真读到
+`shared/dsh-test/entities/alan-从事量化研究.md` —— 即共享在配置迁到 `settings.yaml` 之前是好的。
+
+**根因**：08-27 的「方案 A」把插件配置从 row config 迁到 `~/.dsh/settings.yaml`（commit a55bf9c），
+而 `src/index.ts` 的 `onChange` 是 `live = { ...next, root: live.root, sharing: live.sharing }` ——
+把这两个字段钉在**初始 row config** 上。迁移前配置就在 row config 里，所以生效；迁移后配置只在设置层，
+永远进不来（面板 label「重启生效」是假的）。
+
+**修复**：`MemoryStore` 改成**首次使用时才构造**（`storeOf()`，`MemoryDeps.store` 变 getter），`onChange` 改为
+「store 尚未构造 → 采用设置层的 `next`；已构造 → 保持钉住的 root/sharing」。语义成为真·「启动按设置生效，
+运行中改动重启生效」。
+
+**测试**：新增 `settings-provided root and sharing apply on the boot that reads them`——row config 给一个空 root，
+设置层给真正含 peer 的 root + 一个 mount，断言 `memory-peers/snapshot` 的 peers 来自设置 root、mounts 来自设置层。
+原「root/sharing stay pinned」用例语义不变、继续通过。
+
+### 20.2 `connection` 改为可选注入
+
+`inject` 去掉 `connection`，四个浏览器 RPC 路由（status / peers / models / model-efforts）移入
+`ctx.inject(['connection'], (cctx) => …)`。headless profile 现在能加载插件（工具 + 提取照常），
+只是没有浏览器界面；此前是**整个 profile 启动失败**（`pending (waiting for service: connection)`）。
+
+**测试**：新增 `activates without the web-only connection service (headless profile)`——composition 里不放
+fake-connection，断言五个工具仍注册且 `connection` 确实不存在。测试 120 → 122。
+
+---
+
+## 21. 后续待办
+
+- `shared/<name>/` 的自挂载（`name` 与 `peer` 同值）按设计是「发布给除自己以外的所有 peer」，保留即可；
+  共享列表里的 `name` 只是目录名。
 - 偏差 16（llm-error 静默跳过）与偏差 17（create 竞态）——用户已记录"更值得处理"，待评估。
 - PTC 工具呈现适配（§10.1 已知问题）。

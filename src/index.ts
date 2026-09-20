@@ -43,9 +43,11 @@ import { createStatusTracker } from './status.js'
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-memory-lite'
 
-/** Services this plugin needs: the tool registry, the agent registry, the LLM stream,
- * and the timer service (ctx.timeout for the extraction idle backstop). */
-export const inject = ['tools', 'agents', 'llm', 'timer', 'connection']
+/** Services this plugin requires to activate: the tool registry, the agent registry,
+ * the LLM stream, and the timer service (ctx.timeout for the extraction idle
+ * backstop). `connection` is a web-app service and is injected optionally below, so
+ * a headless profile loads the plugin (tools + extraction) without browser surfaces. */
+export const inject = ['tools', 'agents', 'llm', 'timer']
 
 export { Config }
 
@@ -144,7 +146,12 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // (see installSettingsSection below), so every consumer reading through the
   // deps getter sees the newest value without re-registering.
   let live: ResolvedConfig = resolveConfig(config)
-  const store = new MemoryStore(live.root, live.sharing)
+  // MemoryStore pins root + sharing at construction, so build it on first use:
+  // the settings layer installs asynchronously at boot, and it must be able to
+  // supply root/sharing for THIS boot (a later edit stays restart-applied —
+  // see the onChange pinning below).
+  let store: MemoryStore | undefined
+  const storeOf = (): MemoryStore => (store ??= new MemoryStore(live.root, live.sharing))
   const defaultModel = (): { provider: string; model: string; reasoningEffort?: string } => {
     const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string; reasoningEffort?: string } } | undefined
     if (svc?.currentSelection === undefined) return { provider: '', model: '' }
@@ -154,7 +161,7 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       return { provider: '', model: '' }
     }
   }
-  const deps: MemoryDeps = { config: () => live, store, defaultModel }
+  const deps: MemoryDeps = { config: () => live, get store() { return storeOf() }, defaultModel }
   const readTool = applyReadMemoryTool(ctx, deps)
   applySearchMemoryTool(ctx, deps)
   applyRememberTool(ctx, deps)
@@ -172,96 +179,105 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
     const header = session.header as { cwd?: string; origin?: string } | undefined
     if (header?.cwd === undefined || header?.origin === 'subagent') return
     const peer = peerForHeader(header as Parameters<typeof peerForHeader>[0], live)
-    void store.rememberPeerCwd(peer, header.cwd)
+    void storeOf().rememberPeerCwd(peer, header.cwd)
   })
 
   // Settings-backed overrides (方案 A, IMPLEMENTATION.md §16): the cordis row
   // config is the composition base; user edits land in ~/.dsh/settings.yaml
-  // under the dsh-memory-lite namespace. root/sharing stay pinned to the store
-  // snapshot (restart-applies — MemoryStore holds them at construction); every
-  // other field resolves live on each change.
+  // under the dsh-memory-lite namespace. `root` + `sharing` are restart-applied
+  // (MemoryStore holds both at construction): the settings layer supplies them
+  // until the store is built, then the built pair stays pinned; every other
+  // field resolves live on each change.
   let source: () => MemoryConfig = () => config
   installSettingsCompat(ctx, 'dsh-memory-lite', Config, config, {
     setSource: (get) => { source = get },
     onChange: () => {
       const next = resolveConfig(source())
-      live = { ...next, root: live.root, sharing: live.sharing }
+      live = store === undefined
+        ? next
+        : { ...next, root: live.root, sharing: live.sharing }
     },
   })
 
-  // Browser indicator channel: the header dot polls this snapshot.
-  ctx.effect(
-    () => ctx.connection.fetch.register(rpcRoute('memory-status/snapshot', async (_endpoint, _payload, _signal) => ({
-      ok: true,
-      value: tracker.snapshot(live.extraction.mode),
-    }))),
-    'dsh-memory-lite: /api/memory-status/snapshot',
-  )
+  // Browser-facing RPC routes (status indicator + settings page). `connection`
+  // is a web-app service, so inject it optionally: a headless profile then loads
+  // the plugin (tools + extraction) and simply gets no browser surfaces, instead
+  // of failing the whole profile boot on a missing service.
+  void ctx.inject(['connection'], (cctx) => {
+    // Browser indicator channel: the header dot polls this snapshot.
+    cctx.effect(
+      () => cctx.connection.fetch.register(rpcRoute('memory-status/snapshot', async (_endpoint, _payload, _signal) => ({
+        ok: true,
+        value: tracker.snapshot(live.extraction.mode),
+      }))),
+      'dsh-memory-lite: /api/memory-status/snapshot',
+    )
 
-  // Settings UI: list existing peers so sharing.mounts can be edited as
-  // checkboxes instead of raw YAML (IMPLEMENTATION.md §16.9 known limit).
-  ctx.effect(
-    () => ctx.connection.fetch.register(rpcRoute('memory-peers/snapshot', async (_endpoint, _payload, _signal) => ({
-      ok: true,
-      value: {
-        peers: await store.listPeers(),
-        mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
-      },
-    }))),
-    'dsh-memory-lite: /api/memory-peers/snapshot',
-  )
+    // Settings UI: list existing peers so sharing.mounts can be edited as
+    // checkboxes instead of raw YAML (IMPLEMENTATION.md §16.9 known limit).
+    cctx.effect(
+      () => cctx.connection.fetch.register(rpcRoute('memory-peers/snapshot', async (_endpoint, _payload, _signal) => ({
+        ok: true,
+        value: {
+          peers: await storeOf().listPeers(),
+          mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
+        },
+      }))),
+      'dsh-memory-lite: /api/memory-peers/snapshot',
+    )
 
-  // Settings UI: model catalog for the extraction-model dropdown (§17). rc.1
-  // removed the browser connection.api.llm.models aggregate; rebuild the same
-  // {groups:[{id,name,models:[{id,name,reasoning?}]}]} shape host-side from
-  // ctx.llm (listProviders + listModels + resolveModelInfo) so the client
-  // settings page keeps working across host versions over our own RPC.
-  ctx.effect(
-    () => ctx.connection.fetch.register(rpcRoute('memory-models/snapshot', async (_endpoint, _payload, _signal) => {
-      const groups: unknown[] = []
-      try {
-        const llm = ctx.llm as {
-          listProviders?: () => readonly { readonly id: string; readonly name: string }[]
-          listModels?: (provider: string) => Promise<readonly { readonly id: string; readonly name: string; readonly description?: string }[]>
-          resolveModelInfo?: (provider: string, model: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }>
-        } | undefined
-        if (llm?.listProviders !== undefined) {
-          const providers = llm.listProviders()
-          for (const provider of providers) {
-            const models = llm.listModels !== undefined ? await llm.listModels(provider.id) : []
-            groups.push({ id: provider.id, name: provider.name, models })
+    // Settings UI: model catalog for the extraction-model dropdown (§17). rc.1
+    // removed the browser connection.api.llm.models aggregate; rebuild the same
+    // {groups:[{id,name,models:[{id,name,reasoning?}]}]} shape host-side from
+    // ctx.llm (listProviders + listModels + resolveModelInfo) so the client
+    // settings page keeps working across host versions over our own RPC.
+    cctx.effect(
+      () => cctx.connection.fetch.register(rpcRoute('memory-models/snapshot', async (_endpoint, _payload, _signal) => {
+        const groups: unknown[] = []
+        try {
+          const llm = ctx.llm as {
+            listProviders?: () => readonly { readonly id: string; readonly name: string }[]
+            listModels?: (provider: string) => Promise<readonly { readonly id: string; readonly name: string; readonly description?: string }[]>
+            resolveModelInfo?: (provider: string, model: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }>
+          } | undefined
+          if (llm?.listProviders !== undefined) {
+            const providers = llm.listProviders()
+            for (const provider of providers) {
+              const models = llm.listModels !== undefined ? await llm.listModels(provider.id) : []
+              groups.push({ id: provider.id, name: provider.name, models })
+            }
           }
+        } catch (error) {
+          cctx.logger.warn('dsh-memory-lite: /memory-models failed: ' + String(error))
         }
-      } catch (error) {
-        ctx.logger.warn('dsh-memory-lite: /memory-models failed: ' + String(error))
-      }
-      return { ok: true, value: { groups } }
-    })),
-    'dsh-memory-lite: /api/memory-models/snapshot',
-  )
+        return { ok: true, value: { groups } }
+      })),
+      'dsh-memory-lite: /api/memory-models/snapshot',
+    )
 
-  // Per-route reasoning efforts for the effort dropdown: resolved lazily so
-  // the catalog RPC stays cheap (resolveModelInfo per model would be N calls).
-  ctx.effect(
-    () => ctx.connection.fetch.register(rpcRoute('memory-model-efforts/snapshot', async (_endpoint, payload, _signal) => {
-      const route = String((payload as { route?: unknown } | null)?.route ?? '')
-      const slash = route.indexOf('/')
-      if (slash <= 0) return { ok: true, value: { efforts: [], defaultEffort: undefined } }
-      const provider = route.slice(0, slash)
-      const model = route.slice(slash + 1)
-      let efforts: readonly { readonly id: string; readonly name: string; readonly description?: string }[] = []
-      let defaultEffort: string | undefined
-      try {
-        const llm = ctx.llm as { resolveModelInfo?: (p: string, m: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }> } | undefined
-        const info = llm?.resolveModelInfo !== undefined ? await llm.resolveModelInfo(provider, model) : undefined
-        efforts = info?.reasoning?.efforts ?? []
-        defaultEffort = info?.reasoning?.defaultEffort
-      } catch (error) {
-        ctx.logger.warn('dsh-memory-lite: /memory-model-efforts failed: ' + String(error))
-      }
-      return { ok: true, value: { efforts, defaultEffort } }
-    })),
-    'dsh-memory-lite: /api/memory-model-efforts/snapshot',
-  )
+    // Per-route reasoning efforts for the effort dropdown: resolved lazily so
+    // the catalog RPC stays cheap (resolveModelInfo per model would be N calls).
+    cctx.effect(
+      () => cctx.connection.fetch.register(rpcRoute('memory-model-efforts/snapshot', async (_endpoint, payload, _signal) => {
+        const route = String((payload as { route?: unknown } | null)?.route ?? '')
+        const slash = route.indexOf('/')
+        if (slash <= 0) return { ok: true, value: { efforts: [], defaultEffort: undefined } }
+        const provider = route.slice(0, slash)
+        const model = route.slice(slash + 1)
+        let efforts: readonly { readonly id: string; readonly name: string; readonly description?: string }[] = []
+        let defaultEffort: string | undefined
+        try {
+          const llm = ctx.llm as { resolveModelInfo?: (p: string, m: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }> } | undefined
+          const info = llm?.resolveModelInfo !== undefined ? await llm.resolveModelInfo(provider, model) : undefined
+          efforts = info?.reasoning?.efforts ?? []
+          defaultEffort = info?.reasoning?.defaultEffort
+        } catch (error) {
+          cctx.logger.warn('dsh-memory-lite: /memory-model-efforts failed: ' + String(error))
+        }
+        return { ok: true, value: { efforts, defaultEffort } }
+      })),
+      'dsh-memory-lite: /api/memory-model-efforts/snapshot',
+    )
+  })
   ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
 }

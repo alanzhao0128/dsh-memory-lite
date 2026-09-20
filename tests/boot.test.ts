@@ -79,3 +79,41 @@ test('misconfigured plugin fails loud at boot', async () => {
     await rm(cwd, { recursive: true, force: true })
   }
 })
+
+test('activates without the web-only connection service (headless profile)', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'dsh-memory-boot-'))
+  try {
+    await access(PLUGIN_ENTRY, constants.F_OK)
+    const configPath = join(cwd, 'cordis.yml')
+    // Same composition as the web profile minus `connection`: a headless app
+    // provides no browser bridge, so the plugin must degrade to tools +
+    // extraction instead of failing the whole profile boot on
+    // "pending (waiting for service: connection)".
+    const rows = [
+      '- name: "@deepseek-ai/dsh-system-prompt"',
+      '- name: "@deepseek-ai/dsh-tools"',
+      '- name: "@deepseek-ai/dsh-agent"',
+      '- name: "@deepseek-ai/dsh-llm"',
+      '- name: "@deepseek-ai/cordis-plugin-timer"',
+      '- id: memory-lite',
+      `  name: "${PLUGIN_ENTRY}"`,
+      '  config:',
+      `    root: ${join(cwd, 'memory')}`,
+      '    defaultPeer: boot-test',
+      '',
+    ]
+    await writeFile(configPath, rows.join('\n'))
+    const ctx = await boot('dsh-memory-lite-headless-test', configPath, [], undefined, PROJECT_ROOT)
+    try {
+      assert.equal(ctx.get('connection'), undefined, 'this composition has no connection service')
+      const tools = ctx.get('tools')
+      for (const name of ['read_memory', 'search_memory', 'remember', 'update_memory', 'forget_memory']) {
+        assert.ok(tools.get(name), `expected tool ${name} without connection`)
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})

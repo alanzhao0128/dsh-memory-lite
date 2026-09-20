@@ -138,8 +138,7 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 - `forget_memory` 没有审批门控（模型可以直接软删除）。
 - `## Related` 的自动维护还没做。
 - 没有 CLI / MCP 入口。
-- 插件需要 `connection` 服务，因此只在 **web profile** 可用；headless profile 目前加载不了。
-- 浏览器半边（指示器 + 设置页）只在 dsh web profile 上验证过。
+- 浏览器半边（指示器 + 设置页）需要 web profile 的 `connection` 服务；headless profile 下插件照常加载（工具 + 提取可用），只是没有这两个界面。
 - 隐式提取的质量取决于你选的模型；小模型更容易产出需要 repair 的 JSON。
 
 ## 开发

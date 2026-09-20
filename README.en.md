@@ -139,7 +139,7 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 - `forget_memory` has no approval gate (the model can soft-delete directly).
 - `## Related` auto-maintenance is not implemented.
 - No CLI / MCP entry point.
-- The browser half (indicator + settings page) is verified on the dsh web profile only.
+- The browser half (indicator + settings page) needs the web profile's `connection` service; under a headless profile the plugin still loads (tools + extraction work) and simply has no browser surfaces.
 - Extraction quality depends on the model you pick; small models produce JSON that needs repair more often.
 
 ## Development
