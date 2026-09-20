@@ -877,7 +877,49 @@ PRIORITY：拿不准时 skip 优先于 create。只记几周后仍有用的事�
 
 ---
 
-## 19. 后续待办
+## 19. 插件依赖政策：DSH 核心包必须是 peerDependencies（2026-09-20，v0.2.7）
+
+**事故**：Linux 新机器全新安装后，**任何工具调用都崩**：`dsh: UNKNOWN: Cannot read properties of undefined
+(reading 'prepare')`；纯聊天正常，`tool/call` 已落盘但没有配对的 `tool/result`，错误不落盘栈。
+
+**根因**：`package.json` 把 4 个 DSH 核心包写进 `dependencies` 并钉死 `0.1.2-rc.1`。pnpm 会把它们 hoist 到
+`$DSH_HOME/profiles/<profile>/node_modules/`，profile 里于是出现**第二份物理拷贝**：
+
+| 解析起点 | 解析到 |
+|---|---|
+| profile 目录（cordis loader 的 base） | `profiles/<p>/node_modules/@deepseek-ai/dsh-tools`（0.1.2-rc.1，旧） |
+| fallback（`profiles/node_modules/@deepseek-ai/dsh-base` 等） | 宿主那份（0.1.5-rc.2） |
+
+`dsh-tools` 的调度器挂在**包内私有 Symbol** 上（`Symbol('@deepseek-ai/dsh-tools.scheduler')`，`lib/index.js:2430`）：
+注册侧写 `registry[TOOL_RUNTIME_SCHEDULER]`（`:2578` 的类字段），PTC 的 `run_code` 绑定在 `:1221` 读同一个
+Symbol 并调用 `scheduler.prepare()`（`:1272`）。两份拷贝 = 两个不同的 `Symbol()` → 读到 `undefined` → 抛错。
+模型对话不经过这个边界，所以表现为「聊天正常、一调工具就整轮失败」。
+
+**最小复现**（2026-09-20 本机验证，与插件无关）：造一个只声明 `"@deepseek-ai/dsh-tools": "0.1.2-rc.1"` 的
+shim 包，装进干净 profile —— 无 shim 时工具调用正常走完；装 shim 后立刻复现同样的 `prepare` 崩溃。
+
+**修复**：`dsh-tools` / `dsh-llm` / `dsh-atomic-write` / `dsh-home-paths` 从 `dependencies` 移到
+`peerDependencies`（`>=0.1.2-rc.1`）；`cordis` 本来就在 peer；`schemastery` 留在 `dependencies`
+（普通第三方库，不是宿主单例服务）。构建/测试需要的版本放 `devDependencies`。
+修复后新 profile 里只剩 `schemastery` + `cosmokit`，`@deepseek-ai/dsh-tools` 解析到宿主那份。
+
+**验证**：全新 profile 安装 0.2.7 tarball → 起 web profile → 发一条会触发工具调用的消息 → 6 次 `tool/call`
+全部有配对 `tool/result`（含 `remember` / `read_memory`），无 `prepare` 崩溃。
+
+**规则（所有 dsh 插件）**：任何会被宿主实例化或跨插件共享的 `@deepseek-ai/*` 包只能写 `peerDependencies`；
+写进 `dependencies` 就会在 profile 里 hoist 出第二份拷贝 —— **按版本对齐也没用**（同版本的重复物理拷贝同样失败，
+要的是「只有一份实例」）。纯工具库（如 `schemastery`）可以留 `dependencies`。
+
+---
+
+## 20. 后续待办
+
+- **`root` / `sharing.*` 设置不生效（2026-09-20 实测确认）**：面板写「重启生效」，但 `index.ts` 里
+  `live = { ...next, root: live.root, sharing: live.sharing }` 把这两个字段钉在**初始 row config** 上，
+  设置层的值永远进不来（实测：设置 `root=/tmp/...` 后插件仍写 `~/.agent-memory`）。修法：让 store 延迟构造，
+  或在首次 `onChange` 时按设置层重建 store。
+- 插件 `inject` 含 `connection`，headless profile 加载不了（本轮实测：`pending (waiting for service: connection)`）。
+  若希望 headless 可用，需把 `connection` 改成可选依赖。
 
 - **重启 dsh** 加载新 lib（方案 A/B/C + 双重后缀修复生效）。
 - 观察新提取质量：extraction.log 中 `skip` 占比应上升、`merge` 占比应上升、`create` 下降。

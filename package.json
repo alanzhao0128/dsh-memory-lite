@@ -1,6 +1,6 @@
 {
   "name": "@alanzhao/dsh-memory-lite",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Lightweight zero-dependency memory plugin for DeepSeek Harness: Markdown-file memory store, L0 catalog injection, and 5 model-facing tools.",
   "keywords": [
     "dsh",
@@ -48,14 +48,14 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-atomic-write": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-home-paths": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-atomic-write": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-home-paths": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.2-rc.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -65,6 +65,10 @@
     "@deepseek-ai/cordis-plugin-loader": "^1.0.3",
     "@deepseek-ai/cordis-plugin-timer": "^1.1.4",
     "@deepseek-ai/dsh-agent": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-atomic-write": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-home-paths": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-settings": "0.1.2-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
     "@deepseek-ai/dsh-app-boot": "0.1.2-rc.1",
     "@deepseek-ai/dsh-brand": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-client-connection": "^0.1.5-rc.1",
