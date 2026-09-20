@@ -305,3 +305,20 @@ test('effort dropdown follows the global default model while the route is unset'
   assert.ok(effortSelect, 'effort select offers the default model efforts')
   assert.equal(effortSelect!.props.value, '', 'still follows the global default until the user picks one')
 })
+
+test('an empty messageScope is shown as the host default (user + assistant)', async () => {
+  // The host resolves an empty list to its default (normalizeMessageScope:
+  // [] -> user+assistant), so the panel must render the same selection; before
+  // this it showed nothing checked while the runtime kept counting both kinds.
+  const nodes = await renderSettings({ extraction: { messageScope: [] } }, {})
+  const checkbox = (label: string): unknown => {
+    const row = nodes.find((n) => n.type === 'label'
+      && Array.isArray(n.props.children)
+      && (n.props.children as unknown[])[1] === label)
+    assert.ok(row, 'multicheck row ' + label + ' rendered')
+    return ((row!.props.children as JsxNode[])[0]).props.checked
+  }
+  assert.equal(checkbox('用户消息'), true)
+  assert.equal(checkbox('助手消息'), true)
+  assert.equal(checkbox('工具结果原文'), false)
+})

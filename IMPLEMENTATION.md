@@ -810,6 +810,22 @@ harness 本地解析直接抛 `UNKNOWN_MODEL`（火山接口本身仍接受该 i
 
 **测试**：新增「route 为空时强度下拉给出全局默认模型的 efforts」。测试 118 → 119，全绿。
 
+### 17.14 空 messageScope 的显示一致性（2026-09-20）
+
+**现象**：设置面板「计入窗口的消息类型」三项全不勾时，面板显示「什么都没选」，而运行时仍按默认
+（`user` + `assistant`）计数并进入窗口 —— UI 与实际行为不一致（用户 2026-09-20 报告）。
+
+**根因**：host 的 `normalizeMessageScope()` 把空数组当「用默认」（`length === 0 → ['user','assistant']`），
+而客户端 `fieldValue()` 只在字段**不存在**时才回落到 `DEFAULTS`；`[]` 算「存在」，于是渲染成全不勾。
+
+**改动**（`lib/client.js`）：
+
+1. `fieldValue()`：选中值是空数组且该字段有数组默认值时，回落成默认值渲染（与 host 同语义）。
+2. 保存时：multicheck 全不勾 → 写 `unset`，不再把 `[]` 存进设置文档（文档干净，语义仍是「用默认」）。
+3. 字段 hint 补一句「三项全不勾 = 用默认（用户 + 助手）」。
+
+**测试**：`tests/client.test.ts` 新增「空 messageScope 渲染为 user+assistant 勾选、tool_result 不勾」。测试 119 → 120。
+
 ---
 
 ## 18. 提取治理（A/B/C，2026-08-28/29）
