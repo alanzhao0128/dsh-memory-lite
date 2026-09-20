@@ -1,20 +1,32 @@
 {
   "name": "@alanzhao/dsh-memory-lite",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Lightweight zero-dependency memory plugin for DeepSeek Harness: Markdown-file memory store, L0 catalog injection, and 5 model-facing tools.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "memory",
+    "agent-memory",
+    "long-term-memory",
     "deepseek-harness"
   ],
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alanzhao0128/dsh-memory-lite.git"
+  },
+  "homepage": "https://github.com/alanzhao0128/dsh-memory-lite#readme",
+  "bugs": {
+    "url": "https://github.com/alanzhao0128/dsh-memory-lite/issues"
+  },
   "files": [
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
+    "docs",
     "LICENSE"
   ],
   "license": "MIT",
