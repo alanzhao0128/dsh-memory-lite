@@ -53,18 +53,46 @@ export { Config }
 
 /**
  * Install the memory-lite settings namespace on the host SettingsProvider
- * (dsh-settings >= 0.1.2). `installSection` registers the namespace with the
- * composition entry as the base layer, points the source thunk at the
- * resolved scope, and falls back to the entry when the service detaches.
+ * (dsh <= 0.1.5 via `installSection`) or adapt to SettingsForms (dsh >= 0.1.7).
+ *
+ * In 0.1.5: `installSection` registers the namespace with the composition entry
+ * as the base layer and wires up live updates.
+ * In 0.1.7: SettingsForms manages schema-derived volatile forms; `configure({ auto: false })`
+ * disables auto-generated fallback UI in favor of our own custom settings page, and
+ * `app-boot/config-reload` propagates live config updates from `cordis.patch.yml`.
  *
  * Rides ctx.inject so an absent settings service (host without one) is a
  * silent no-op rather than a hard inject failure.
  */
 function installSettingsCompat<T>(ctx: Context, ns: string, schema: unknown, entry: T, hooks: SettingsSectionHooks<T>): void {
   void ctx.inject(['settings'], (sctx) => {
-    const settings = sctx.settings as SettingsProvider | undefined
+    const settings = sctx.settings as (SettingsProvider & { configure?: (opts: { auto?: boolean }, owner?: unknown) => () => void }) | undefined
     if (settings === undefined) return
-    settings.installSection(sctx, ns as never, schema as never, entry, hooks)
+    // Branch A: dsh <= 0.1.5 (SettingsProvider with installSection)
+    if (typeof (settings as any).installSection === 'function') {
+      settings.installSection(sctx, ns as never, schema as never, entry, hooks)
+      return
+    }
+    // Branch B: dsh >= 0.1.7 (SettingsForms)
+    // 1. Point source to read from live entry / fiber config if available
+    hooks.setSource(() => {
+      const entryConfig = (ctx as any).fiber?.entry?.options?.config as T | undefined
+      const fiberConfig = (ctx as any).fiber?.config as T | undefined
+      return entryConfig ?? fiberConfig ?? entry
+    })
+    // 2. Disable auto-generated settings form if configure() is available
+    if (typeof settings.configure === 'function') {
+      sctx.effect(
+        () => settings.configure!({ auto: false }, (ctx as any).fiber),
+        'dsh-memory-lite: disable auto-generated settings form',
+      )
+    }
+    // 3. Listen to profile config reloads
+    ;(sctx as any).on('app-boot/config-reload', () => {
+      hooks.onChange()
+    })
+    // 4. Trigger initial change notification to sync with fiber config
+    hooks.onChange()
   })
 }
 

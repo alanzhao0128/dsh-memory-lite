@@ -146,56 +146,67 @@ export interface ResolvedConfig {
   ui: UiConfig
 }
 
+/**
+ * Mark a schema node editable without remounting in dsh >= 0.1.7 settings
+ * (SettingsForms / config-editor volatile form). Forward-compatible with older
+ * schemastery runtimes via extra('volatile', true).
+ */
+function asVolatile<T extends z<any>>(schema: T): T {
+  return typeof (schema as any).volatile === 'function'
+    ? (schema as any).volatile()
+    : (schema as any).extra('volatile', true)
+}
+
 /** Validate the plugin configuration shape. Unknown keys are tolerated for forward compatibility. */
 export const Config: z<MemoryConfig> = z.object({
-  root: z.string(),
-  defaultPeer: z.string(),
+  root: asVolatile(z.string()),
+  defaultPeer: asVolatile(z.string()),
   workspacePeers: z.object({
     enabled: z.boolean(),
     excludeSubagents: z.boolean(),
     cwdFallback: z.string(),
   }),
   index: z.object({
-    maxTokens: z.number(),
+    maxTokens: asVolatile(z.number()),
     sortBy: z.union([z.const('mtime')]),
   }),
   tools: z.object({
     schemaMinimal: z.boolean(),
   }),
   extraction: z.object({
-    mode: z.union([z.const('incremental'), z.const('explicit_only'), z.const('off')]),
-    windowTurns: z.number(),
-    idleTimeoutMin: z.number(),
-    maxMessages: z.number(),
-    messageScope: z.array(z.union([z.const('user'), z.const('assistant'), z.const('tool_result')])),
-    toolResultMaxBytes: z.number(),
-    includeDigest: z.boolean(),
-    dedup: z.boolean(),
+    mode: asVolatile(z.union([z.const('incremental'), z.const('explicit_only'), z.const('off')])),
+    windowTurns: asVolatile(z.number()),
+    idleTimeoutMin: asVolatile(z.number()),
+    maxMessages: asVolatile(z.number()),
+    messageScope: asVolatile(z.array(z.union([z.const('user'), z.const('assistant'), z.const('tool_result')]))),
+    toolResultMaxBytes: asVolatile(z.number()),
+    includeDigest: asVolatile(z.boolean()),
+    dedup: asVolatile(z.boolean()),
     llm: z.object({
-      route: z.string(),
-      reasoningEffort: z.string(),
+      route: asVolatile(z.string()),
+      reasoningEffort: asVolatile(z.string()),
       provider: z.string(),
       model: z.string(),
     }),
-    turnStoppingTrigger: z.boolean(),
-    flushTrigger: z.boolean(),
-    minTurnExtract: z.number(),
-    turnDebounceMs: z.number(),
-    auditLog: z.boolean(),
-    maxConcurrentRequests: z.number(),
-    parseRetry: z.boolean(),
+    turnStoppingTrigger: asVolatile(z.boolean()),
+    flushTrigger: asVolatile(z.boolean()),
+    minTurnExtract: asVolatile(z.number()),
+    turnDebounceMs: asVolatile(z.number()),
+    auditLog: asVolatile(z.boolean()),
+    maxConcurrentRequests: asVolatile(z.number()),
+    parseRetry: asVolatile(z.boolean()),
   }),
   sharing: z.object({
-    enabled: z.boolean(),
-    mounts: z.array(z.object({
+    enabled: asVolatile(z.boolean()),
+    mounts: asVolatile(z.array(z.object({
       name: z.string(),
       peer: z.string(),
       subpath: z.string(),
       readonly: z.boolean(),
-    })),
+    }))),
   }),
   ui: z.object({
-    headerOrder: z.number(),
+    headerOrder: asVolatile(z.number()),
   }),
 })
 

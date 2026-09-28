@@ -59,7 +59,7 @@ function applyWith(): { entries: SlotEntry[]; inject: string[] } {
   const { factory } = loadClient()
   const plugin = factory(fakeRequire) as { apply: (ctx: unknown, config: unknown) => void; inject: string[] }
   assert.equal(typeof plugin.apply, 'function')
-  assert.deepEqual(plugin.inject, ['connection', 'slots', 'settingsScope'])
+  assert.deepEqual(plugin.inject, ['connection', 'slots'])
   const entries: SlotEntry[] = []
   const fakeCtx = {
     get: (name: string) => {
@@ -99,12 +99,12 @@ test('client.js evaluates and registers the header indicator + settings page', (
   assert.equal(typeof settings!.component, 'function')
 })
 
-test('client.js binds the settingsScope namespace service', () => {
+test('client.js declares universal services in inject (dual-track compatibility)', () => {
   const { inject } = applyWith()
-  assert.ok(inject.includes('settingsScope'), 'inject declares settingsScope')
+  assert.deepEqual(inject, ['connection', 'slots'], 'inject declares only universal services without hardcoding settingsScope or configForms')
 })
 
-test('client.js binds both the memory-lite and agent-default-model scopes', () => {
+test('client.js binds settingsScope in dsh <= 0.1.5 environments', () => {
   const { factory } = loadClient()
   const plugin = factory(fakeRequire) as { apply: (ctx: unknown) => void }
   const bound: string[] = []
@@ -122,6 +122,29 @@ test('client.js binds both the memory-lite and agent-default-model scopes', () =
   plugin.apply(fakeCtx, {})
   assert.ok(bound.includes('dsh-memory-lite'), 'memory-lite namespace bound')
   assert.ok(bound.includes('agent-default-model'), 'agent-default-model namespace bound for the model dropdown')
+})
+
+test('client.js binds configForms in dsh >= 0.1.7 environments', () => {
+  const { factory } = loadClient()
+  const plugin = factory(fakeRequire) as { apply: (ctx: unknown) => void }
+  const requested: string[] = []
+  const fakeCtx = {
+    get: (name: string) => {
+      if (name === 'connection') return {
+        rpc: { call: async () => ({ ok: true, value: null }) },
+        api: { settings: { mutate: async () => ({ result: { ok: true } }) }, llm: { models: async () => ({ result: { ok: true, value: { groups: [], failures: [] } } }) } },
+      }
+      if (name === 'configForms') return {
+        describe: () => ({ getSnapshot: () => ({ view: { namespaces: [{ ns: 'memory-lite' }, { ns: 'agent-default-model' }] } }) }),
+        get: (id: string) => { requested.push(id); return fakeScope },
+      }
+      return null
+    },
+    slots: { inject: () => {}, register: (opts: SlotEntry, component: unknown) => ({ ...opts, component }) },
+  }
+  plugin.apply(fakeCtx, {})
+  assert.ok(requested.includes('memory-lite'), 'memory-lite entry requested via configForms')
+  assert.ok(requested.includes('agent-default-model'), 'agent-default-model entry requested via configForms')
 })
 
 /* ------------------------------------------------------------------ *

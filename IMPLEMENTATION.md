@@ -950,3 +950,39 @@ fake-connection，断言五个工具仍注册且 `connection` 确实不存在。
   共享列表里的 `name` 只是目录名。
 - 偏差 16（llm-error 静默跳过）与偏差 17（create 竞态）——用户已记录"更值得处理"，待评估。
 - PTC 工具呈现适配（§10.1 已知问题）。
+
+---
+
+## 22. dsh 0.1.7-rc.2 破坏性变更双轨兼容（v0.3.0）
+
+### 22.1 官方 0.1.7 核心架构变更与破坏面分析
+1. **全局设置系统重构**：
+   - 官方移除全局 `~/.dsh/settings.yaml`，启动时重命名为 `settings.yaml.imported`。
+   - 配置全部收归各 Profile 的 `cordis.patch.yml`（按 Loader entry id 映射）。
+   - 移除 `@deepseek-ai/dsh-settings` 的 `SettingsProvider.installSection()`，改由 `SettingsForms` 提供。
+   - `SettingsForms.write()` 强制校验 Schema 节点的 volatile 特性：未标记 `.volatile()` 的路径会被直接拒绝（`Config field "..." is not volatile`）。
+2. **前端客户端配置服务变更**：
+   - 前端包 `@deepseek-ai/dsh-client-ui-settings` 彻底删除了 `settingsScope` 服务，改为 `configForms`。
+   - 若客户端插件在 `inject` 中声明 `settingsScope`，在 0.1.7 运行时会导致插件因依赖无法满足而挂起，设置页面完全崩溃。
+
+### 22.2 双轨平滑兼容设计与改造实现
+1. **Schema 节点 volatile 标记（`src/config.ts`）**：
+   - 引入 `asVolatile` 辅助函数（在支持 `.volatile()` 的运行时调用该方法，在旧版通过 `.extra('volatile', true)` 设置元数据）。
+   - 为设置面板所有可编辑字段（`root`, `defaultPeer`, `index.maxTokens`, `extraction.*`, `sharing.*`, `ui.headerOrder`）打上 volatile 标记，确保 0.1.7 的 `SettingsForms` 允许在线热写入。
+2. **后端 `installSettingsCompat` 特征嗅探（`src/index.ts`）**：
+   - 探测 `sctx.settings.installSection`：若存在（dsh <= 0.1.5），走原方案 A 链路；
+   - 若不存在但提供 `SettingsForms`（dsh >= 0.1.7）：
+     - 调用 `settings.configure({ auto: false }, ctx.fiber)` 禁用官方简陋的自动表单；
+     - `source()` 挂钩 `entry.options.config ?? fiber.config ?? entry`；
+     - 监听 `app-boot/config-reload` 事件，当 `config-editor` 修改 patch 并热重载时触发 `hooks.onChange()`。
+3. **前端 Scope 动态解析（`lib/client.js`）**：
+   - `inject` 仅保留跨版本通用的 `['connection', 'slots']`，不再硬依赖 `settingsScope` 或 `configForms`；
+   - 实现 `resolveScope(ctx, defaultId, fallbackId)`：
+     - 若 `configForms` 存在，通过 `configForms.get(...)` 获取 scope；
+     - 若 `settingsScope` 存在，通过 `settingsScope.bind(...)` 获取 scope；
+     - 两者接口契约高度统一（`getSnapshot()`, `subscribe()`, `mutate()`），上层 React 组件完全无需重写。
+4. **集成测试矩阵扩展**：
+   - 新增 `tests/fixtures/fake-settings-forms.ts` 模拟 0.1.7 `SettingsForms`；
+   - 新增 `tests/settings-boot.test.ts` 中的 0.1.7 启动与 `config-reload` 热重载测试；
+   - 更新 `tests/client.test.ts` 覆盖 0.1.5 和 0.1.7 两种客户端环境；
+   - 测试套件扩展至 **124/124 全绿**。

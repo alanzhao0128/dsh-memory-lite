@@ -16,12 +16,14 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { boot } from '@deepseek-ai/dsh-app-boot'
 import type { FakeSettingsProvider } from './fixtures/fake-settings.js'
+import type { FakeSettingsForms } from './fixtures/fake-settings-forms.js'
 import { FakeConnectionService } from './fixtures/fake-connection.js'
 
 const PROJECT_ROOT = resolve(fileURLToPath(import.meta.url), '../..')
 const PLUGIN_ENTRY = join(PROJECT_ROOT, 'lib', 'index.js')
 const FAKE_CONNECTION_ENTRY = join(PROJECT_ROOT, 'tests', 'fixtures', 'fake-connection.ts')
 const FAKE_SETTINGS_ENTRY = join(PROJECT_ROOT, 'tests', 'fixtures', 'fake-settings.ts')
+const FAKE_SETTINGS_FORMS_ENTRY = join(PROJECT_ROOT, 'tests', 'fixtures', 'fake-settings-forms.ts')
 
 async function callRpc(conn: FakeConnectionService, endpoint: string, payload: unknown): Promise<any> {
   const route = conn.fetchRoutes.get('/api/' + endpoint)
@@ -191,6 +193,64 @@ test('settings-provided root and sharing apply on the boot that reads them', asy
         ['shared-peer'],
         'sharing must come from the settings layer, not only the row config',
       )
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('dsh >= 0.1.7 SettingsForms: disables auto-generated form and applies config-reload', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'dsh-settings-forms-boot-'))
+  try {
+    await access(PLUGIN_ENTRY, constants.F_OK)
+    const memoryRoot = join(cwd, 'memory')
+    const configPath = join(cwd, 'cordis.yml')
+    await writeFile(configPath, [
+      '- name: "@deepseek-ai/dsh-system-prompt"',
+      '- name: "@deepseek-ai/dsh-tools"',
+      '- name: "@deepseek-ai/dsh-agent"',
+      '- name: "@deepseek-ai/dsh-llm"',
+      '- name: "@deepseek-ai/cordis-plugin-timer"',
+      '- id: fake-connection',
+      `  name: "${FAKE_CONNECTION_ENTRY}"`,
+      '- id: fake-settings-forms',
+      `  name: "${FAKE_SETTINGS_FORMS_ENTRY}"`,
+      '- id: memory-lite',
+      `  name: "${PLUGIN_ENTRY}"`,
+      '  config:',
+      `    root: ${memoryRoot}`,
+      '    defaultPeer: boot-test',
+      '    extraction:',
+      '      mode: explicit_only',
+      '',
+    ].join('\n'))
+
+    const ctx = await boot('dsh-memory-lite-forms-test', configPath, [], undefined, PROJECT_ROOT)
+    try {
+      const settings = ctx.get('settings') as FakeSettingsForms
+      assert.ok(settings, 'SettingsForms mounted')
+      assert.equal(settings.configured.length, 1, 'configure() must be called once')
+      assert.equal(settings.configured[0]?.auto, false, 'must request auto: false to disable auto-generated form')
+
+      const connection = ctx.get('connection') as FakeConnectionService
+      const beforeSnap = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
+      assert.equal(beforeSnap.value.mode, 'explicit_only')
+
+      // Simulate a config update applied to the entry options and notify config-reload
+      const entry = [...ctx.loader.entries()].find(e => e.options.id === 'memory-lite')
+      assert.ok(entry, 'memory-lite loader entry found')
+      entry.options.config = {
+        root: memoryRoot,
+        defaultPeer: 'boot-test',
+        extraction: { mode: 'incremental' },
+      }
+
+      ctx.emit('app-boot/config-reload')
+
+      const afterSnap = await callRpc(connection, 'memory-status/snapshot', {}) as { value: { mode: string } }
+      assert.equal(afterSnap.value.mode, 'incremental', 'mode must update to incremental following config-reload')
     } finally {
       await ctx.fiber.dispose()
     }
