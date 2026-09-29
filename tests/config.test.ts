@@ -2,7 +2,29 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { resolveConfig, DEFAULT_MEMORY_ROOT, DEFAULT_PEER, DEFAULT_INDEX_MAX_TOKENS } from '../src/config.js'
+import { resolveConfig, Config, unwrapConfig, DEFAULT_MEMORY_ROOT, DEFAULT_PEER, DEFAULT_INDEX_MAX_TOKENS } from '../src/config.js'
+
+test('resolveConfig cleanly unwraps Schemastery volatile-parsed empty and populated configs', () => {
+  // When Cordis / Schemastery parses an entry whose schema uses .volatile(),
+  // volatile fields evaluate to { get: () => value }. resolveConfig must unwrap
+  // them without crashing on path.startsWith or similar primitive checks.
+  const parsedEmpty = Config({})
+  const resolvedFromEmpty = resolveConfig(parsedEmpty)
+  assert.equal(resolvedFromEmpty.defaultPeer, DEFAULT_PEER)
+  assert.equal(resolvedFromEmpty.root, join(homedir(), '.agent-memory'))
+  assert.equal(resolvedFromEmpty.extraction.mode, 'incremental')
+
+  const parsedPopulated = Config({
+    root: '~/custom-memory',
+    defaultPeer: 'test-peer',
+    extraction: { mode: 'explicit_only', windowTurns: 10 },
+  })
+  const resolvedFromPopulated = resolveConfig(parsedPopulated)
+  assert.equal(resolvedFromPopulated.defaultPeer, 'test-peer')
+  assert.equal(resolvedFromPopulated.root, join(homedir(), 'custom-memory'))
+  assert.equal(resolvedFromPopulated.extraction.mode, 'explicit_only')
+  assert.equal(resolvedFromPopulated.extraction.windowTurns, 10)
+})
 
 test('empty config resolves to documented defaults', () => {
   const config = resolveConfig({})

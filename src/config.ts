@@ -224,8 +224,34 @@ function normalizeMessageScope(scope: readonly ('user' | 'assistant' | 'tool_res
   return [...new Set(scope)]
 }
 
+/**
+ * Recursively unwrap Schemastery / Cosmokit `.volatile()` reference objects
+ * ({ get(): T }). A volatile field evaluates to a stable reference holder
+ * whose .get() yields the current value (or undefined when unconfigured).
+ * This unwraps them so resolveConfig and all internal code deal strictly with
+ * plain values.
+ */
+export function unwrapConfig<T>(obj: T): T {
+  if (obj === null || obj === undefined) return obj
+  if (typeof obj === 'object' && typeof (obj as any).get === 'function') {
+    return unwrapConfig((obj as any).get())
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(item => unwrapConfig(item)) as unknown as T
+  }
+  if (typeof obj === 'object' && Object.prototype.toString.call(obj) === '[object Object]') {
+    const res: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(obj)) {
+      res[key] = unwrapConfig(value)
+    }
+    return res as T
+  }
+  return obj
+}
+
 /** Normalize and default a raw configuration; throws on invalid values. */
-export function resolveConfig(config: MemoryConfig = {}): ResolvedConfig {
+export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
+  const config = unwrapConfig(rawConfig) ?? {}
   const root = resolve(expandHomePath(config.root ?? DEFAULT_MEMORY_ROOT))
   const defaultPeer = config.defaultPeer ?? DEFAULT_PEER
   if (defaultPeer === '' || defaultPeer.includes('/') || defaultPeer.includes('\\') || defaultPeer === '.' || defaultPeer === '..') {

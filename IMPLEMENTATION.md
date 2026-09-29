@@ -1010,3 +1010,18 @@ fake-connection，断言五个工具仍注册且 `connection` 确实不存在。
      - Gen 3（>=0.3.1 / v4）：`kind === 'plugin:dsh-memory-lite'`。
 3. **向后兼容性**：
    - dsh 0.1.5（v3）的 `assertMessageEventShape` 仅要求 `typeof source.kind === 'string' && source.kind !== ''`，对具体字符串完全开放，故新格式在 0.1.5 下同样合法。
+
+---
+
+## 24. Schemastery volatile 引用解包修复（v0.3.2）
+
+### 24.1 根因分析
+- 在 dsh 0.1.7 中，为了支持 `SettingsForms`，在 Schema 字段上标记了 `.volatile()`。
+- Schemastery 在解析带有 volatile 标记的字段时，会把结果包装成 `Volatile<T>` 引用对象 `{ get: () => T, Symbol(cosmokit.volatile.write): ... }`。
+- 当插件以默认配置启动时，Cordis 解析产生的 `config.root` 是一个包含 `.get()` 的引用对象，而不是原始字符串。
+- `resolveConfig` 直接调用 `expandHomePath(config.root ?? DEFAULT_MEMORY_ROOT)`，由于引用对象非空，未回退到默认值，直接将对象传入导致 `path.startsWith is not a function` 崩溃，导致插件无法激活。
+
+### 24.2 解决方案
+- 引入 `unwrapConfig` 递归函数，深度解包所有带有 `.get()` 方法的 Volatile 引用，将其还原为纯净的基础值（当未配置时解包出 `undefined`）。
+- 在 `resolveConfig` 开头首先对输入配置执行 `unwrapConfig`，确保后续所有路径展开与校验均运行在干净的 JavaScript 基础值之上。
+- 新增 `tests/config.test.ts` 测试用例，断言经 Schemastery `Config` 解析后的空配置与具名配置均能安全解析，测试矩阵 125/125 全绿。
