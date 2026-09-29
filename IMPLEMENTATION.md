@@ -986,3 +986,27 @@ fake-connection，断言五个工具仍注册且 `connection` 确实不存在。
    - 新增 `tests/settings-boot.test.ts` 中的 0.1.7 启动与 `config-reload` 热重载测试；
    - 更新 `tests/client.test.ts` 覆盖 0.1.5 和 0.1.7 两种客户端环境；
    - 测试套件扩展至 **124/124 全绿**。
+
+---
+
+## 23. dsh 0.1.7 v4 会话消息来源规范适配（v0.3.1）
+
+### 23.1 根因分析（官方 0.1.7 源码断点）
+- **会话格式升为 v4**（`SESSION_FORMAT_VERSION = 4`）：
+  - 官方彻底废除通用插件包装 `{ kind: 'plugin', plugin: '...' }`，`dsh-llm` 的 `MessageSourceMap` 移除了 `plugin` 键。
+  - `@deepseek-ai/dsh-session-format-v3-to-v4` 的 `assertV4SourceRowAdmission` / `assertV4MessageSources` 对原生 v4 消息进行硬性校验：`value["kind"] === "plugin" -> throw new SessionFormatError("format v4 message requires a producer-owned source kind")`。
+  - 插件在 0.2.3 规范下注入的 L0 catalog 携带 `source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' }`，在进入 v4 会话时被立即拒收报错。
+
+### 23.2 解决方案与双轨兼容
+1. **生成消息改为 v4 规范 Producer-owned 格式**：
+   - 官方 v3->v4 迁移规范对于三方插件统一映射为 `kind: 'plugin:<plugin-name>'`。
+   - `renderCatalogMessage` 与 `renderCatalogUpdate` 中的消息源更新为：
+     `source: { kind: 'plugin:dsh-memory-lite', form: 'catalog' }`。
+   - 后台提取构建的临时消息（`src/extract/index.ts`）同步改为 `kind: 'plugin:dsh-memory-lite'`。
+2. **全三代历史消息兼容识别**：
+   - `isMemoryCatalogSource` 升级支持：
+     - Gen 1（<0.2.3）：`kind === 'memory-catalog'`；
+     - Gen 2（0.2.3–0.3.0）：`kind === 'plugin' && plugin === 'dsh-memory-lite'`；
+     - Gen 3（>=0.3.1 / v4）：`kind === 'plugin:dsh-memory-lite'`。
+3. **向后兼容性**：
+   - dsh 0.1.5（v3）的 `assertMessageEventShape` 仅要求 `typeof source.kind === 'string' && source.kind !== ''`，对具体字符串完全开放，故新格式在 0.1.5 下同样合法。

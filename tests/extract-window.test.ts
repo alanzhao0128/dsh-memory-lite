@@ -100,11 +100,13 @@ test('scopeOfType and inScope map surface types to messageScope keys', () => {
 test('isConversationEvent accepts only real user input for user/message', () => {
   const real = { type: 'user/message', seq: 1, data: { source: { kind: 'user' } } }
   const injected = { type: 'user/message', seq: 2, data: { source: { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' } } }
+  const v4injected = { type: 'user/message', seq: 7, data: { source: { kind: 'plugin:dsh-memory-lite', form: 'catalog' } } }
   // Sessions written before 0.2.3 carry the private kind; it stays excluded too.
   const legacy = { type: 'user/message', seq: 6, data: { source: { kind: 'memory-catalog' } } }
   const sourceless = { type: 'user/message', seq: 3, data: {} }
   assert.equal(isConversationEvent(real), true)
   assert.equal(isConversationEvent(injected), false)
+  assert.equal(isConversationEvent(v4injected), false)
   assert.equal(isConversationEvent(legacy), false)
   assert.equal(isConversationEvent(sourceless), false)
   assert.equal(isConversationEvent({ type: 'assistant/message', seq: 4, data: {} }), true)

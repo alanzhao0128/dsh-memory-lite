@@ -28,7 +28,7 @@ After installing you should see:
 - a full settings page under **Settings → memory-lite** (screenshot below)
 - ask the model to remember something ("remember that I use pnpm") — it calls `remember` and a file lands under `~/.agent-memory/peers/<peer>/memories/preferences/` (directories are created on first use)
 
-Compatibility: **dsh ≥ 0.1.5** (dual-track compatibility for dsh 0.1.7 SettingsForms / configForms while retaining seamless backward compatibility with 0.1.5), Node ≥ 22.
+Compatibility: **dsh ≥ 0.1.5** (dual-track compatibility for dsh 0.1.7 SettingsForms/configForms and v4 producer-owned message source contracts while retaining seamless backward compatibility with 0.1.5), Node ≥ 22.
 
 <p align="center">
   <img src="docs/preview/settings-extraction.png" alt="Settings → memory-lite: extraction mode and triggers" width="560">

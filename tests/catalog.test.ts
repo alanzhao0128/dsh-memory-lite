@@ -28,15 +28,20 @@ const changedEntries = (): readonly IndexEntry[] => {
   return changed
 }
 
-test('the catalog source uses the official plugin kind with the catalog form', () => {
+test('the catalog source uses the producer-owned plugin:dsh-memory-lite kind with catalog form', () => {
   const message = renderCatalogMessage(entries, 'demo')
-  assert.deepEqual(message.source, { kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' })
+  assert.deepEqual(message.source, { kind: 'plugin:dsh-memory-lite', form: 'catalog' })
   assert.equal(isMemoryCatalogSource(message.source), true)
-  // The private kind written before 0.2.3 stays readable for old sessions.
+  // Generation 1: The private kind written before 0.2.3 stays readable for old sessions.
   assert.equal(isMemoryCatalogSource({ kind: 'memory-catalog', form: 'catalog', entries }), true)
+  // Generation 2: The v3 plugin wrapper written in 0.2.3–0.3.0 stays readable.
+  assert.equal(isMemoryCatalogSource({ kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' }), true)
+  // Generation 3: The v4 producer-owned kind.
+  assert.equal(isMemoryCatalogSource({ kind: 'plugin:dsh-memory-lite', form: 'catalog' }), true)
   assert.equal(isMemoryCatalogSource({ kind: 'user' }), false)
   assert.equal(isMemoryCatalogSource({ kind: 'plugin', plugin: 'other', form: 'catalog' }), false)
-  assert.equal(isMemoryCatalogSource({ kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'instructions' }), false)
+  assert.equal(isMemoryCatalogSource({ kind: 'plugin:other', form: 'catalog' }), false)
+  assert.equal(isMemoryCatalogSource({ kind: 'plugin:dsh-memory-lite', form: 'instructions' }), false)
   assert.equal(isMemoryCatalogSource(undefined), false)
 })
 
@@ -53,7 +58,7 @@ test('renderCatalogMessage carries entries, guidance, and peer', () => {
 test('renderCatalogUpdate marks the replacement framing', () => {
   const update = renderCatalogUpdate(entries, 'demo')
   assert.match(textOf(update), /replaces every earlier memory catalog/)
-  assert.equal(update.source.kind, 'plugin')
+  assert.equal(update.source.kind, 'plugin:dsh-memory-lite')
 })
 
 test('isCurrentCatalogText matches either framing and detects real change', () => {
@@ -111,7 +116,7 @@ test('applyCatalogDecision publishes on first sight', () => {
   assert.equal(result.kind, 'enter')
   const catalog = catalogMessage(result.messages)
   assert.ok(catalog)
-  assert.equal(catalog!.message.source.kind, 'plugin')
+  assert.equal(catalog!.message.source.kind, 'plugin:dsh-memory-lite')
   assert.match(catalog!.text, /memory index for the demo project/)
 })
 

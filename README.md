@@ -27,7 +27,7 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 - **设置 → memory-lite** 出现完整配置页（下图）
 - 对模型说「记住：我用 pnpm 作为包管理器」，它会调用 `remember`，文件落到 `~/.agent-memory/peers/<peer>/memories/preferences/`（首次使用会自动建目录）
 
-兼容性：**dsh ≥ 0.1.5**（已双轨适配 dsh 0.1.7 架构与 SettingsForms / configForms 配置体系，同时向后兼容 0.1.5），Node ≥ 22。
+兼容性：**dsh ≥ 0.1.5**（双轨适配 dsh 0.1.7 的 SettingsForms/configForms 配置体系与 v4 会话 producer-owned 消息来源契约，同时向后兼容 0.1.5），Node ≥ 22。
 
 <p align="center">
   <img src="docs/preview/settings-extraction.png" alt="设置 → memory-lite：提取模式与触发方式" width="560">

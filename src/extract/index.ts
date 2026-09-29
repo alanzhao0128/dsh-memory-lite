@@ -577,7 +577,7 @@ async function callExtraction(
     ...(route.reasoningEffort !== undefined ? { reasoningEffort: route.reasoningEffort } : {}),
     messages: [createUserMessage({
       content: [{ type: 'text', text: user }],
-      source: { kind: 'plugin', plugin: 'dsh-memory-lite' },
+      source: { kind: 'plugin:dsh-memory-lite' },
     })],
     system,
     maxTokens: EXTRACTION_MAX_TOKENS,

@@ -20,8 +20,17 @@ export interface IndexEntry {
 }
 
 /**
- * The injected catalog message uses the OFFICIAL `plugin` source kind with the
- * `catalog` form (see catalog.ts), so released session-format migrations can
- * always classify and carry it. The private `memory-catalog` kind written
- * before 0.2.3 is read back for old sessions but never written again.
+ * The injected catalog message uses the producer-owned `plugin:dsh-memory-lite`
+ * source kind with the `catalog` form (see catalog.ts), conforming to dsh 0.1.7
+ * session format v4 rules while preserving backward compatibility with v3.
+ * Pre-0.2.3 `memory-catalog` and 0.2.3–0.3.0 `{ kind: 'plugin', plugin: 'dsh-memory-lite' }`
+ * remain recognized on read.
  */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'plugin:dsh-memory-lite': {
+      kind: 'plugin:dsh-memory-lite'
+      form?: 'catalog'
+    }
+  }
+}

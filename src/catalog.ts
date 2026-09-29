@@ -15,11 +15,12 @@ import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type { IndexEntry } from './types.js'
 
 /**
- * The `plugin` name stamped on the catalog source: the official `plugin` kind
- * plus the official `catalog` form mark one plugin-published catalog without
- * inventing a source kind outside the released vocabulary.
+ * The plugin name and source kind stamped on the catalog source:
+ * `plugin:dsh-memory-lite` satisfies dsh 0.1.7 v4 producer-owned source admission
+ * while remaining fully valid in dsh 0.1.5.
  */
 export const MEMORY_CATALOG_PLUGIN = 'dsh-memory-lite'
+export const MEMORY_CATALOG_SOURCE_KIND = `plugin:${MEMORY_CATALOG_PLUGIN}` as const
 
 const GUIDANCE =
   'You have long-term memory tools (read_memory / search_memory / remember / update_memory / forget_memory). ' +
@@ -57,16 +58,22 @@ function textOfContent(content: unknown): string | undefined {
 }
 
 /**
- * Whether one message source is a memory catalog this plugin published. New
- * messages carry the official `plugin` kind with the `catalog` form; sessions
- * written before that change carry the private `memory-catalog` kind and stay
- * readable, so an already-published catalog is never published twice.
+ * Whether one message source is a memory catalog this plugin published.
+ * Recognizes all three historical representations:
+ * 1. Pre-0.2.3: { kind: 'memory-catalog' }
+ * 2. 0.2.3 - 0.3.0 (v3 format): { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' }
+ * 3. 0.1.7+ (v4 format & v3->v4 migrated): { kind: 'plugin:dsh-memory-lite', form: 'catalog' }
  */
 export function isMemoryCatalogSource(source: unknown): boolean {
   if (typeof source !== 'object' || source === null) return false
   const record = source as { readonly kind?: unknown; readonly plugin?: unknown; readonly form?: unknown }
+  // Generation 1: pre-0.2.3 legacy source
   if (record.kind === 'memory-catalog') return true
-  return record.kind === 'plugin' && record.plugin === MEMORY_CATALOG_PLUGIN && record.form === 'catalog'
+  // Generation 2: 0.2.3 - 0.3.0 v3 source wrapper
+  if (record.kind === 'plugin' && record.plugin === MEMORY_CATALOG_PLUGIN && record.form === 'catalog') return true
+  // Generation 3: 0.1.7 v4 producer-owned source kind (and v3->v4 migrated)
+  if (record.kind === MEMORY_CATALOG_SOURCE_KIND && record.form === 'catalog') return true
+  return false
 }
 
 /** The text one rendered catalog message publishes. */
@@ -90,7 +97,7 @@ export function renderCatalogMessage(entries: readonly IndexEntry[], peer: strin
         '</system-reminder>',
       ].join('\n'),
     }],
-    source: { kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' },
+    source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
   })
 }
 
@@ -109,7 +116,7 @@ export function renderCatalogUpdate(entries: readonly IndexEntry[], peer: string
         '</system-reminder>',
       ].join('\n'),
     }],
-    source: { kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' },
+    source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
   })
 }
 
