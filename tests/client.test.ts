@@ -147,6 +147,52 @@ test('client.js binds configForms in dsh >= 0.1.7 environments', () => {
   assert.ok(requested.includes('agent-default-model'), 'agent-default-model entry requested via configForms')
 })
 
+test('client.js self-heals lazy scope when configForms becomes available after apply()', () => {
+  const { factory } = loadClient()
+  const plugin = factory(fakeRequire) as { apply: (ctx: unknown) => void }
+  let configFormsAvailable = false
+  const requested: string[] = []
+  let slotInjectedProps: (() => { scope: { getSnapshot: () => { status: string; writable: boolean } } }) | null = null
+  const fakeCtx = {
+    get: (name: string) => {
+      if (name === 'connection') return {
+        rpc: { call: async () => ({ ok: true, value: null }) },
+        api: { settings: { mutate: async () => ({ result: { ok: true } }) }, llm: { models: async () => ({ result: { ok: true, value: { groups: [], failures: [] } } }) } },
+      }
+      if (name === 'configForms' && configFormsAvailable) return {
+        describe: () => ({ getSnapshot: () => ({ view: { namespaces: [{ ns: 'memory-lite' }, { ns: 'agent-default-model' }] } }) }),
+        get: (id: string) => { requested.push(id); return fakeScope },
+      }
+      return null
+    },
+    slots: {
+      inject: (_name: string, fn: () => SlotEntry) => {
+        const entry = fn()
+        if (entry.id === 'memory-lite') {
+          slotInjectedProps = (entry as { inject?: () => { scope: { getSnapshot: () => { status: string; writable: boolean } } } }).inject ?? null
+        }
+      },
+      register: (opts: SlotEntry, component: unknown) => ({ ...opts, component }),
+    },
+  }
+  // During apply(), configForms is not yet available
+  plugin.apply(fakeCtx, {})
+  assert.equal(requested.length, 0, 'no configForms requested before it is available')
+
+  // Later, configForms becomes available (e.g. gateway socket connects)
+  configFormsAvailable = true
+
+  // When slot inject runs (user opens settings)
+  assert.ok(typeof slotInjectedProps === 'function', 'slot inject factory registered')
+  const resolved = slotInjectedProps!()
+  assert.ok(resolved.scope, 'scope resolved')
+  const snap = resolved.scope.getSnapshot()
+  assert.equal(snap.status, 'ready')
+  assert.equal(snap.writable, true)
+  assert.ok(requested.includes('memory-lite'), 'memory-lite entry requested lazily')
+  assert.ok(requested.includes('agent-default-model'), 'agent-default-model entry requested lazily')
+})
+
 /* ------------------------------------------------------------------ *
  * Stale stored value (2026-09-17): a route whose model was renamed or
  * removed from the provider must stay visible in the dropdown — flagged —
