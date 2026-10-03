@@ -391,3 +391,35 @@ test('an empty messageScope is shown as the host default (user + assistant)', as
   assert.equal(checkbox('助手消息'), true)
   assert.equal(checkbox('工具结果原文'), false)
 })
+
+test('client.js wraps status dot with official Tooltip when available', () => {
+  let tooltipProps: unknown = null
+  const tooltipRequire = (name: string): unknown => {
+    if (name === '@deepseek-ai/dsh-client-ui-primitives') {
+      return { Tooltip: (props: unknown) => { tooltipProps = props; return { p: props } } }
+    }
+    return fakeRequire(name)
+  }
+  const { factory } = loadClient()
+  const plugin = factory(tooltipRequire) as { apply: (ctx: unknown, config: unknown) => void }
+  let headerComponent: ((props: unknown) => unknown) | null = null
+  const fakeCtx = {
+    get: (name: string) => (name === 'connection' ? { rpc: { call: async () => ({ ok: true, value: null }) } } : null),
+    slots: {
+      inject: (_name: string, fn: () => SlotEntry) => {
+        const entry = fn()
+        if (entry.id === 'memory-lite-status') {
+          headerComponent = entry.component as (props: unknown) => unknown
+        }
+      },
+      register: (opts: SlotEntry, component: unknown) => ({ ...opts, component }),
+    },
+  }
+  plugin.apply(fakeCtx, {})
+  assert.ok(headerComponent, 'headerComponent registered')
+  const hooks = makeHookRuntime()
+  const vnode = hooks.render(() => headerComponent!({ connection: { rpc: { call: async () => ({ ok: true, value: null }) } } })) as { type?: unknown; p?: { side?: string; label?: string } }
+  assert.ok(vnode && vnode.p, 'VNode rendered with props')
+  assert.equal(vnode.p.side, 'bottom')
+  assert.ok(typeof vnode.p.label === 'string', 'Tooltip label provided')
+})

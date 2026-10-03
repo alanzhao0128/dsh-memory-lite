@@ -1,6 +1,6 @@
 {
   "name": "@alanzhao/dsh-memory-lite",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Lightweight zero-dependency memory plugin for DeepSeek Harness: Markdown-file memory store, L0 catalog injection, and 5 model-facing tools.",
   "keywords": [
     "dsh",
@@ -42,7 +42,8 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-primitives"
       ],
       "platform": "web"
     }
