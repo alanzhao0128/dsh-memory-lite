@@ -81,13 +81,30 @@ function catalogText(message: UserMessage): string | undefined {
   return textOfContent((message as { readonly content?: unknown }).content)
 }
 
+/** Render the global charter section if present. */
+function renderGlobalCharter(globalCharter?: string): string[] {
+  if (globalCharter === undefined || globalCharter.trim() === '') return []
+  return [
+    '',
+    '## Global Agent Charter (~/.agent-memory/AGENTS.md)',
+    globalCharter.trim(),
+    '',
+  ]
+}
+
 /** The catalog message for this session's first publication. */
-export function renderCatalogMessage(entries: readonly IndexEntry[], peer: string, sharedMounts: readonly SharedMountNotice[] = []): UserMessage {
+export function renderCatalogMessage(
+  entries: readonly IndexEntry[],
+  peer: string,
+  sharedMounts: readonly SharedMountNotice[] = [],
+  globalCharter?: string,
+): UserMessage {
   return createUserMessage({
     content: [{
       type: 'text',
       text: [
         '<system-reminder>',
+        ...renderGlobalCharter(globalCharter),
         `This is your long-term memory index for the ${peer} project. It lists what you have memorized, one line per memory.`,
         'The full text of any memory is NOT loaded until you call read_memory — use the exact path from this index.',
         ...renderSections(entries),
@@ -95,26 +112,32 @@ export function renderCatalogMessage(entries: readonly IndexEntry[], peer: strin
         '',
         GUIDANCE,
         '</system-reminder>',
-      ].join('\n'),
+      ].filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'),
     }],
     source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
   })
 }
 
 /** The catalog message when the index changed and an older catalog is still visible. */
-export function renderCatalogUpdate(entries: readonly IndexEntry[], peer: string, sharedMounts: readonly SharedMountNotice[] = []): UserMessage {
+export function renderCatalogUpdate(
+  entries: readonly IndexEntry[],
+  peer: string,
+  sharedMounts: readonly SharedMountNotice[] = [],
+  globalCharter?: string,
+): UserMessage {
   return createUserMessage({
     content: [{
       type: 'text',
       text: [
         '<system-reminder>',
+        ...renderGlobalCharter(globalCharter),
         `The memory catalog for ${peer} changed. This complete catalog replaces every earlier memory catalog in this session:`,
         ...renderSections(entries),
         ...renderSharedMounts(sharedMounts),
         '',
         GUIDANCE,
         '</system-reminder>',
-      ].join('\n'),
+      ].filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'),
     }],
     source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
   })
@@ -131,9 +154,10 @@ export function isCurrentCatalogText(
   entries: readonly IndexEntry[],
   peer: string,
   sharedMounts: readonly SharedMountNotice[] = [],
+  globalCharter?: string,
 ): boolean {
-  return text === catalogText(renderCatalogMessage(entries, peer, sharedMounts))
-    || text === catalogText(renderCatalogUpdate(entries, peer, sharedMounts))
+  return text === catalogText(renderCatalogMessage(entries, peer, sharedMounts, globalCharter))
+    || text === catalogText(renderCatalogUpdate(entries, peer, sharedMounts, globalCharter))
 }
 
 /**

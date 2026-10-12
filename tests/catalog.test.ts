@@ -241,3 +241,31 @@ test('capCatalogEntries returns empty for a non-positive budget', () => {
   assert.deepEqual(capCatalogEntries(one, 100), [])
   assert.deepEqual(capCatalogEntries([], 1200), [])
 })
+
+test('renderCatalogMessage renders Global Agent Charter when provided', () => {
+  const charter = '# Global Charter\n- Rule 1: Always plan before action'
+  const message = renderCatalogMessage(entries, 'demo', [], charter)
+  const text = textOf(message)
+  assert.ok(text.includes('## Global Agent Charter (~/.agent-memory/AGENTS.md)'))
+  assert.ok(text.includes('Rule 1: Always plan before action'))
+})
+
+test('applyCatalogDecision publishes catalog when entries is empty but globalCharter is present', () => {
+  const charter = '# Global Charter\n- Rule 1'
+  const decision: PreStepDecision = { kind: 'resolve', messages: [] }
+  const res = applyCatalogDecision({
+    decision,
+    history: { published: false },
+    existing: undefined,
+    entries: [],
+    sharedMounts: [],
+    peer: 'empty-peer',
+    globalCharter: charter,
+  })
+  assert.equal(res.kind, 'enter')
+  if (res.kind === 'enter') {
+    assert.equal(res.messages.length, 1)
+    const text = textOf(res.messages[0] as UserMessage)
+    assert.ok(text.includes('Global Agent Charter'))
+  }
+})

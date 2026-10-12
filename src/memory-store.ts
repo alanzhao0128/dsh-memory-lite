@@ -199,6 +199,25 @@ export class MemoryStore {
     this.sharing = sharing
   }
 
+  /** Path of the global charter file (SOUL / Identity) directly under root. */
+  globalCharterPath(): string {
+    return join(this.root, 'AGENTS.md')
+  }
+
+  /**
+   * Read the global charter (AGENTS.md) if present under the memory root.
+   * Returns trimmed content or undefined if absent / empty / unreadable.
+   */
+  async readGlobalCharter(): Promise<string | undefined> {
+    try {
+      const text = await readFileNode(this.globalCharterPath(), 'utf8')
+      const trimmed = text.trim()
+      return trimmed === '' ? undefined : trimmed
+    } catch {
+      return undefined
+    }
+  }
+
   peersDir(): string {
     return join(this.root, 'peers')
   }

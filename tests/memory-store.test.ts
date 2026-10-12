@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryStore, normalizeContent, parseIndex, parseMemoryFile, renderMemoryFile, slugify, summaryOf, MutationQueue } from '../src/memory-store.js'
@@ -312,6 +312,20 @@ test('peer meta: displayName annotations round-trip and rememberPeerCwd writes o
     await store.rememberPeerCwd(peerA, '/somewhere/else')
     const aAfter = (await store.listPeers()).find(p => p.name === peerA)!
     assert.equal(aAfter.displayName, '健康分析')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('readGlobalCharter returns content when AGENTS.md exists and undefined when absent', async () => {
+  const { store, root } = await makeStore()
+  try {
+    const absent = await store.readGlobalCharter()
+    assert.equal(absent, undefined)
+
+    await writeFile(join(root, 'AGENTS.md'), '# Global Charter\n- Rule 1\n', 'utf8')
+    const present = await store.readGlobalCharter()
+    assert.equal(present, '# Global Charter\n- Rule 1')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

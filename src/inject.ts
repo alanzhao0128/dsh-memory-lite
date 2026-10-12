@@ -24,6 +24,8 @@ export interface CatalogDecisionParams {
   /** Shared mounts to advertise (Phase 3); drives the empty-index exception. */
   readonly sharedMounts: readonly SharedMountNotice[]
   readonly peer: string
+  /** Global charter content from ~/.agent-memory/AGENTS.md (SOUL/Identity) if present. */
+  readonly globalCharter?: string
 }
 
 /** Fixed catalog overhead (framing + guidance + section headers), approximate tokens. */
@@ -57,12 +59,12 @@ export function capCatalogEntries(entries: readonly IndexEntry[], maxTokens: num
  * nothing for a fresh empty index.
  */
 export function applyCatalogDecision(params: CatalogDecisionParams): PreStepDecision {
-  const { decision, history, existing, entries, sharedMounts = [], peer } = params
+  const { decision, history, existing, entries, sharedMounts = [], peer, globalCharter } = params
   if (decision.kind === 'reject') return decision
   // The official `plugin` + `catalog` source carries no payload, so "already
   // published and still current" is decided by the published message text.
   const current = (text: string | undefined): boolean =>
-    text !== undefined && isCurrentCatalogText(text, entries, peer, sharedMounts)
+    text !== undefined && isCurrentCatalogText(text, entries, peer, sharedMounts, globalCharter)
   if (current(history.visibleText)) {
     return existing === undefined
       ? decision
@@ -71,14 +73,14 @@ export function applyCatalogDecision(params: CatalogDecisionParams): PreStepDeci
   if (existing !== undefined && current(existing.text)) return decision
   // Phase 3: an empty local index still publishes a catalog when there are
   // shared mounts to advertise (otherwise the shared region is undiscoverable).
-  if (!history.published && entries.length === 0 && sharedMounts.length === 0) {
+  if (!history.published && entries.length === 0 && sharedMounts.length === 0 && (globalCharter === undefined || globalCharter === '')) {
     return existing === undefined
       ? decision
       : { kind: 'enter', messages: decision.messages.filter(message => message.id !== existing.message.id) }
   }
   const catalog = history.published
-    ? renderCatalogUpdate(entries, peer, sharedMounts)
-    : renderCatalogMessage(entries, peer, sharedMounts)
+    ? renderCatalogUpdate(entries, peer, sharedMounts, globalCharter)
+    : renderCatalogMessage(entries, peer, sharedMounts, globalCharter)
   return {
     kind: 'enter',
     messages: existing === undefined
@@ -105,6 +107,7 @@ export function applyMemoryCatalogInjection(
     const config = deps.config()
     const peer = peerForHeader(agent.session.header, config)
     const entries = capCatalogEntries(await deps.store.readIndex(peer), config.index.maxTokens)
+    const globalCharter = await deps.store.readGlobalCharter()
     const sharedMounts = config.sharing.enabled
       ? config.sharing.mounts
           .filter(mount => mount.peer !== peer)
@@ -117,6 +120,7 @@ export function applyMemoryCatalogInjection(
       entries,
       sharedMounts,
       peer,
+      globalCharter,
     })
   })
 }
