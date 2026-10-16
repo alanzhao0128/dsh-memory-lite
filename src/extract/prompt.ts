@@ -34,6 +34,7 @@ export function extractionSystem(): string {
     '- Before create, check the index. If an existing file covers the same topic (same entity/project/event/person), use merge into that file instead of create.',
     '- create only when no existing file covers the topic.',
     '- merge must add only NEW facts not already present in that file (no duplicates).',
+    '- Write each content line as fact text without a leading list bullet or empty lines.',
     '- If the new fact contradicts an existing file, use update (old content moves to History).',
     '',
     'Reply with exactly ONE JSON object matching this schema (choose one of the four):',
