@@ -40,7 +40,7 @@ Compatibility: **dsh ≥ 0.1.5** (dual-track compatibility for dsh 0.1.7 Setting
 |---|---|
 | Explicit memory (5 tools) | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`; `update` archives the previous content into `## History`, `forget` is a soft delete into `.trash/` |
 | L0 catalog injection | one resident catalog message per session (rendered from `_index.md`); re-published when the index changes or compaction moves it off the visible surface |
-| Implicit extraction | a background run feeds the new conversation window to the model and applies a create / merge / update / skip decision, with dedup search and parse-failure repair |
+| Implicit extraction | a background run feeds the new conversation window to the model and applies a create / merge / update / skip decision, with dedup search and parse-failure repair; merges ignore empty lines and deduplicate facts regardless of leading bullet prefixes |
 | Cross-peer sharing | mount another peer's memories read-only under `shared/<name>/` |
 | Header indicator | capsule + three-state dot in the session header, polling the run status every 10 s |
 | Peer isolation | the peer name derives from the session cwd (basename + short hash); cwd-less sessions fall back to `defaultPeer` |

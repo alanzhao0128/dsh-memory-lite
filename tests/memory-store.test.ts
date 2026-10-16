@@ -82,6 +82,33 @@ test('concurrent appends through the queue lose nothing', async () => {
   }
 })
 
+test('merges normalize bullet prefixes and skip empty and repeated facts', async () => {
+  const { store, root, peer } = await makeStore()
+  try {
+    await store.writeNewMemory(peer, 'preferences/x.md', 'X', 'existing')
+    const input = ' - existing\n- - new fact\nnew fact\n\n  \n-\n- -\n-1 is negative'
+    await store.appendCurrent(peer, 'preferences/x.md', input)
+    const { content } = await store.readFile(peer, 'preferences/x.md')
+    assert.equal(parseMemoryFile(content).current, '- existing\n- new fact\n- -1 is negative')
+    await store.appendCurrent(peer, 'preferences/x.md', input)
+    assert.equal((await store.readFile(peer, 'preferences/x.md')).content, content)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('merges compare legacy nested bullets without rewriting existing sections', async () => {
+  const { store, root, peer } = await makeStore()
+  try {
+    await store.writeNewMemory(peer, 'preferences/x.md', 'X', '- existing')
+    const before = await store.readFile(peer, 'preferences/x.md')
+    await store.appendCurrent(peer, 'preferences/x.md', 'existing\n- - existing\n-')
+    assert.equal((await store.readFile(peer, 'preferences/x.md')).content, before.content)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('updateCurrent archives the previous current into History (ADD-only)', async () => {
   const { store, root, peer } = await makeStore()
   try {

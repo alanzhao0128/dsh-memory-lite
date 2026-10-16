@@ -367,15 +367,20 @@ export class MemoryStore {
 
   /**
    * Append content as new Current bullets; creates the section when absent.
-   * Identical lines already in Current are skipped (no-op writes are dropped).
+   * Bullet prefixes and whitespace are ignored when deduplicating facts.
+   * Empty facts and no-op writes are dropped; existing content is preserved.
    */
   appendCurrent(peer: string, relPath: string, content: string): Promise<void> {
     return this.queue.enqueue(async () => {
       const existing = await this.readFile(peer, relPath)
       const parsed = parseMemoryFile(existing.content)
-      const bullets = content.split('\n').map(line => `- ${line}`)
-      const seen = new Set(parsed.current.split('\n').filter(line => line !== ''))
-      const fresh = bullets.filter(bullet => !seen.has(bullet))
+      const fact = (line: string): string => line.trim().replace(/^(?:-(?:\s+|$))+/, '').trim()
+      const seen = new Set(parsed.current.split('\n').map(fact))
+      const fresh = content.split('\n').map(fact).filter(line => {
+        if (!line || seen.has(line)) return false
+        seen.add(line)
+        return true
+      }).map(line => `- ${line}`)
       if (fresh.length === 0) return
       parsed.current = parsed.current === '' ? fresh.join('\n') : `${parsed.current}\n${fresh.join('\n')}`
       await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
