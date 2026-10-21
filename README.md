@@ -27,7 +27,7 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 - **设置 → memory-lite** 出现完整配置页（下图）
 - 对模型说「记住：我用 pnpm 作为包管理器」，它会调用 `remember`，文件落到 `~/.agent-memory/peers/<peer>/memories/preferences/`（首次使用会自动建目录）
 
-兼容性：**dsh ≥ 0.1.5**（双轨适配 dsh 0.1.7 的 SettingsForms/configForms 配置体系与 v4 会话 producer-owned 消息来源契约，同时向后兼容 0.1.5），Node ≥ 22。
+兼容性：**dsh ≥ 0.1.5**（首发支持 dsh 0.2.1-rc.2 规范与 engines 约束，原生兼容 Working Directory 解耦与 Subagent 托管 Activation 隔离机制；双轨适配 0.1.7+ SettingsForms/configForms，向后兼容 0.1.5），Node ≥ 22。
 
 <p align="center">
   <img src="docs/preview/settings-extraction.png" alt="设置 → memory-lite：提取模式与触发方式" width="560">
@@ -140,6 +140,14 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 - 没有 CLI / MCP 入口。
 - 浏览器半边（指示器 + 设置页）需要 web profile 的 `connection` 服务；headless profile 下插件照常加载（工具 + 提取可用），只是没有这两个界面。
 - 隐式提取的质量取决于你选的模型；小模型更容易产出需要 repair 的 JSON。
+
+## 变更历史 (Changelog)
+
+### v0.4.1
+- **DSH 0.2.1-rc.2 规范与 engines 对齐**：在 `package.json` 中声明 `"engines": { "dsh": ">=0.1.2-rc.1" }`，契合官方优先识别 `engines.dsh` 的最新兼容性机制。
+- **修复 Volatile 配置二次校验缺陷**：修复了在注入底层 `installSettingsCompat` 时未解包 Volatile Ref 导致的 `ValidationError`。
+- **L0 目录分类优先级固化与防截断**：`renderIndex` 强制按 `preferences -> entities -> experiences -> events` 优先级输出，并将默认 `index.maxTokens` 扩容至 2000，杜绝核心行为准则和资产信息被挤出上下文。
+- **后台提取三重硬门禁（Triple Gate）**：重构 `extractionSystem`，设立排他性负面清单（否决单次排错与临时工具抄录）、30天耐久度法则与激进 Merge 约束，彻底根除过度提取与记忆粉尘化。
 
 ## 开发
 

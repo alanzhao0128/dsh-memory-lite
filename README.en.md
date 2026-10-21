@@ -28,7 +28,7 @@ After installing you should see:
 - a full settings page under **Settings → memory-lite** (screenshot below)
 - ask the model to remember something ("remember that I use pnpm") — it calls `remember` and a file lands under `~/.agent-memory/peers/<peer>/memories/preferences/` (directories are created on first use)
 
-Compatibility: **dsh ≥ 0.1.5** (dual-track compatibility for dsh 0.1.7 SettingsForms/configForms and v4 producer-owned message source contracts while retaining seamless backward compatibility with 0.1.5), Node ≥ 22.
+Compatibility: **dsh ≥ 0.1.5** (full support for dsh 0.2.1-rc.2 specification and engines constraint, seamless integration with Working Directory decoupling and managed Subagent Activation isolation; dual-track compatibility for 0.1.7+ SettingsForms/configForms, backward compatible to 0.1.5), Node ≥ 22.
 
 <p align="center">
   <img src="docs/preview/settings-extraction.png" alt="Settings → memory-lite: extraction mode and triggers" width="560">
@@ -141,6 +141,14 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 - No CLI / MCP entry point.
 - The browser half (indicator + settings page) needs the web profile's `connection` service; under a headless profile the plugin still loads (tools + extraction work) and simply has no browser surfaces.
 - Extraction quality depends on the model you pick; small models produce JSON that needs repair more often.
+
+## Changelog
+
+### v0.4.1
+- **DSH 0.2.1-rc.2 Specification & Engines Alignment**: Declared `"engines": { "dsh": ">=0.1.2-rc.1" }` in `package.json`, adhering to the official priority evaluation of `engines.dsh`.
+- **Fixed Volatile Reference Validation Bug**: Resolved `ValidationError` during `installSettingsCompat` by cleanly unwrapping volatile references with `unwrapConfig`.
+- **L0 Catalog Category Priority & Anti-Truncation**: Enforced stable output priority in `renderIndex` (`preferences -> entities -> experiences -> events`) and expanded default `index.maxTokens` to 2000, preventing core rules and assets from being dropped by token budgets.
+- **Triple Gate for Background Extraction**: Overhauled `extractionSystem` with a strict negative exclusion list, 30-day durability test, and aggressive merge requirement to eliminate over-extraction and memory fragmentation.
 
 ## Development
 

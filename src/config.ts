@@ -15,7 +15,7 @@ export const DEFAULT_MEMORY_ROOT = '~/.agent-memory'
 /** Default peer used for sessions without a usable cwd. */
 export const DEFAULT_PEER = 'dsh-web'
 /** Default cap on catalog size, in approximate tokens. */
-export const DEFAULT_INDEX_MAX_TOKENS = 1200
+export const DEFAULT_INDEX_MAX_TOKENS = 2000
 /** Default session-header indicator slot order (ascending; -1 sits left of the built-in "Session log" capsule). */
 export const DEFAULT_HEADER_ORDER = -1
 
@@ -31,7 +31,7 @@ export interface WorkspacePeersConfig {
 
 /** L0 catalog sizing. */
 export interface IndexConfig {
-  /** Approximate token cap for the catalog; entries past the cap are truncated. Defaults to 1200. */
+  /** Approximate token cap for the catalog; entries past the cap are truncated. Defaults to 2000. */
   maxTokens: number
   /** Index sort order; `mtime` newest-first is the only supported value. Defaults to `mtime`. */
   sortBy: 'mtime'

@@ -26,7 +26,7 @@ import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
 // module-level installSettingsSection moved onto the provider). The host
 // settings service is that provider, so we call the method directly.
 import type { SettingsProvider, SettingsSectionHooks } from '@deepseek-ai/dsh-settings'
-import { Config, resolveConfig } from './config.js'
+import { Config, resolveConfig, unwrapConfig } from './config.js'
 import type { MemoryConfig, ResolvedConfig } from './config.js'
 import { MemoryStore } from './memory-store.js'
 import { peerForHeader } from './peer.js'
@@ -217,7 +217,7 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // until the store is built, then the built pair stays pinned; every other
   // field resolves live on each change.
   let source: () => MemoryConfig = () => config
-  installSettingsCompat(ctx, 'dsh-memory-lite', Config, config, {
+  installSettingsCompat(ctx, 'dsh-memory-lite', Config, unwrapConfig(config), {
     setSource: (get) => { source = get },
     onChange: () => {
       const next = resolveConfig(source())

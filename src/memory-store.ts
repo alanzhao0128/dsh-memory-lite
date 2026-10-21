@@ -146,7 +146,18 @@ export function renderIndex(peer: string, entries: readonly IndexEntry[], now: D
     if (list === undefined) byCategory.set(entry.category, [entry])
     else list.push(entry)
   }
-  for (const [category, list] of byCategory) {
+  // Enforce a stable priority order so preferences and critical entities always render first,
+  // preventing them from being truncated by L0 token caps when experiences grow large.
+  const orderedCategories = [
+    'preferences',
+    'entities',
+    'experiences',
+    'events',
+    ...[...byCategory.keys()].filter(k => !['preferences', 'entities', 'experiences', 'events'].includes(k)),
+  ]
+  for (const category of orderedCategories) {
+    const list = byCategory.get(category)
+    if (list === undefined || list.length === 0) continue
     lines.push(`## ${category}${hints[category] !== undefined ? ' ' + hints[category] : ''}`)
     for (const entry of list) lines.push(`- ${entry.path}: ${entry.summary}`)
     lines.push('')

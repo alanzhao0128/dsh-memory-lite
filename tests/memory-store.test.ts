@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MemoryStore, normalizeContent, parseIndex, parseMemoryFile, renderMemoryFile, slugify, summaryOf, MutationQueue } from '../src/memory-store.js'
+import { MemoryStore, normalizeContent, parseIndex, parseMemoryFile, renderMemoryFile, renderIndex, slugify, summaryOf, MutationQueue } from '../src/memory-store.js'
 import { MemoryPathError } from '../src/path.js'
 
 async function makeStore(): Promise<{ store: MemoryStore; root: string; peer: string }> {
@@ -329,4 +329,26 @@ test('readGlobalCharter returns content when AGENTS.md exists and undefined when
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('renderIndex enforces stable category priority (preferences -> entities -> experiences -> events)', () => {
+  // Input entries ordered with experiences first (mimicking mtime sort where an experience is newest)
+  const entries = [
+    { category: 'experiences', path: 'experiences/build.md', summary: 'build notes' },
+    { category: 'entities', path: 'entities/cpa.md', summary: 'cpa service' },
+    { category: 'preferences', path: 'preferences/style.md', summary: 'plan first' },
+    { category: 'events', path: 'events/deploy.md', summary: 'vps deploy' },
+  ]
+  const rendered = renderIndex('test-peer', entries, new Date('2026-10-21T00:00:00.000Z'))
+
+  // Verify section order in rendered markdown
+  const prefIndex = rendered.indexOf('## preferences')
+  const entIndex = rendered.indexOf('## entities')
+  const expIndex = rendered.indexOf('## experiences')
+  const evtIndex = rendered.indexOf('## events')
+
+  assert.ok(prefIndex !== -1 && entIndex !== -1 && expIndex !== -1 && evtIndex !== -1)
+  assert.ok(prefIndex < entIndex, 'preferences must precede entities')
+  assert.ok(entIndex < expIndex, 'entities must precede experiences')
+  assert.ok(expIndex < evtIndex, 'experiences must precede events')
 })
