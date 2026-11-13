@@ -69,6 +69,16 @@ export interface SharingConfig {
   mounts: SharingMountConfig[]
 }
 
+/** Retention for a memory file's History section and its full-snapshot archive. */
+export interface HistoryConfig {
+  /** Newest History entries kept per file (one line each); 0 drops History entirely. Defaults to 5. */
+  maxEntries: number
+  /** Max characters per History line; longer lines are cut with an ellipsis. Defaults to 240. */
+  entryMaxChars: number
+  /** Full pre-change snapshots kept per file under `<peer>/.history/`; 0 disables archiving. Defaults to 5. */
+  archiveKeep: number
+}
+
 /** Extraction model selection: an explicit route wins; empty = the global default model (agent-default-model). */
 export interface ExtractionLlmConfig {
   /** Combined "provider/model" route, e.g. 'deepseek-official/deepseek-v4-flash'. Empty = global default. */
@@ -119,6 +129,15 @@ export interface ExtractionConfig {
   maxConcurrentRequests: number
   /** On a failed JSON parse, one cheap repair call re-asks the model for valid JSON. Defaults to true. */
   parseRetry: boolean
+  /**
+   * Before a merge/update lands on an existing file, show the model that file's
+   * numbered Current lines and let it answer with line-targeted edits (or noop)
+   * instead of blindly appending. One extra LLM call, only for merge/update
+   * decisions. A failed reconcile falls back to a plain append. Defaults to true.
+   */
+  reconcile: boolean
+  /** Byte budget for the numbered Current shown to the reconcile call; larger files fall back to append. Defaults to 24576. */
+  reconcileMaxBytes: number
 }
 
 /** Raw plugin configuration as written in cordis.yml; every field optional. */
@@ -130,6 +149,7 @@ export interface MemoryConfig {
   tools?: Partial<ToolsConfig>
   extraction?: Partial<ExtractionConfig>
   sharing?: Partial<SharingConfig>
+  history?: Partial<HistoryConfig>
   ui?: Partial<UiConfig>
 }
 
@@ -143,6 +163,7 @@ export interface ResolvedConfig {
   tools: ToolsConfig
   extraction: ExtractionConfig
   sharing: SharingConfig
+  history: HistoryConfig
   ui: UiConfig
 }
 
@@ -195,6 +216,8 @@ export const Config: z<MemoryConfig> = z.object({
     auditLog: asVolatile(z.boolean()),
     maxConcurrentRequests: asVolatile(z.number()),
     parseRetry: asVolatile(z.boolean()),
+    reconcile: asVolatile(z.boolean()),
+    reconcileMaxBytes: asVolatile(z.number()),
   }),
   sharing: z.object({
     enabled: asVolatile(z.boolean()),
@@ -204,6 +227,11 @@ export const Config: z<MemoryConfig> = z.object({
       subpath: z.string(),
       readonly: z.boolean(),
     }))),
+  }),
+  history: z.object({
+    maxEntries: asVolatile(z.number()),
+    entryMaxChars: asVolatile(z.number()),
+    archiveKeep: asVolatile(z.number()),
   }),
   ui: z.object({
     headerOrder: asVolatile(z.number()),
@@ -291,6 +319,8 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
     auditLog: config.extraction?.auditLog ?? true,
     maxConcurrentRequests: config.extraction?.maxConcurrentRequests ?? 1,
     parseRetry: config.extraction?.parseRetry ?? true,
+    reconcile: config.extraction?.reconcile ?? true,
+    reconcileMaxBytes: config.extraction?.reconcileMaxBytes ?? 24576,
   }
   for (const [key, value] of [
     ['windowTurns', extraction.windowTurns],
@@ -300,6 +330,7 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
     ['turnDebounceMs', extraction.turnDebounceMs],
     ['maxConcurrentRequests', extraction.maxConcurrentRequests],
     ['idleTimeoutMin', extraction.idleTimeoutMin],
+    ['reconcileMaxBytes', extraction.reconcileMaxBytes],
   ] as const) {
     if (!Number.isInteger(value) || value < 0) {
       throw new Error(`dsh-memory-lite: extraction.${key} must be a non-negative integer, got ${value}`)
@@ -335,6 +366,23 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
       throw new Error('dsh-memory-lite: sharing mount subpath must not escape the memories root, got ' + JSON.stringify(mount.subpath))
     }
   }
+  const history = {
+    maxEntries: config.history?.maxEntries ?? 5,
+    entryMaxChars: config.history?.entryMaxChars ?? 240,
+    archiveKeep: config.history?.archiveKeep ?? 5,
+  }
+  for (const [key, value] of [
+    ['maxEntries', history.maxEntries],
+    ['entryMaxChars', history.entryMaxChars],
+    ['archiveKeep', history.archiveKeep],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new Error(`dsh-memory-lite: history.${key} must be a non-negative integer, got ${value}`)
+    }
+  }
+  if (history.entryMaxChars < 20) {
+    throw new Error(`dsh-memory-lite: history.entryMaxChars must be >= 20, got ${history.entryMaxChars}`)
+  }
   const ui = {
     headerOrder: config.ui?.headerOrder ?? DEFAULT_HEADER_ORDER,
   }
@@ -349,6 +397,7 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
     tools: { schemaMinimal: config.tools?.schemaMinimal ?? true },
     extraction,
     sharing,
+    history,
     ui,
   }
 }

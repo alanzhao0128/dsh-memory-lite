@@ -54,10 +54,12 @@ export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
       const existed = await deps.store.fileExists(peer, relPath)
       if (existed) {
         await deps.store.appendCurrent(peer, relPath, content)
+        // An existing file keeps its summary; it describes the whole file.
+        await deps.store.ensureIndexEntry(peer, relPath, summaryOf(content))
       } else {
         await deps.store.writeNewMemory(peer, relPath, title, content)
+        await deps.store.refreshIndexEntry(peer, relPath, summaryOf(content))
       }
-      await deps.store.refreshIndexEntry(peer, relPath, summaryOf(content))
       return { path: relPath, appended: existed }
     },
     presentCall(args): GenericCallView {

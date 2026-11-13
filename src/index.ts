@@ -179,7 +179,7 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   // supply root/sharing for THIS boot (a later edit stays restart-applied —
   // see the onChange pinning below).
   let store: MemoryStore | undefined
-  const storeOf = (): MemoryStore => (store ??= new MemoryStore(live.root, live.sharing))
+  const storeOf = (): MemoryStore => (store ??= new MemoryStore(live.root, live.sharing, live.history))
   const defaultModel = (): { provider: string; model: string; reasoningEffort?: string } => {
     const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string; reasoningEffort?: string } } | undefined
     if (svc?.currentSelection === undefined) return { provider: '', model: '' }

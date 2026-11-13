@@ -13,6 +13,8 @@ const OK_OUTCOMES = new Set([
   'create',
   'merge',
   'update',
+  'patch',
+  'noop',
   'skip',
   'parse-error-recovered',
 ])

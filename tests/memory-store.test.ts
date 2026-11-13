@@ -91,7 +91,8 @@ test('updateCurrent archives the previous current into History (ADD-only)', asyn
     assert.match(text, /## Current/)
     assert.match(text, /- use bun/)
     assert.match(text, /## History/)
-    assert.match(text, /- \d{4}-\d{2}-\d{2}: - use pnpm/)
+    assert.match(text, /- \d{4}-\d{2}-\d{2}: use pnpm/)
+    assert.ok(!text.includes('- - '), 'no nested double bullets')
     // Previous content survives only in History.
     assert.ok(!text.includes('pnpm') || /use pnpm/.test(text))
   } finally {

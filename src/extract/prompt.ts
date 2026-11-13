@@ -51,10 +51,15 @@ export function extractionSystem(): string {
     '- If the new fact contradicts an existing file, use update (old content moves to History).',
     '',
     'Reply with exactly ONE JSON object matching this schema (choose one of the four):',
-    '{"decision":"create","category":"preferences|entities|events|experiences","title":"...","content":"..."}',
+    '{"decision":"create","category":"preferences|entities|events|experiences","title":"...","summary":"...","content":"..."}',
     '{"decision":"merge","path":"...","content":"..."}',
     '{"decision":"update","path":"...","content":"..."}',
     '{"decision":"skip","reason":"..."}',
+    '',
+    'CONTENT FORMAT:',
+    '- content is plain text, one self-contained statement per line. Do NOT prefix lines with "- " or "* "; the store adds list markers itself.',
+    '- State the conclusion and, when it matters, the reason and the date (YYYY-MM-DD). Never record the debugging story.',
+    '- summary (create only, required): ONE sentence, at most 80 characters, describing what the whole file is about (topic and scope). It is shown in the memory index, so describe the file, not the latest fact.',
     '',
     'STRICT OUTPUT RULES:',
     '- Your entire reply must be exactly one JSON object and nothing else.',
@@ -63,6 +68,54 @@ export function extractionSystem(): string {
     '- Path values must be relative .md paths inside the memory root (e.g. preferences/tools.md).',
     '- category is required only for create.',
   ].join('\n')
+}
+
+/** The system instruction for the reconcile call that follows a merge/update on an existing file. */
+export function reconcileSystem(): string {
+  return [
+    'You maintain ONE existing memory file. You are given its current lines (numbered "N| text") and a proposed addition. Decide how to fold the addition in without duplicates or contradictions.',
+    'Reply with exactly ONE JSON object, one of:',
+    '{"decision":"noop","reason":"..."}',
+    '{"decision":"patch","ops":[...],"summary":"..."}',
+    'Operations (line numbers refer to the numbered lines shown):',
+    '- {"op":"replace","line":N,"content":"..."}: rewrite line N. Use this when the addition updates, corrects or contradicts that line; keep still-valid details and dates.',
+    '- {"op":"delete","line":N}: remove line N only when the addition clearly supersedes it or it is an exact duplicate.',
+    '- {"op":"insert","after":N,"content":"..."}: add new lines after line N (0 = top), next to related lines.',
+    '- {"op":"append","content":"..."}: add genuinely new facts at the end.',
+    'Rules:',
+    '- If every fact in the addition is already present, answer noop.',
+    '- Prefer replace over append when an existing line covers the same fact; never leave two lines that disagree.',
+    '- Do not touch unrelated lines. Never delete more than a few lines. At most 12 operations.',
+    '- content is plain text, one self-contained statement per line, without numbering and without a leading "- ".',
+    '- summary is optional: only give it when the file\'s overall topic changed; ONE sentence of at most 80 characters.',
+    '',
+    'STRICT OUTPUT RULES:',
+    '- Your entire reply must be exactly one JSON object and nothing else.',
+    '- No prose, no explanation, no markdown, no code fences, no trailing period.',
+    '- The JSON must be valid, balanced, and use half-width braces and quotes.',
+  ].join('\n')
+}
+
+/** The user turn for the reconcile call. */
+export function buildReconcileUser(
+  title: string,
+  numbered: string,
+  truncated: boolean,
+  kind: 'create' | 'merge' | 'update',
+  proposed: string,
+): string {
+  const hint = kind === 'update'
+    ? 'The extractor believes parts of the current file are OUTDATED or CONTRADICTED by this addition.'
+    : 'The extractor proposes adding this to the file.'
+  return [
+    `## Memory file: ${title}`,
+    '## Current lines' + (truncated ? ' (long lines shortened with …; replace/delete still work by line number)' : ''),
+    numbered,
+    '## Proposed addition',
+    hint,
+    proposed,
+    'Reply with the single JSON object only (see STRICT OUTPUT RULES).',
+  ].join('\n\n')
 }
 
 /** One line of the memory index: path plus one-line summary. */

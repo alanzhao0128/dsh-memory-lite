@@ -20,13 +20,14 @@ import { peerForHeader } from '../peer.js'
 import type { MemoryDeps } from '../tool-utils.js'
 import type { StatusTracker } from '../status.js'
 import { MEMORY_CATEGORIES } from '../types.js'
-import { slugify, summaryOf } from '../memory-store.js'
+import { parseMemoryFile, slugify, summaryOf } from '../memory-store.js'
+import { numberedView, PatchError } from '../patch.js'
 import { countsTowardExtraction, selectWindow, renderEventText } from './window.js'
 import { shouldExtractIdle, shouldExtractTurn, shouldExtractWindow } from './triggers.js'
-import { parseDecision, type ExtractionDecision } from './decision.js'
+import { parseDecision, parseReconcile, type ExtractionDecision, type ReconcileDecision } from './decision.js'
 import { digestApproxTokens, rollDigest } from './digest.js'
 import { emptyCheckpoint, parseCheckpoint, withRun, renderCheckpoint, type CheckpointFile } from './checkpoint.js'
-import { buildExtractionUser, extractionSystem } from './prompt.js'
+import { buildExtractionUser, buildReconcileUser, extractionSystem, reconcileSystem } from './prompt.js'
 
 const DIGEST_MAX_TOKENS = 100
 const MAX_KEYWORDS = 8
@@ -340,16 +341,65 @@ export async function extractOnce(
     }
   }
 
-  let path: string | undefined
+  // Reconcile: when a merge/update/create lands on an existing file, show the
+  // model that file's numbered lines so it can replace/delete/insert instead of
+  // blindly appending. One extra call, only on those paths.
+  const hooks: ApplyHooks = ext.reconcile
+    ? {
+        reconcile: async (request): Promise<ReconcileAnswer> => {
+          const view = numberedView(request.current, ext.reconcileMaxBytes)
+          if (view === undefined) return { kind: 'fallback', reason: 'current-too-large' }
+          const reconcileSystemText = reconcileSystem()
+          const reconcileUser = buildReconcileUser(request.title, view.text, view.truncated, request.kind, request.content)
+          metrics.llmCalls += 1
+          let call: Awaited<ReturnType<typeof callExtraction>>
+          try {
+            call = await callExtraction(ctx, route, reconcileSystemText, reconcileUser, signal)
+          } catch (error) {
+            if (signal.aborted) throw error
+            metrics.inputTokens += digestApproxTokens(reconcileSystemText) + digestApproxTokens(reconcileUser)
+            return { kind: 'fallback', reason: 'llm-error: ' + String(error).slice(0, 160) }
+          }
+          addUsage(metrics, call)
+          try {
+            return parseReconcile(call.text)
+          } catch (error) {
+            void store.appendFailedAnswer(peer, {
+              at: new Date().toISOString(),
+              session: session.id,
+              win: [windowStart, windowEnd],
+              route,
+              stage: 'reconcile',
+              error: String(error).slice(0, 300),
+              text: call.text,
+            })
+            return { kind: 'fallback', reason: 'parse-error: ' + String(error).slice(0, 160) }
+          }
+        },
+      }
+    : {}
+
+  let applied: AppliedDecision
   try {
-    path = await applyDecision(store, peer, decision)
+    applied = await applyDecisionDetailed(store, peer, decision, hooks)
   } catch (error) {
     await recordRun(rc, 'apply-error: ' + String(error).slice(0, 200), decision.kind, undefined, undefined, false)
     return
   }
+  if (applied.fallback !== undefined) {
+    ctx.logger.warn('dsh-memory-lite: reconcile fell back to append for ' + String(applied.path) + ' (' + applied.fallback + ')')
+  }
 
   const digest = rollDigest(state.checkpoint.digest, windowText, DIGEST_MAX_TOKENS)
-  await recordRun(rc, recovered ? 'parse-error-recovered' : undefined, decision.kind, path, digest, true)
+  await recordRun(
+    rc,
+    recovered ? 'parse-error-recovered' : undefined,
+    applied.applied,
+    applied.path,
+    digest,
+    true,
+    applied.fallback === undefined ? undefined : { reconcileFallback: applied.fallback },
+  )
 }
 
 /** The repair turn: convert a failed non-JSON answer into a valid JSON decision. */
@@ -376,6 +426,7 @@ async function recordRun(
   path: string | undefined,
   digest: string | undefined,
   advance: boolean,
+  extra: Record<string, unknown> = {},
 ): Promise<void> {
   const { ctx, state, store, peer, sessionId, windowStart, windowEnd, hits, route, metrics, startedAt, auditLog, tracker } = rc
   const durationMs = Date.now() - startedAt
@@ -396,6 +447,7 @@ async function recordRun(
     ...(metrics.cacheReadTokens > 0 ? { cacheReadTokens: metrics.cacheReadTokens } : {}),
     ...(metrics.cacheWriteTokens > 0 ? { cacheWriteTokens: metrics.cacheWriteTokens } : {}),
     durationMs,
+    ...extra,
   }
   // A failed run keeps the previous checkpoint so the same window is retried
   // on the next trigger; only a completed decision advances past it. The audit
@@ -426,6 +478,7 @@ async function recordRun(
       path: path ?? null,
       note: note ?? null,
       route: route ?? null,
+      ...extra,
     }
     await store.appendExtractionLog(peer, JSON.stringify(logLine))
     ctx.logger.info(
@@ -437,43 +490,120 @@ async function recordRun(
   tracker.reportRun(outcome, note ?? null, decision ?? null)
 }
 
+/** What the reconcile model is asked to fold into an existing file. */
+export interface ReconcileRequest {
+  readonly path: string
+  readonly title: string
+  /** The file's Current body (its numbering is what the model's line numbers refer to). */
+  readonly current: string
+  readonly kind: 'create' | 'merge' | 'update'
+  /** The proposed addition exactly as the extractor wrote it. */
+  readonly content: string
+}
+
+/** Reconcile result; `fallback` means "could not reconcile, append instead". */
+export type ReconcileAnswer = ReconcileDecision | { readonly kind: 'fallback'; readonly reason: string }
+
+/** Optional collaborators for {@link applyDecisionDetailed}. */
+export interface ApplyHooks {
+  /** Present = reconcile merge/update/create against an existing file before writing. */
+  readonly reconcile?: (request: ReconcileRequest) => Promise<ReconcileAnswer>
+}
+
+/** How a decision was actually applied (`patch`/`noop` come from reconcile). */
+export interface AppliedDecision {
+  readonly path: string | undefined
+  readonly applied: 'create' | 'merge' | 'update' | 'patch' | 'noop' | 'skip'
+  /** Why reconcile gave up and the change was appended instead. */
+  readonly fallback?: string
+}
+
 /** Apply one decision through the store (all writes go through the queue). */
 export async function applyDecision(
   store: MemoryStore,
   peer: string,
   decision: ExtractionDecision,
+  hooks: ApplyHooks = {},
 ): Promise<string | undefined> {
-  switch (decision.kind) {
-    case 'create': {
-      if (!MEMORY_CATEGORIES.includes(decision.category as never)) {
-        throw new Error('unknown category: ' + decision.category)
-      }
-      // Model sometimes writes a title ending in ".md"; strip it so the
-      // slug does not produce a double extension (e.g. foo.md.md).
-      const title = decision.title.replace(/\.md$/i, '')
-      const path = decision.category + '/' + slugify(title) + '.md'
-      // Conservative implicit-channel rule: never overwrite an existing memory
-      // (it may hold explicit user content); merge into it instead.
-      if (await store.fileExists(peer, path)) {
-        await store.appendCurrent(peer, path, decision.content)
-        await store.refreshIndexEntry(peer, path, summaryOf(decision.content))
-      } else {
-        await store.writeNewMemory(peer, path, decision.title, decision.content)
-        await store.refreshIndexEntry(peer, path, summaryOf(decision.content))
-      }
-      return path
+  return (await applyDecisionDetailed(store, peer, decision, hooks)).path
+}
+
+/**
+ * Apply one decision and report how it landed. Index summaries describe the
+ * whole file, so only a brand-new file (or an explicit `summary`) sets one;
+ * merging a fact never replaces it with that fact's first words.
+ */
+export async function applyDecisionDetailed(
+  store: MemoryStore,
+  peer: string,
+  decision: ExtractionDecision,
+  hooks: ApplyHooks = {},
+): Promise<AppliedDecision> {
+  if (decision.kind === 'skip') return { path: undefined, applied: 'skip' }
+  let path: string
+  let title: string | undefined
+  if (decision.kind === 'create') {
+    if (!MEMORY_CATEGORIES.includes(decision.category as never)) {
+      throw new Error('unknown category: ' + decision.category)
     }
-    case 'merge':
-      await store.appendCurrent(peer, decision.path, decision.content)
-      await store.refreshIndexEntry(peer, decision.path, summaryOf(decision.content))
-      return decision.path
-    case 'update':
-      await store.updateCurrent(peer, decision.path, decision.content)
-      await store.refreshIndexEntry(peer, decision.path, summaryOf(decision.content))
-      return decision.path
-    default:
-      return undefined
+    // Model sometimes writes a title ending in ".md"; strip it so the
+    // slug does not produce a double extension (e.g. foo.md.md).
+    title = decision.title.replace(/\.md$/i, '')
+    path = decision.category + '/' + slugify(title) + '.md'
+  } else {
+    path = decision.path
   }
+  // Conservative implicit-channel rule: a create never overwrites an existing
+  // memory (it may hold explicit user content); it folds into it instead.
+  const exists = await store.fileExists(peer, path).catch(() => false)
+  let fallback: string | undefined
+
+  if (exists && hooks.reconcile !== undefined) {
+    const file = await store.readFile(peer, path)
+    const parsed = parseMemoryFile(file.content)
+    if (parsed.current !== '') {
+      const answer = await hooks.reconcile({
+        path,
+        title: parsed.title === '' ? path : parsed.title,
+        current: parsed.current,
+        kind: decision.kind,
+        content: decision.content,
+      })
+      if (answer.kind === 'noop') return { path, applied: 'noop' }
+      if (answer.kind === 'patch') {
+        try {
+          const result = await store.patchCurrent(peer, path, answer.ops)
+          if (answer.summary !== undefined) await store.refreshIndexEntry(peer, path, answer.summary)
+          else if (result.changed) await store.ensureIndexEntry(peer, path, summaryOf(parsed.title === '' ? decision.content : parsed.title))
+          return { path, applied: result.changed ? 'patch' : 'noop' }
+        } catch (error) {
+          if (!(error instanceof PatchError)) throw error
+          fallback = 'patch-rejected: ' + error.message
+        }
+      } else {
+        fallback = answer.reason
+      }
+    }
+  }
+
+  const summary = decision.kind === 'update' || decision.kind === 'create' ? decision.summary : undefined
+  if (decision.kind === 'create' && !exists) {
+    await store.writeNewMemory(peer, path, decision.title, decision.content)
+    await store.refreshIndexEntry(peer, path, summary ?? summaryOf(decision.content))
+    return { path, applied: 'create' }
+  }
+  // With reconcile active, an update that could not be reconciled is appended:
+  // replacing Current with text the model wrote without seeing it would lose data.
+  const blindReplace = decision.kind === 'update' && !(exists && hooks.reconcile !== undefined)
+  if (blindReplace) {
+    await store.updateCurrent(peer, path, decision.content)
+    if (summary !== undefined) await store.refreshIndexEntry(peer, path, summary)
+    else await store.ensureIndexEntry(peer, path, summaryOf(decision.content))
+    return { path, applied: 'update' }
+  }
+  await store.appendCurrent(peer, path, decision.content)
+  await store.ensureIndexEntry(peer, path, summaryOf(decision.content))
+  return { path, applied: decision.kind === 'create' ? 'create' : decision.kind, ...(fallback === undefined ? {} : { fallback }) }
 }
 
 /**

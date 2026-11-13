@@ -39,7 +39,7 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 |---|---|
 | 显式记忆（5 个工具） | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`；`update` 把旧内容归档进 `## History`，`forget` 是软删除（进 `.trash/`） |
 | L0 目录注入 | 每个会话注入一条常驻的记忆目录消息（`_index.md` 渲染）；目录变化、或压缩把它挤出可见面时自动重发 |
-| 隐式提取 | 后台把新增对话窗口喂给模型，产出 create / merge / update / skip 决策，带去重检索与解析失败重试 |
+| 隐式提取 | 后台把新增对话窗口喂给模型，产出 create / merge / update / skip 决策，带去重检索与解析失败重试；落到已有文件前会再让模型对照该文件的编号行做一次「对账」（replace / delete / insert / noop），而不是盲目追加 |
 | 跨 peer 共享 | 把别的 peer 的记忆以只读方式挂到 `shared/<name>/` 下 |
 | 头部指示器 | 标题栏胶囊 + 三色点，每 10 秒轮询一次运行状态 |
 | peer 隔离 | peer 名由会话 cwd 推导（目录名 + 短哈希），无 cwd 的会话落到 `defaultPeer` |
@@ -79,6 +79,10 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 | 提取模型 | 提取模型 | 默认跟随全局默认模型（活值）；也可固定到某个 provider/model |
 | | 推理强度 | 按所选模型声明的强度读取；**建议 off** |
 | 可靠性 | 解析失败重试 | JSON 解析失败时一次廉价 repair 调用（默认开） |
+| 对账 | `extraction.reconcile` | merge / update 落到已有文件前，把该文件 Current 的编号行给模型，让它输出行级编辑或 noop；失败自动退回追加。默认开，每次 merge / update 多一次调用 |
+| | `extraction.reconcileMaxBytes` | 展示给对账调用的 Current 字节上限，默认 24576；更大的文件跳过对账、直接追加 |
+| History | `history.maxEntries` / `entryMaxChars` | 每个文件 History 只留最新 N 行（默认 5），每行最多 M 字符（默认 240）。仅在 `cordis.patch.yml` 里配置，**重启生效** |
+| | `history.archiveKeep` | 每次 update / patch 前把整个旧文件存成快照（默认保留最近 5 份，0 = 不存）。**重启生效** |
 | | 审计日志 | 写 `peers/{peer}/sessions/{session-id}.json` 与 `extraction.log` |
 | 目录注入 | 目录 token 上限 | L0 目录截断上限，默认 1200 |
 | 界面 | 指示器位置 | 标题栏 utilities 槽顺序；保存后刷新页面生效 |
@@ -97,16 +101,17 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 │   │   ├── _index.md              # L0 目录（生成；可人工编辑）
 │   │   ├── preferences/  entities/  events/  experiences/
 │   │   │   └── {slug}.md          # L1 全文
+│   ├── .history/{category}/{slug}.md/  # update / patch 前的完整旧文件快照（不参与检索与注入）
 │   └── sessions/                  # 提取书签 + 审计 + extraction.log
 └── .trash/                        # forget 的软删除（按日期分目录）
 ```
 
-每个记忆文件用 `## Current` / `## History` / `## Related` 三段；更新是归档而不是覆盖。四个分类是给模型的检索路径：preferences（总是相关）、entities（被提到的事实）、events（时间相关）、experiences（任务经验）。
+每个记忆文件用 `## Current` / `## History` / `## Related` 三段。更新前会把完整旧文件存进 `.history/` 快照，`## History` 本身只留最新几行一句话记录，不再整段堆旧内容。目录里的摘要描述整个文件：新建时由提取模型写一句话，之后 merge 不会再用最新事实的前几个字覆盖它。四个分类是给模型的检索路径：preferences（总是相关）、entities（被提到的事实）、events（时间相关）、experiences（任务经验）。
 
 ## 工作原理（简版）
 
 - **目录注入**：在 `agent/pre-step` 瀑布里把 `_index.md` 渲染成一条带官方 `plugin` + `catalog` 形式的 `user/message`；子代理会话不注入。
-- **提取**：按 `windowTurns` 或空闲触发 → 取窗口内消息 → grep 已有记忆去重 → 一次 LLM 决策 → 写文件 → 推进每会话书签。**失败不推进书签**，下次触发重试。
+- **提取**：按 `windowTurns` 或空闲触发 → 取窗口内消息 → grep 已有记忆去重 → 一次 LLM 决策 → （落到已有文件时）第二次 LLM「对账」：看着该文件的编号行输出 replace / delete / insert / append 或 noop，行号越界、整行被大幅缩写、一次删太多都会被拒绝并退回追加 → 写文件 → 推进每会话书签。**失败不推进书签**，下次触发重试。
 - **安全**：所有文件访问过包含边界（只允许相对路径；`..`、绝对路径、symlink 逃逸在执行层拒绝）。
 - **并发**：所有写入走串行队列 + 原子替换（tmp + rename）。
 
@@ -142,6 +147,13 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 - 隐式提取的质量取决于你选的模型；小模型更容易产出需要 repair 的 JSON。
 
 ## 变更历史 (Changelog)
+
+### v0.5.0（2026-11-13）
+- **不再嵌套项目符号**：已带 `-` / `1.` / `#` / 表格 / 缩进的行保持原样，只给普通行补 `- `；去重改为忽略列表标记后比较。
+- **History 有上限**：只留最新 `history.maxEntries` 行、每行截断；完整旧文件存进 `peers/{peer}/.history/`（不检索、不注入），按 `history.archiveKeep` 保留。
+- **目录摘要稳定**：`create` 要求提取模型给一句话 `summary`；`merge` / `remember` 追加不再覆盖已有摘要；`update` 可选带新摘要。
+- **对账（reconcile）**：merge / update / create 落到已有文件前，多一次 LLM 调用，模型对照该文件的编号行输出行级补丁或 noop；补丁校验失败或调用失败退回追加（update 在对账开启时不再盲目整体替换）。可用 `extraction.reconcile: false` 关闭。
+- 审计与 `extraction.log` 新增结果类型 `patch` / `noop`，对账退回时带 `reconcileFallback` 字段。
 
 ### v0.4.1
 - **DSH 0.2.1-rc.2 规范与 engines 对齐**：在 `package.json` 中声明 `"engines": { "dsh": ">=0.1.2-rc.1" }`，契合官方优先识别 `engines.dsh` 的最新兼容性机制。

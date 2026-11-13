@@ -5,12 +5,18 @@
  * @module dsh-memory-lite/src/memory-store
  */
 
-import { readFile as readFileNode, readdir, rename, stat } from 'node:fs/promises'
+import { readFile as readFileNode, readdir, rename, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import type { IndexEntry } from './types.js'
-import type { SharingConfig } from './config.js'
+import type { HistoryConfig, SharingConfig } from './config.js'
 import { containWithin, ensureDir, MemoryPathError, realpathSafe } from './path.js'
+import { applyPatch, bulletLines, lineKey, type PatchOp } from './patch.js'
+
+/** Current UTC date as YYYY-MM-DD. */
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10)
+}
 
 /** Serialize mutations so writers never interleave inside one memory tree. */
 export class MutationQueue {
@@ -26,6 +32,12 @@ export class MutationQueue {
 
 /** Cap on retained summary-log lines per peer (bounds the rolling log). */
 export const MAX_LOG_LINES = 5000
+
+/** Defaults for the History cap and sidecar archive (see {@link HistoryConfig}). */
+export const DEFAULT_HISTORY: HistoryConfig = { maxEntries: 5, entryMaxChars: 240, archiveKeep: 5 }
+
+/** Directory (beside `memories/`) that holds full pre-change snapshots. */
+export const ARCHIVE_DIR = '.history'
 
 /** UI-annotation metadata for one peer directory (never a path segment). */
 export interface PeerMeta {
@@ -204,10 +216,16 @@ export class MemoryStore {
   readonly root: string
   private readonly queue = new MutationQueue()
   readonly sharing: SharingConfig
+  readonly history: HistoryConfig
 
-  constructor(root: string, sharing: SharingConfig = { enabled: false, mounts: [] }) {
+  constructor(
+    root: string,
+    sharing: SharingConfig = { enabled: false, mounts: [] },
+    history: HistoryConfig = DEFAULT_HISTORY,
+  ) {
     this.root = root
     this.sharing = sharing
+    this.history = history
   }
 
   /** Path of the global charter file (SOUL / Identity) directly under root. */
@@ -302,7 +320,7 @@ export class MemoryStore {
    * keeps the `shared/<name>` prefix so tool output stays source-annotated.
    * `opts.write` marks a mutation so read-only mounts are rejected.
    */
-  async resolve(peer: string, relPath: string, opts: { write?: boolean } = {}): Promise<{ abs: string; rel: string }> {
+  async resolve(peer: string, relPath: string, opts: { write?: boolean } = {}): Promise<{ abs: string; rel: string; base: string }> {
     if (extname(relPath).toLowerCase() !== '.md') {
       throw new MemoryPathError(`memory path must end in .md: ${JSON.stringify(relPath)}`)
     }
@@ -316,11 +334,11 @@ export class MemoryStore {
     // other symlinked ancestors never leak into tool-facing paths.
     const memoriesReal = await realpathSafe(memories)
     const abs = await containWithin(memories, relPath)
-    return { abs, rel: relative(memoriesReal, abs) }
+    return { abs, rel: relative(memoriesReal, abs), base: memoriesReal }
   }
 
   /** Resolve a `shared/<name>/...` path against the declared mount, enforcing read-only. */
-  private async resolveShared(peer: string, relPath: string, opts: { write?: boolean }): Promise<{ abs: string; rel: string }> {
+  private async resolveShared(peer: string, relPath: string, opts: { write?: boolean }): Promise<{ abs: string; rel: string; base: string }> {
     if (!this.sharing.enabled) {
       throw new MemoryPathError('shared/ paths are disabled (sharing.enabled = false)')
     }
@@ -345,7 +363,7 @@ export class MemoryStore {
     await ensureDir(targetMemories)
     const subpath = mount.subpath === '' || mount.subpath === '.' ? '' : mount.subpath + '/'
     const targetAbs = await containWithin(targetMemories, subpath + inner)
-    return { abs: targetAbs, rel: relPath }
+    return { abs: targetAbs, rel: relPath, base: targetMemories }
   }
 
   async fileExists(peer: string, relPath: string): Promise<boolean> {
@@ -370,7 +388,7 @@ export class MemoryStore {
 
   /** Create a new memory file with the canonical skeleton. */
   writeNewMemory(peer: string, relPath: string, title: string, content: string): Promise<void> {
-    const bullets = content.split('\n').map(line => `- ${line}`).join('\n')
+    const bullets = bulletLines(content).join('\n')
     return this.queue.enqueue(async () => {
       await this.writeNow(peer, relPath, `# ${title}\n\n## Current\n${bullets}\n\n## History\n\n## Related\n`)
     })
@@ -378,15 +396,22 @@ export class MemoryStore {
 
   /**
    * Append content as new Current bullets; creates the section when absent.
-   * Identical lines already in Current are skipped (no-op writes are dropped).
+   * Lines that already exist in Current (ignoring list markers and surrounding
+   * whitespace) are skipped, and no-op writes are dropped. Lines that are
+   * already list items, headings, table rows or indented keep their shape
+   * instead of being wrapped in a second `- `.
    */
   appendCurrent(peer: string, relPath: string, content: string): Promise<void> {
     return this.queue.enqueue(async () => {
       const existing = await this.readFile(peer, relPath)
       const parsed = parseMemoryFile(existing.content)
-      const bullets = content.split('\n').map(line => `- ${line}`)
-      const seen = new Set(parsed.current.split('\n').filter(line => line !== ''))
-      const fresh = bullets.filter(bullet => !seen.has(bullet))
+      const seen = new Set(parsed.current.split('\n').map(lineKey).filter(key => key !== ''))
+      const fresh = bulletLines(content).filter(line => {
+        const key = lineKey(line)
+        if (key === '' || seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
       if (fresh.length === 0) return
       parsed.current = parsed.current === '' ? fresh.join('\n') : `${parsed.current}\n${fresh.join('\n')}`
       await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
@@ -394,24 +419,87 @@ export class MemoryStore {
   }
 
   /**
-   * Replace a memory's current content, archiving the previous current into
-   * History with a date. The previous content is never destroyed (ADD-only).
+   * Replace a memory's current content. The complete previous file is first
+   * saved as a snapshot under `<peer>/.history/<path>/` (outside `memories/`,
+   * so it is never searched or injected); History keeps only the newest
+   * `history.maxEntries` one-line entries.
    */
   updateCurrent(peer: string, relPath: string, content: string): Promise<void> {
     return this.queue.enqueue(async () => {
+      const resolved = await this.resolve(peer, relPath, { write: true })
       const existing = await this.readFile(peer, relPath)
       const parsed = parseMemoryFile(existing.content)
-      const date = new Date().toISOString().slice(0, 10)
+      await this.archiveSnapshot(resolved, existing.content)
       if (parsed.current !== '') {
-        const oldLines = parsed.current.split('\n')
-        const entry = `- ${date}: ${oldLines[0]}`
-        const continuation = oldLines.slice(1).map(line => `  ${line}`).join('\n')
-        const historyEntry = continuation === '' ? entry : `${entry}\n${continuation}`
-        parsed.history = parsed.history === '' ? historyEntry : `${parsed.history}\n${historyEntry}`
+        const firstLine = (parsed.current.split('\n').find(line => line.trim() !== '') ?? '').replace(/^\s*(?:[-*+]\s+)+/, '')
+        parsed.history = this.pushHistory(parsed.history, `- ${todayUtc()}: ${firstLine}`)
+      } else {
+        parsed.history = this.pushHistory(parsed.history)
       }
-      parsed.current = content.split('\n').map(line => `- ${line}`).join('\n')
+      parsed.current = bulletLines(content).join('\n')
       await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
     })
+  }
+
+  /**
+   * Apply line-targeted patch operations to a memory's Current section (line
+   * numbers are 1-based positions in the Current body, as shown to the
+   * reconcile model). Validates everything before writing; a rejected patch
+   * leaves the file untouched. Returns whether the file changed.
+   */
+  patchCurrent(peer: string, relPath: string, ops: readonly PatchOp[]): Promise<{ changed: boolean; replaced: number; deleted: number; added: number }> {
+    return this.queue.enqueue(async () => {
+      const resolved = await this.resolve(peer, relPath, { write: true })
+      const existing = await this.readFile(peer, relPath)
+      const parsed = parseMemoryFile(existing.content)
+      const result = applyPatch(parsed.current === '' ? [] : parsed.current.split('\n'), ops)
+      const next = result.lines.join('\n').trim()
+      if (next === parsed.current) return { changed: false, replaced: 0, deleted: 0, added: 0 }
+      await this.archiveSnapshot(resolved, existing.content)
+      parsed.current = next
+      parsed.history = this.pushHistory(
+        parsed.history,
+        `- ${todayUtc()}: patch（替换 ${result.replaced} / 删除 ${result.deleted} / 新增 ${result.added} 行）`,
+      )
+      await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
+      return { changed: true, replaced: result.replaced, deleted: result.deleted, added: result.added }
+    })
+  }
+
+  /** Append one entry (when given) to a History body, then enforce the retention cap. */
+  private pushHistory(history: string, entry?: string): string {
+    const entries = history === '' ? [] : history.split(/\n(?=- )/)
+    if (entry !== undefined) entries.push(entry)
+    const { maxEntries, entryMaxChars } = this.history
+    if (maxEntries <= 0) return ''
+    return entries
+      .slice(-maxEntries)
+      .map(item => {
+        const head = (item.split('\n')[0] ?? '').trimEnd()
+        return head.length <= entryMaxChars ? head : head.slice(0, entryMaxChars - 1) + '…'
+      })
+      .join('\n')
+  }
+
+  /**
+   * Save the complete previous file text as `<peer>/.history/<rel>/<utc>.md`
+   * and prune to the newest `history.archiveKeep` snapshots. Best effort: a
+   * failure to archive never blocks the memory write itself.
+   */
+  private async archiveSnapshot(resolved: { rel: string; base: string }, previous: string): Promise<void> {
+    if (this.history.archiveKeep <= 0) return
+    try {
+      const dir = join(dirname(resolved.base), ARCHIVE_DIR, resolved.rel)
+      await ensureDir(dir)
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      await writeFileAtomic(join(dir, `${stamp}.md`), previous, { mode: 0o600, dirMode: 0o700 })
+      const names = (await readdir(dir)).filter(name => name.endsWith('.md')).sort()
+      for (const name of names.slice(0, Math.max(0, names.length - this.history.archiveKeep))) {
+        await unlink(join(dir, name)).catch(() => {})
+      }
+    } catch {
+      // archive is a safety net, not part of the functional path
+    }
   }
 
   /**
@@ -529,6 +617,23 @@ export class MemoryStore {
       const category = relPath.split('/')[0] ?? ''
       const next = entries.filter(entry => entry.path !== relPath)
       next.push({ category, path: relPath, summary })
+      await this.writeIndexNow(peer, next)
+    })
+  }
+
+  /**
+   * Make sure an index entry exists without touching an existing summary. A
+   * summary describes the whole file, so merging a new fact must not replace
+   * it with that fact's first words. The index is still rebuilt (re-sorted by
+   * mtime) so the file moves to the front.
+   */
+  ensureIndexEntry(peer: string, relPath: string, fallbackSummary: string): Promise<void> {
+    return this.queue.enqueue(async () => {
+      const entries = await this.readIndex(peer)
+      const category = relPath.split('/')[0] ?? ''
+      const existing = entries.find(entry => entry.path === relPath)
+      const next = entries.filter(entry => entry.path !== relPath)
+      next.push({ category, path: relPath, summary: existing?.summary ?? fallbackSummary })
       await this.writeIndexNow(peer, next)
     })
   }

@@ -1025,3 +1025,28 @@ fake-connection，断言五个工具仍注册且 `connection` 确实不存在。
 - 引入 `unwrapConfig` 递归函数，深度解包所有带有 `.get()` 方法的 Volatile 引用，将其还原为纯净的基础值（当未配置时解包出 `undefined`）。
 - 在 `resolveConfig` 开头首先对输入配置执行 `unwrapConfig`，确保后续所有路径展开与校验均运行在干净的 JavaScript 基础值之上。
 - 新增 `tests/config.test.ts` 测试用例，断言经 Schemastery `Config` 解析后的空配置与具名配置均能安全解析，测试矩阵 125/125 全绿。
+
+---
+
+## 25. 记忆冗余治理：store 卫生 + 对账（v0.5.0）
+
+### 25.1 根因（2026-11-13 对 7.3M token 的提取记录与 70 个记忆文件的复盘）
+1. 提取模型看不到目标文件正文，只有索引摘要和至多 8 行 grep 命中，所以 prompt 里的 "merge 只加新事实 / 与旧内容矛盾用 update" 无从执行；`merge` 实际是盲追加，去重只比整行完全相同。
+2. `update` 用模型没见过旧内容的新文本整体替换 Current，旧 Current 整段进 History，History 无上限（实测占全部记忆体积 40%，CPA 手册 71%）。
+3. `refreshIndexEntry(summaryOf(decision.content))` 让索引摘要变成「最后一次写入的前 100 字」。
+4. 每一行无条件加 `- `，模型已写列表时变成 `- - -`。
+
+### 25.2 第一期：store 层
+- `src/patch.ts` 的 `bulletLines`：已有列表标记 / 标题 / 引用 / 表格 / 缩进的行保持原样，普通行补 `- `，空行丢弃；`lineKey` 忽略列表标记，用于去重。
+- `updateCurrent` 先把完整旧文件写入 `<peer>/.history/<rel>/<utc>.md`（`archiveKeep` 份，位于 `memories/` 之外，不被检索与注入），History 只留最新 `maxEntries` 条、每条首行截断到 `entryMaxChars`；遗留的超长 History 在下一次写入时被同样裁剪（快照保留原文）。
+- 索引摘要：`create` 的 decision 新增 `summary`；`ensureIndexEntry` 只在缺失时写入；`merge`、`remember` 追加、`update_memory` 不再覆盖，`update` 决策可显式带 `summary`。
+
+### 25.3 第二期：对账
+- 提取第一次调用不变（skip 约占一半，不增加成本）；当决策是 merge / update、或 create 命中已存在文件时，第二次调用把该文件 Current 的编号行（`N| 行`）和提议内容给模型，答案只能是 `noop` 或 `patch`（`replace` / `delete` / `insert` / `append`，行号指原始编号）。
+- Current 超过 `reconcileMaxBytes` 时先把每行截到 160 字符，仍超就跳过对账直接追加（`current-too-large`）。
+- `applyPatch` 的保护：行号越界 / 同一行多次编辑 / 空内容 / 超过 20 个操作 / 删除超过一半（且多于 2 行）/ 把 ≥120 字符的行缩到不足一半，一律抛 `PatchError`，文件不变并退回追加。对账开启时，无法对账的 `update` 退回追加而不是整体替换。
+- 审计：结果类型新增 `patch` / `noop`；对账退回时 audit 与 `extraction.log` 带 `reconcileFallback`；对账答案解析失败写入 `failed-answers.log`（`stage: reconcile`）。
+- 线上冒烟（gemini-3.8-flash，23.6KB 的 CPA 手册）：矛盾事实 → 4 处 replace，重复事实 → noop，新事实 → 1 处 insert；23.6KB 输入约 8.8k token。
+
+### 25.4 未做（第三期，待定）
+超过阈值后的自动整理（consolidation）与保真闸、`consolidate_memory` 工具。

@@ -40,7 +40,7 @@ Compatibility: **dsh ≥ 0.1.5** (full support for dsh 0.2.1-rc.2 specification 
 |---|---|
 | Explicit memory (5 tools) | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`; `update` archives the previous content into `## History`, `forget` is a soft delete into `.trash/` |
 | L0 catalog injection | one resident catalog message per session (rendered from `_index.md`); re-published when the index changes or compaction moves it off the visible surface |
-| Implicit extraction | a background run feeds the new conversation window to the model and applies a create / merge / update / skip decision, with dedup search and parse-failure repair |
+| Implicit extraction | a background run feeds the new conversation window to the model and applies a create / merge / update / skip decision, with dedup search and parse-failure repair; before landing on an existing file the model is shown that file's numbered lines for a reconcile pass (replace / delete / insert / noop) instead of a blind append |
 | Cross-peer sharing | mount another peer's memories read-only under `shared/<name>/` |
 | Header indicator | capsule + three-state dot in the session header, polling the run status every 10 s |
 | Peer isolation | the peer name derives from the session cwd (basename + short hash); cwd-less sessions fall back to `defaultPeer` |
@@ -80,6 +80,10 @@ Everything is edited in **Settings → memory-lite** and stored under the `dsh-m
 | Model | Extraction model | follows the live global default model unless pinned to a provider/model |
 | | Reasoning effort | read from the selected model's declaration; **off is recommended** |
 | Reliability | Parse retry | one cheap repair call when the answer is not valid JSON (on by default) |
+| Reconcile | `extraction.reconcile` | before a merge / update lands on an existing file, show the model its numbered Current lines and let it answer with line edits or noop; falls back to append on failure. On by default; one extra call per merge / update |
+| | `extraction.reconcileMaxBytes` | byte budget for the numbered Current shown to the reconcile call, default 24576; larger files skip reconcile and append |
+| History | `history.maxEntries` / `entryMaxChars` | keep only the newest N History lines per file (default 5), each at most M characters (default 240). Set in `cordis.patch.yml` only, **restart to apply** |
+| | `history.archiveKeep` | save the whole previous file as a snapshot before every update / patch (newest 5 kept by default, 0 = off). **Restart to apply** |
 | | Audit log | writes `peers/{peer}/sessions/{session-id}.json` and `extraction.log` |
 | Catalog | Token cap | truncation cap for the L0 catalog, default 1200 |
 | UI | Indicator order | header utilities slot order; refresh the page after saving |
@@ -98,16 +102,17 @@ Full schema and defaults: [`src/config.ts`](https://github.com/alanzhao0128/dsh-
 │   │   ├── _index.md              # L0 catalog (generated; hand-editable)
 │   │   ├── preferences/  entities/  events/  experiences/
 │   │   │   └── {slug}.md          # L1 full text
+│   ├── .history/{category}/{slug}.md/  # full pre-change snapshots (never searched or injected)
 │   └── sessions/                  # extraction bookmark + audit + extraction.log
 └── .trash/                        # soft-deleted memories (dated folders)
 ```
 
-Each memory file uses `## Current` / `## History` / `## Related`; updates archive instead of overwriting. The four categories are retrieval paths for the model: preferences (always relevant), entities (mentioned knowledge), events (time-related), experiences (task lessons).
+Each memory file uses `## Current` / `## History` / `## Related`. Before an update the complete previous file is saved under `.history/`, and `## History` itself keeps only the newest few one-line notes instead of piling up old bodies. The catalog summary describes the whole file: the extractor writes one sentence when it creates the file, and later merges no longer overwrite it with the first words of the newest fact. The four categories are retrieval paths for the model: preferences (always relevant), entities (mentioned knowledge), events (time-related), experiences (task lessons).
 
 ## How it works (short version)
 
 - **Catalog injection**: in the `agent/pre-step` waterfall the peer's `_index.md` is rendered into one `user/message` carrying the official `plugin` source kind with the `catalog` form; subagent sessions get none.
-- **Extraction**: triggered by `windowTurns` or idle → select the window → grep existing memories for dedup → one LLM decision → write files → advance the per-session bookmark. **A failed run keeps the bookmark**, so the same window is retried on the next trigger.
+- **Extraction**: triggered by `windowTurns` or idle → select the window → grep existing memories for dedup → one LLM decision → (when it lands on an existing file) a second LLM reconcile call that sees the file's numbered lines and answers with replace / delete / insert / append or noop; out-of-range lines, heavily shortened lines and mass deletions are rejected and fall back to append → write files → advance the per-session bookmark. **A failed run keeps the bookmark**, so the same window is retried on the next trigger.
 - **Safety**: every file access goes through a containment boundary (relative paths only; `..`, absolute paths and symlink escapes are rejected at the executor).
 - **Concurrency**: all writes go through a serial queue with atomic tmp+rename replacement.
 
@@ -143,6 +148,13 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 - Extraction quality depends on the model you pick; small models produce JSON that needs repair more often.
 
 ## Changelog
+
+### v0.5.0 (2026-11-13)
+- **No more nested bullets**: lines that already carry `-` / `1.` / `#` / table / indentation keep their shape; only plain lines get a `- `. Duplicate detection now ignores list markers.
+- **Capped History**: only the newest `history.maxEntries` lines survive, each truncated; the full previous file goes to `peers/{peer}/.history/` (never searched or injected), pruned by `history.archiveKeep`.
+- **Stable catalog summaries**: `create` asks the extractor for a one-sentence `summary`; `merge` / `remember` appends no longer overwrite an existing summary; `update` may carry a new one.
+- **Reconcile**: merge / update / create onto an existing file costs one extra LLM call in which the model sees the file's numbered lines and answers with line edits or noop; a rejected patch or failed call falls back to append (with reconcile on, an update is no longer a blind whole-file replace). Turn off with `extraction.reconcile: false`.
+- Audit entries and `extraction.log` gain the outcomes `patch` / `noop`, plus a `reconcileFallback` field when reconcile gave up.
 
 ### v0.4.1
 - **DSH 0.2.1-rc.2 Specification & Engines Alignment**: Declared `"engines": { "dsh": ">=0.1.2-rc.1" }` in `package.json`, adhering to the official priority evaluation of `engines.dsh`.
