@@ -148,6 +148,9 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 
 ## 变更历史 (Changelog)
 
+### v0.5.1（2026-11-15）
+- **放宽提取输出上限并拦截截断**：`EXTRACTION_MAX_TOKENS` 由 `4096` 提高到 `32768`，避免思考模型与 `reconcile` 阶段在长窗口下耗尽输出配额；同时在 `collectStream` 中将 `finish.kind === 'max-tokens'` 显式按 `llm-error` 抛出，杜绝截断后的半截 JSON 流入容错解析或修复流程。
+
 ### v0.5.0（2026-11-13）
 - **不再嵌套项目符号**：已带 `-` / `1.` / `#` / 表格 / 缩进的行保持原样，只给普通行补 `- `；去重改为忽略列表标记后比较。
 - **History 有上限**：只留最新 `history.maxEntries` 行、每行截断；完整旧文件存进 `peers/{peer}/.history/`（不检索、不注入），按 `history.archiveKeep` 保留。

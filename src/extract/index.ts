@@ -32,12 +32,10 @@ import { buildExtractionUser, buildReconcileUser, extractionSystem, reconcileSys
 const DIGEST_MAX_TOKENS = 100
 const MAX_KEYWORDS = 8
 const MAX_GREP_HITS = 8
-// Bumped 1024 -> 4096 (2026-08-28): with extraction.llm.reasoningEffort = high
-// the model's reasoning pass consumed the whole 1024-token budget and the
-// answer text came back empty (every failed answer logged textLen=0), forcing
-// the repair path on ~85% of runs. 4096 leaves room for both reasoning and the
-// JSON decision body.
-const EXTRACTION_MAX_TOKENS = 4096
+// Bumped 1024 -> 4096 (2026-08-28) -> 32768 (2026-11-15): reasoning models
+// share maxTokens between thinking and the JSON decision body (including the
+// reconcile pass), so 4096 can still exhaust on heavier windows.
+const EXTRACTION_MAX_TOKENS = 32768
 
 interface Route {
   readonly provider: string
@@ -678,6 +676,9 @@ async function collectStream(stream: AsyncIterable<StreamChunk>): Promise<{ text
   if (finish.kind === 'aborted' || finish.kind === 'error') {
     const detail = finishFailureDetail(finish)
     throw new Error('llm stream finished with ' + finish.kind + (detail === '' ? '' : ': ' + detail))
+  }
+  if (finish.kind === 'max-tokens') {
+    throw new Error('llm stream finished with max-tokens')
   }
   return {
     text: assembler

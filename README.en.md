@@ -149,6 +149,9 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 
 ## Changelog
 
+### v0.5.1 (2026-11-15)
+- **Higher extraction output budget & truncation guard**: bumped `EXTRACTION_MAX_TOKENS` from `4096` to `32768` so reasoning models and the `reconcile` pass do not exhaust the budget on heavier windows; `collectStream` now also rejects `finish.kind === 'max-tokens'` as an explicit `llm-error` instead of letting truncated JSON enter tolerant parsing or repair.
+
 ### v0.5.0 (2026-11-13)
 - **No more nested bullets**: lines that already carry `-` / `1.` / `#` / table / indentation keep their shape; only plain lines get a `- `. Duplicate detection now ignores list markers.
 - **Capped History**: only the newest `history.maxEntries` lines survive, each truncated; the full previous file goes to `peers/{peer}/.history/` (never searched or injected), pruned by `history.archiveKeep`.

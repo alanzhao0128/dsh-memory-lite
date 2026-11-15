@@ -422,6 +422,34 @@ test('extractOnce records the provider failure detail on a terminal error finish
   }
 })
 
+test('extractOnce treats a max-tokens finish as llm-error instead of parsing truncated JSON', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    let seenMaxTokens: number | undefined
+    ctx.on('llm/stream', (options: any) => {
+      seenMaxTokens = options.maxTokens
+      return (async function* (): AsyncIterable<any> {
+        yield { type: 'text-delta', index: 0, text: '{"decision":"skip","reason":"truncated' }
+        yield { type: 'finish', reason: { kind: 'max-tokens' } }
+      })()
+    })
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const session = sessionLike('session-maxtokens', 30)
+    await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    assert.equal(seenMaxTokens, 32768)
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-maxtokens.json'), 'utf8'))
+    assert.equal(checkpoint.audit[0].maxTokens, 32768)
+    assert.match(checkpoint.audit[0].note, /llm-error: Error: llm stream finished with max-tokens/)
+    assert.equal(checkpoint.checkpoint.seq, 0)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('extractOnce uses the global default model when route is unset (§17)', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
