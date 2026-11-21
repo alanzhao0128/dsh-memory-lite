@@ -149,6 +149,11 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 
 ## Changelog
 
+### v0.5.2 (2026-11-21)
+- **Collapse stacked bullets**: incoming lines with stacked markers (`- - x`, `  - * x`, `1. - x`) keep only the first marker (→ `- x` / `  - x` / `1. x`); negative numbers like `-1` and `- 1. step` are untouched. Applies to merge / create / update and reconcile patch insert / append.
+- **Drop empty entries**: marker-only lines (`-`, `- -`, `* `, `1.`) are no longer written; previously a lone `-` became `- -`. `lineKey` now treats them as empty too.
+- Existing nested lines are left as they are (no automatic rewrite). Thanks to #1 for the root-cause analysis and #2 for the approach.
+
 ### v0.5.1 (2026-11-15)
 - **Higher extraction output budget & truncation guard**: bumped `EXTRACTION_MAX_TOKENS` from `4096` to `32768` so reasoning models and the `reconcile` pass do not exhaust the budget on heavier windows; `collectStream` now also rejects `finish.kind === 'max-tokens'` as an explicit `llm-error` instead of letting truncated JSON enter tolerant parsing or repair.
 

@@ -40,6 +40,51 @@ test('lineKey ignores list markers and whitespace', () => {
   assert.equal(lineKey('   '), '')
 })
 
+test('bulletLines collapses stacked markers and drops marker-only lines', () => {
+  assert.deepEqual(bulletLines('- - x\n- - - y\n  - * z\n1. - w\n-\n- -\n* \n1.\n'), [
+    '- x', '- y', '  - z', '1. w',
+  ])
+  // Negative numbers and numbered text after a bullet are content, not markers.
+  assert.deepEqual(bulletLines('-1 is negative\n- -1 too\n- 1. step'), [
+    '- -1 is negative', '- -1 too', '- 1. step',
+  ])
+})
+
+test('lineKey treats marker-only lines as empty', () => {
+  assert.equal(lineKey('-'), '')
+  assert.equal(lineKey('- -'), '')
+  assert.equal(lineKey('1.'), '')
+  assert.equal(lineKey('-1'), '-1')
+  assert.equal(lineKey('- -1'), '-1')
+})
+
+test('appendCurrent flattens stacked markers, drops empty entries and keeps legacy lines', async () => {
+  const { store, file, root } = await makeStore()
+  try {
+    // Seed a pre-0.5.2 file on disk: its nested line must survive untouched.
+    await store.writeNewMemory(PEER, 'entities/n.md', 'N', 'placeholder')
+    const abs = join(root, 'peers', PEER, 'memories', 'entities', 'n.md')
+    await writeFile(abs, (await readFile(abs, 'utf8')).replace('- placeholder', '- - legacy nested'))
+    await store.appendCurrent(PEER, 'entities/n.md', '- - new\n-\n- -\nlegacy nested')
+    const once = await file('entities/n.md')
+    assert.equal(parseMemoryFile(once).current, '- - legacy nested\n- new')
+    await store.appendCurrent(PEER, 'entities/n.md', '- - new\n-\n- -\nlegacy nested')
+    assert.equal(await file('entities/n.md'), once)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('applyPatch insert/append flatten stacked markers and drop marker-only lines', () => {
+  const result = applyPatch(['- a'], [
+    { op: 'insert', after: 0, content: '- - top\n-' },
+    { op: 'append', content: '- - - tail\n- -' },
+  ])
+  assert.deepEqual(result.lines, ['- top', '- a', '- tail'])
+  assert.equal(result.added, 2)
+  assert.throws(() => applyPatch(['- a'], [{ op: 'append', content: '- -\n-' }]), PatchError)
+})
+
 test('appendCurrent never nests markers and skips lines that exist under another marker', async () => {
   const { store, file, root } = await makeStore()
   try {

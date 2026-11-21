@@ -148,6 +148,11 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 
 ## 变更历史 (Changelog)
 
+### v0.5.2（2026-11-21）
+- **折叠叠层项目符号**：新写入的行若带叠层标记（`- - x`、`  - * x`、`1. - x`），只保留首个标记（→ `- x` / `  - x` / `1. x`）；`-1` 这类负数、`- 1. 步骤` 不受影响。作用于 merge / create / update 与对账补丁的 insert / append。
+- **丢弃空条目**：只有标记的行（`-`、`- -`、`* `、`1.`）不再写入；此前单独的 `-` 会被补成 `- -`。`lineKey` 同步把这类行视为空。
+- 已存在的嵌套行保持原样，不做自动改写。感谢 #1 的根因分析与 #2 的思路。
+
 ### v0.5.1（2026-11-15）
 - **放宽提取输出上限并拦截截断**：`EXTRACTION_MAX_TOKENS` 由 `4096` 提高到 `32768`，避免思考模型与 `reconcile` 阶段在长窗口下耗尽输出配额；同时在 `collectStream` 中将 `finish.kind === 'max-tokens'` 显式按 `llm-error` 抛出，杜绝截断后的半截 JSON 流入容错解析或修复流程。
 

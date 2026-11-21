@@ -29,27 +29,36 @@ export const MIN_REPLACE_RATIO = 0.5
 
 const STRUCTURAL = /^(?:[-*+]|\d+[.)])\s|^#{1,6}\s|^>|^\||^```/
 
+/** Leading indentation + first list marker, followed by stacked bullet markers. */
+const STACKED = /^(\s*(?:[-*+]|\d+[.)])\s+)(?:[-*+](?:\s+|$))+/
+
+/** A line made only of list markers (`-`, `- -`, `* `, `1.`), i.e. an empty entry. */
+const MARKERS_ONLY = /^\s*(?:(?:[-*+]|\d+[.)])(?:\s+|$))+$/
+
 /**
  * Turn free-form content into Current lines. Lines that already carry
  * structure (list marker, heading, quote, table row, code fence) or are
- * indented keep their shape; plain lines become `- ` bullets. Blank lines are
- * dropped. This replaces the old "prefix every line with `- `" rule that
- * produced `- - -` nesting when the model already wrote a list.
+ * indented keep their shape; plain lines become `- ` bullets. Stacked bullet
+ * markers (`- - x`) collapse to the first one, and lines holding nothing but
+ * markers are dropped along with blank lines. This replaces the old "prefix
+ * every line with `- `" rule that produced `- - -` nesting when the model
+ * already wrote a list.
  */
 export function bulletLines(content: string): string[] {
   const out: string[] = []
   for (const raw of content.split('\n')) {
     const line = raw.trimEnd()
-    if (line.trim() === '') continue
-    if (/^\s+\S/.test(line) || STRUCTURAL.test(line)) out.push(line)
-    else out.push(`- ${line}`)
+    if (line.trim() === '' || MARKERS_ONLY.test(line)) continue
+    const flat = line.replace(STACKED, '$1')
+    if (/^\s+\S/.test(flat) || STRUCTURAL.test(flat)) out.push(flat)
+    else out.push(`- ${flat}`)
   }
   return out
 }
 
-/** Comparison key for a line: list markers and surrounding whitespace removed. */
+/** Comparison key for a line: list markers (with or without trailing text) and surrounding whitespace removed. */
 export function lineKey(line: string): string {
-  return line.replace(/^\s*(?:(?:[-*+]|\d+[.)])\s+)+/, '').trim()
+  return line.replace(/^\s*(?:(?:[-*+]|\d+[.)])(?:\s+|$))+/, '').trim()
 }
 
 /** Prompt-ready numbered view of a Current section; blank lines are skipped but keep their numbers. */
