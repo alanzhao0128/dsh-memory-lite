@@ -1,22 +1,39 @@
 /**
- * Shared type contracts for dsh-memory-lite.
+ * Shared type contracts for dsh-memory-lite v1.0 (Unified Topic Vault).
  * @module dsh-memory-lite/src/types
  */
 
-/** The four memory categories the plugin generates. */
-export const MEMORY_CATEGORIES = ['preferences', 'entities', 'events', 'experiences'] as const
+/** Special top-level topic that is always expanded in L0 catalogs. */
+export const PREFERENCES_TOPIC = 'preferences'
 
-/** One memory category name. */
-export type MemoryCategory = (typeof MEMORY_CATEGORIES)[number]
+/** Default top-level namespace for sensitive/private topics (`private/<subtopic>`). */
+export const DEFAULT_PRIVATE_NAMESPACE = 'private'
 
-/** One L0 index entry: a memory file and its one-line summary. */
+/** One L0 index entry: a memory file, its owning topic, and its one-line summary. */
 export interface IndexEntry {
-  /** First path segment of {@link path} (the containing directory). */
-  readonly category: string
-  /** Memory file path relative to the peer's memories root, e.g. `preferences/coding.md`. */
+  /** Owning topic directory relative to memories root, e.g. `infra`, `g7`, `private/health`. */
+  readonly topic: string
+  /** Memory file path relative to `<root>/memories/`, e.g. `infra/cpa.md` or `private/health/checkup.md`. */
   readonly path: string
   /** One-line summary rendered in the L0 catalog. */
   readonly summary: string
+}
+
+/** One collapsed topic line rendered in adaptive Topic Map mode when the vault exceeds L0 token budget. */
+export interface CollapsedTopicNotice {
+  readonly topic: string
+  readonly count: number
+  readonly previewTitles: readonly string[]
+}
+
+/** Evaluated trust boundary for a session, tool call, or extraction run. */
+export interface TrustContext {
+  /** When true, the entire private namespace is invisible and non-writable. */
+  readonly restricted: boolean
+  /** Why restricted mode triggered (for diagnostics/UI). */
+  readonly reason?: 'hidePrivate' | 'provider' | 'path'
+  /** Optional private topic forced when writing/extracting inside a configured `privacy.privatePaths` cwd. */
+  readonly forcedPrivateTopic?: string
 }
 
 /**

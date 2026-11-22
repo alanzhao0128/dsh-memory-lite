@@ -71,7 +71,7 @@ test('misconfigured plugin fails loud at boot', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'dsh-memory-boot-'))
   try {
     const configPath = join(cwd, 'cordis.yml')
-    await writeFile(configPath, configRows(join(cwd, 'memory'), ['    defaultPeer: "a/b"']).join('\n'))
+    await writeFile(configPath, configRows(join(cwd, 'memory'), ['    privacy:', '      namespace: "a/b"']).join('\n'))
     // Misconfiguration must fail the boot loudly (the Loader wraps the
     // plugin's thrown error, so assert the rejection, not its exact wording).
     await assert.rejects(() => boot('dsh-memory-lite-test', configPath, [], undefined, PROJECT_ROOT))

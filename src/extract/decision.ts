@@ -1,9 +1,7 @@
 /**
  * Parse the extraction LLM's structured output into a concrete memory
- * mutation decision. The model answers in JSON; the parser is tolerant of
- * code fences and prose, normalizes full-width braces/quotes, salvages
- * broken-brace JSON from key:value pairs, and rejects anything outside the
- * closed vocabulary.
+ * mutation decision. Tolerates code fences, prose, full-width braces/quotes,
+ * and broken-brace JSON; rejects anything outside the closed vocabulary.
  * @module dsh-memory-lite/src/extract/decision
  */
 
@@ -13,7 +11,8 @@ export type ExtractionDecisionKind = 'create' | 'merge' | 'update' | 'skip'
 
 export interface CreateDecision {
   readonly kind: 'create'
-  readonly category: string
+  /** Owning topic directory (e.g. `preferences`, `infra`, `g7`, `private/health`). */
+  readonly topic: string
   readonly title: string
   readonly content: string
   /** One-sentence description of the whole file for the L0 index (optional). */
@@ -54,14 +53,15 @@ export function parseDecision(text: string): ExtractionDecision {
   }
   switch (kind) {
     case 'create': {
-      const category = str(record.category)
+      // Accept `topic` (v1.0 canonical) and fall back to legacy `category` if emitted.
+      const topic = str(record.topic) || str(record.category)
       const title = str(record.title)
       const content = str(record.content)
-      if (category === '' || title === '' || content === '') {
-        throw new Error('create decision requires category, title, and content')
+      if (topic === '' || title === '' || content === '') {
+        throw new Error('create decision requires topic, title, and content')
       }
       const summary = cleanSummary(record.summary)
-      return { kind, category, title, content, ...(summary === undefined ? {} : { summary }) }
+      return { kind, topic, title, content, ...(summary === undefined ? {} : { summary }) }
     }
     case 'merge':
     case 'update': {
@@ -88,11 +88,7 @@ function normalizeFullWidth(text: string): string {
     .replaceAll('\uFF02', '"')
 }
 
-/**
- * The first balanced `{...}` region in the answer (fence-free). When the
- * braces are broken (truncated or unbalanced output), falls back to rebuilding
- * a JSON object from `"key": "value"` pairs; throws only when neither works.
- */
+/** The first balanced `{...}` region in the answer, or rebuilt from `"key": "value"` pairs. */
 export function extractJsonObject(text: string): string {
   const normalized = normalizeFullWidth(text)
   const balanced = scanBalanced(normalized)
@@ -102,7 +98,6 @@ export function extractJsonObject(text: string): string {
   throw new Error('extraction answer contains no JSON object')
 }
 
-/** The first balanced `{...}` region, or undefined when unbalanced. */
 function scanBalanced(text: string): string | undefined {
   const start = text.indexOf('{')
   if (start === -1) return undefined
@@ -127,7 +122,6 @@ function scanBalanced(text: string): string | undefined {
   return undefined
 }
 
-/** Rebuild a JSON object from complete `"key": "value"` pairs (no braces). */
 function rebuildFromPairs(text: string): string | undefined {
   const pairRe = /"([A-Za-z_][A-Za-z0-9_]*)":\s*("(?:\\.|[^"\\])*"|true|false|null|-?\d+(?:\.\d+)?)/g
   const pairs: [string, string][] = []
@@ -144,7 +138,6 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-/** Index summaries are one line; collapse whitespace and cap the length. */
 function cleanSummary(value: unknown): string | undefined {
   const text = str(value).replaceAll(/\s+/g, ' ')
   if (text === '') return undefined

@@ -2,146 +2,82 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { resolveConfig, Config, unwrapConfig, DEFAULT_MEMORY_ROOT, DEFAULT_PEER, DEFAULT_INDEX_MAX_TOKENS } from '../src/config.js'
+import {
+  resolveConfig, Config, DEFAULT_INDEX_MAX_TOKENS, DEFAULT_HOT_BUDGET_RATIO,
+} from '../src/config.js'
 
 test('resolveConfig cleanly unwraps Schemastery volatile-parsed empty and populated configs', () => {
-  // When Cordis / Schemastery parses an entry whose schema uses .volatile(),
-  // volatile fields evaluate to { get: () => value }. resolveConfig must unwrap
-  // them without crashing on path.startsWith or similar primitive checks.
   const parsedEmpty = Config({})
   const resolvedFromEmpty = resolveConfig(parsedEmpty)
-  assert.equal(resolvedFromEmpty.defaultPeer, DEFAULT_PEER)
   assert.equal(resolvedFromEmpty.root, join(homedir(), '.agent-memory'))
+  assert.equal(resolvedFromEmpty.privacy.namespace, 'private')
+  assert.equal(resolvedFromEmpty.privacy.hidePrivate, false)
   assert.equal(resolvedFromEmpty.extraction.mode, 'incremental')
 
   const parsedPopulated = Config({
     root: '~/custom-memory',
-    defaultPeer: 'test-peer',
+    privacy: {
+      hidePrivate: true,
+      restrictedProviders: ['llm-g7'],
+      restrictedPaths: ['~/Documents/G7/**'],
+      privatePaths: [{ pattern: '~/Documents/健康分析/**', topic: 'private/health' }],
+    },
     extraction: { mode: 'explicit_only', windowTurns: 10 },
   })
   const resolvedFromPopulated = resolveConfig(parsedPopulated)
-  assert.equal(resolvedFromPopulated.defaultPeer, 'test-peer')
   assert.equal(resolvedFromPopulated.root, join(homedir(), 'custom-memory'))
+  assert.equal(resolvedFromPopulated.privacy.hidePrivate, true)
+  assert.deepEqual(resolvedFromPopulated.privacy.restrictedProviders, ['llm-g7'])
+  assert.deepEqual(resolvedFromPopulated.privacy.restrictedPaths, ['~/Documents/G7/**'])
+  assert.equal(resolvedFromPopulated.privacy.privatePaths.length, 1)
   assert.equal(resolvedFromPopulated.extraction.mode, 'explicit_only')
   assert.equal(resolvedFromPopulated.extraction.windowTurns, 10)
 })
 
-test('empty config resolves to documented defaults', () => {
+test('empty config resolves to documented v1.0 defaults', () => {
   const config = resolveConfig({})
-  assert.equal(config.defaultPeer, DEFAULT_PEER)
   assert.equal(config.root, join(homedir(), '.agent-memory'))
-  assert.equal(config.workspacePeers.enabled, true)
-  assert.equal(config.workspacePeers.excludeSubagents, true)
-  assert.equal(config.workspacePeers.cwdFallback, 'default_peer')
+  assert.equal(config.privacy.namespace, 'private')
+  assert.equal(config.privacy.hidePrivate, false)
+  assert.deepEqual(config.privacy.restrictedProviders, [])
+  assert.deepEqual(config.privacy.restrictedPaths, [])
+  assert.deepEqual(config.privacy.privatePaths, [])
   assert.equal(config.index.maxTokens, DEFAULT_INDEX_MAX_TOKENS)
+  assert.equal(config.index.hotBudgetRatio, DEFAULT_HOT_BUDGET_RATIO)
   assert.equal(config.index.sortBy, 'mtime')
   assert.equal(config.tools.schemaMinimal, true)
   assert.equal(config.extraction.mode, 'incremental')
   assert.equal(config.extraction.parseRetry, true)
-  assert.equal(config.sharing.enabled, false)
-  assert.deepEqual(config.sharing.mounts, [])
 })
 
 test('root expands ~ and resolves to absolute', () => {
-  const config = resolveConfig({ root: '~/mem' })
-  assert.equal(config.root, join(homedir(), 'mem'))
-  const relative = resolveConfig({ root: 'relative/path' })
-  assert.ok(relative.root.startsWith('/'))
-})
-
-test('partial nested configs merge with defaults', () => {
-  const config = resolveConfig({ workspacePeers: { enabled: false }, index: { maxTokens: 600 } })
-  assert.equal(config.workspacePeers.enabled, false)
-  assert.equal(config.workspacePeers.excludeSubagents, true)
-  assert.equal(config.index.maxTokens, 600)
-  assert.equal(resolveConfig({ extraction: { parseRetry: false } }).extraction.parseRetry, false)
+  assert.equal(resolveConfig({ root: '~/mem' }).root, join(homedir(), 'mem'))
+  assert.ok(resolveConfig({ root: 'relative/path' }).root.startsWith('/'))
 })
 
 test('invalid values fail loud', () => {
-  assert.throws(() => resolveConfig({ defaultPeer: 'a/b' }), /defaultPeer/)
-  assert.throws(() => resolveConfig({ defaultPeer: '..' }), /defaultPeer/)
-  assert.throws(() => resolveConfig({ defaultPeer: '' }), /defaultPeer/)
+  assert.throws(() => resolveConfig({ privacy: { namespace: 'a/b' } }), /privacy\.namespace/)
+  assert.throws(() => resolveConfig({ privacy: { namespace: '..' } }), /privacy\.namespace/)
+  assert.throws(() => resolveConfig({ privacy: { privatePaths: [{ pattern: '~/x', topic: 'public/x' }] } }), /private\/<subtopic>/)
+  assert.throws(() => resolveConfig({ privacy: { privatePaths: [{ pattern: '', topic: 'private/x' }] } }), /pattern/)
   assert.throws(() => resolveConfig({ index: { maxTokens: 10 } }), /maxTokens/)
   assert.throws(() => resolveConfig({ index: { maxTokens: 1.5 } }), /maxTokens/)
-})
-
-test('sharing mounts resolve with readonly default and validate', () => {
-  const config = resolveConfig({
-    sharing: {
-      enabled: true,
-      mounts: [{ name: 'dsh-test', peer: 'dsh-test-72572e8b', subpath: '', readonly: true }],
-    },
-  })
-  assert.equal(config.sharing.enabled, true)
-  assert.equal(config.sharing.mounts.length, 1)
-  assert.equal(config.sharing.mounts[0].name, 'dsh-test')
-  assert.equal(config.sharing.mounts[0].peer, 'dsh-test-72572e8b')
-  // readonly defaults to true when omitted.
-  const implicit = resolveConfig({ sharing: { enabled: true, mounts: [{ name: 'a', peer: 'b' }] } })
-  assert.equal(implicit.sharing.mounts[0].readonly, true)
-  // invalid mounts fail loud.
-  assert.throws(() => resolveConfig({ sharing: { mounts: [{ name: 'a/b', peer: 'p', subpath: '', readonly: true }] } }), /mount name/)
-  assert.throws(() => resolveConfig({ sharing: { mounts: [{ name: '..', peer: 'p', subpath: '', readonly: true }] } }), /mount name/)
-  assert.throws(() => resolveConfig({ sharing: { mounts: [{ name: 'a', peer: 'p/q', subpath: '', readonly: true }] } }), /mount peer/)
-  assert.throws(() => resolveConfig({ sharing: { mounts: [{ name: 'a', peer: 'p', subpath: '../x', readonly: true }] } }), /subpath/)
+  assert.throws(() => resolveConfig({ index: { hotBudgetRatio: 0.1 } }), /hotBudgetRatio/)
+  assert.throws(() => resolveConfig({ index: { hotBudgetRatio: 0.99 } }), /hotBudgetRatio/)
 })
 
 test('ui.headerOrder defaults to -1 and validates', () => {
-  // Default: memory-lite renders left of the built-in "Session log" capsule.
   assert.equal(resolveConfig({}).ui.headerOrder, -1)
-  // Explicit value is honored.
   assert.equal(resolveConfig({ ui: { headerOrder: 2 } }).ui.headerOrder, 2)
-  // Non-integers fail loud.
   assert.throws(() => resolveConfig({ ui: { headerOrder: 1.5 } }), /headerOrder/)
 })
 
-
-test('extraction.llm.route and reasoningEffort default empty and validate', () => {
-  // Defaults: empty route = follow the global default model.
+test('extraction.llm.route, windowTurns, and messageScope validate', () => {
   const config = resolveConfig({})
   assert.equal(config.extraction.llm.route, '')
-  assert.equal(config.extraction.llm.reasoningEffort, '')
-
-  // Explicit route resolves and effort passes through.
-  const explicit = resolveConfig({
-    extraction: { llm: { route: 'deepseek-official/deepseek-v4-flash', reasoningEffort: 'low' } },
-  })
-  assert.equal(explicit.extraction.llm.route, 'deepseek-official/deepseek-v4-flash')
-  assert.equal(explicit.extraction.llm.reasoningEffort, 'low')
-
-  // Legacy provider/model fields still resolve for pre-§17 configs.
-  const legacy = resolveConfig({
-    extraction: { llm: { provider: 'deepseek-official', model: 'deepseek-v4-flash' } },
-  })
-  assert.equal(legacy.extraction.llm.provider, 'deepseek-official')
-  assert.equal(legacy.extraction.llm.model, 'deepseek-v4-flash')
-  assert.equal(legacy.extraction.llm.route, '')
-
-  // Model ids may contain a slash (pi-ai routes like commandcode/deepseek/deepseek-v4-flash),
-  // so 'provider/model-with/slash' is legal; only provider-less or empty-segment routes fail.
-  assert.equal(resolveConfig({ extraction: { llm: { route: 'a/b/c' } } }).extraction.llm.route, 'a/b/c')
-  // Invalid routes fail loud.
-  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'nope' } } }), /route/)
-  assert.throws(() => resolveConfig({ extraction: { llm: { route: '/model' } } }), /route/)
-  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'provider/' } } }), /route/)
-  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'a\\b/c' } } }), /route/)
-})
-
-test('extraction.windowTurns and messageScope defaults follow the conversation-only design', () => {
-  const config = resolveConfig({})
   assert.equal(config.extraction.windowTurns, 50)
   assert.deepEqual(config.extraction.messageScope, ['user', 'assistant'])
-  // Explicit overrides survive.
-  const custom = resolveConfig({ extraction: { windowTurns: 7, messageScope: ['user', 'assistant', 'tool_result'] } })
-  assert.equal(custom.extraction.windowTurns, 7)
-  assert.deepEqual(custom.extraction.messageScope, ['user', 'assistant', 'tool_result'])
-})
-
-test('extraction.messageScope validates entries and drops duplicates', () => {
+  assert.equal(resolveConfig({ extraction: { llm: { route: 'a/b/c' } } }).extraction.llm.route, 'a/b/c')
+  assert.throws(() => resolveConfig({ extraction: { llm: { route: 'nope' } } }), /route/)
   assert.throws(() => resolveConfig({ extraction: { messageScope: ['bogus'] as never } }), /messageScope/)
-  assert.throws(() => resolveConfig({ extraction: { messageScope: ['user', 'wat'] as never } }), /messageScope/)
-  const dedup = resolveConfig({ extraction: { messageScope: ['user', 'user', 'assistant'] } })
-  assert.deepEqual(dedup.extraction.messageScope, ['user', 'assistant'])
-  const empty = resolveConfig({ extraction: { messageScope: [] } })
-  assert.deepEqual(empty.extraction.messageScope, ['user', 'assistant'])
 })

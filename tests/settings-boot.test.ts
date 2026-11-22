@@ -138,15 +138,16 @@ test('a pre-seeded settings document is the config source when the row config is
   }
 })
 
-test('settings-provided root and sharing apply on the boot that reads them', async () => {
+test('settings-provided root and privacy apply on the boot that reads them', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'dsh-settings-bootcfg-'))
   try {
     await access(PLUGIN_ENTRY, constants.F_OK)
     const rowRoot = join(cwd, 'row-root')
     const settingsRoot = join(cwd, 'settings-root')
-    // One peer exists under the SETTINGS root only: if the store still pinned
-    // the row root at construction, the peer list below comes back empty.
-    await mkdir(join(settingsRoot, 'peers', 'boot-peer'), { recursive: true })
+    // Seed one memory under the SETTINGS root only so we verify the store uses it from first read.
+    await mkdir(join(settingsRoot, 'memories', 'infra'), { recursive: true })
+    await writeFile(join(settingsRoot, 'memories', 'infra', 'vps.md'), '# VPS\n\n## Current\n- box\n')
+    await writeFile(join(settingsRoot, 'memories', '_index.md'), '# Memory Index\n\n## infra\n- infra/vps.md: vps box\n')
     const configPath = join(cwd, 'cordis.yml')
     await writeFile(configPath, [
       '- name: "@deepseek-ai/dsh-system-prompt"',
@@ -162,37 +163,27 @@ test('settings-provided root and sharing apply on the boot that reads them', asy
       '    seed:',
       '      dsh-memory-lite:',
       '        root: ' + JSON.stringify(settingsRoot),
-      '        sharing:',
-      '          enabled: true',
-      '          mounts:',
-      '            - name: shared-peer',
-      '              peer: shared-peer',
-      "              subpath: ''",
-      '              readonly: true',
+      '        privacy:',
+      '          hidePrivate: true',
+      '          restrictedProviders:',
+      '            - llm-g7',
       '',
       '- id: memory-lite',
       `  name: "${PLUGIN_ENTRY}"`,
       '  config:',
       `    root: ${rowRoot}`,
-      '    defaultPeer: boot-test',
       '',
     ].join('\n'))
     const ctx = await boot('dsh-memory-lite-bootcfg-test', configPath, [], undefined, PROJECT_ROOT)
     try {
       const connection = ctx.get('connection') as FakeConnectionService
-      const snap = await callRpc(connection, 'memory-peers/snapshot', {}) as {
-        value: { peers: { name: string }[]; mounts: { name: string }[] }
+      const snap = await callRpc(connection, 'memory-vault/snapshot', {}) as {
+        value: { totalMemories: number; topics: { topic: string }[]; privacy: { hidePrivate: boolean; restrictedProviders: string[] } }
       }
-      assert.deepEqual(
-        snap.value.peers.map(peer => peer.name),
-        ['boot-peer'],
-        'the store must use the settings-provided root from the first read',
-      )
-      assert.deepEqual(
-        snap.value.mounts.map(mount => mount.name),
-        ['shared-peer'],
-        'sharing must come from the settings layer, not only the row config',
-      )
+      assert.equal(snap.value.totalMemories, 1, 'the store must use the settings-provided root from the first read')
+      assert.deepEqual(snap.value.topics.map(t => t.topic), ['infra'])
+      assert.equal(snap.value.privacy.hidePrivate, true)
+      assert.deepEqual(snap.value.privacy.restrictedProviders, ['llm-g7'])
     } finally {
       await ctx.fiber.dispose()
     }

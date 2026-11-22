@@ -64,7 +64,6 @@ async function bootCtx(memoryRoot: string): Promise<Awaited<ReturnType<typeof bo
     '  name: "' + PLUGIN_ENTRY + '"',
     '  config:',
     '    root: ' + memoryRoot,
-    '    defaultPeer: test-peer',
     '    extraction:',
     '      windowTurns: 20',
     '',
@@ -91,20 +90,20 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
       { inputTokens: 1234, outputTokens: 42 },
     ))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc123', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
-    const memoryPath = join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md')
+    const memoryPath = join(tmp, 'memories', 'preferences', 'pnpm.md')
     const memory = await readFile(memoryPath, 'utf8')
     assert.match(memory, /# pnpm/)
     assert.match(memory, /## Current/)
     assert.match(memory, /用户使用 pnpm/)
 
-    const index = await readFile(join(tmp, 'peers', 'test-peer', 'memories', '_index.md'), 'utf8')
+    const index = await readFile(join(tmp, 'memories', '_index.md'), 'utf8')
     assert.match(index, /preferences\/pnpm\.md/)
 
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-abc123.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-abc123.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.equal(checkpoint.checkpoint.seq, 30)
     assert.equal(checkpoint.audit.length, 1)
@@ -117,7 +116,7 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
     assert.ok(typeof checkpoint.audit[0].durationMs === 'number' && checkpoint.audit[0].durationMs >= 0)
 
     // Peer-level summary log records the same run as one JSON line.
-    const logText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'extraction.log'), 'utf8')
+    const logText = await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')
     const logLine = JSON.parse(logText.trim().split('\n')[0])
     assert.equal(logLine.session, 'session-abc123')
     assert.equal(logLine.outcome, 'create')
@@ -145,19 +144,19 @@ test('extractOnce recovers a prose answer via one bounded repair call', async ()
         : mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}')
     })
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc789', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
     // One repair call on top of the original call; the memory is written.
     assert.equal(calls, 2)
-    await access(join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md'), constants.F_OK)
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-abc789.json'), 'utf8')
+    await access(join(tmp, 'memories', 'preferences', 'pnpm.md'), constants.F_OK)
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-abc789.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.equal(checkpoint.audit[0].decision, 'create')
     assert.equal(checkpoint.audit[0].note, 'parse-error-recovered')
     assert.equal(checkpoint.audit[0].llmCalls, 2)
-    const logText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'extraction.log'), 'utf8')
+    const logText = await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')
     const logLine = JSON.parse(logText.trim().split('\n')[0])
     assert.equal(logLine.outcome, 'parse-error-recovered')
     assert.equal(logLine.decision, 'create')
@@ -175,11 +174,11 @@ test('extractOnce records a parse-error audit but keeps the checkpoint for retry
   try {
     ctx.on('llm/stream', () => mockStreamText('not json at all'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-abc456', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
 
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-abc456.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-abc456.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     // A failed run must NOT advance the bookmark: the window is retried on the
     // next trigger instead of being silently dropped.
@@ -189,8 +188,8 @@ test('extractOnce records a parse-error audit but keeps the checkpoint for retry
     assert.equal(checkpoint.audit[0].llmCalls, 2)
     assert.ok(checkpoint.audit[0].inputTokens > 0)
     // No memory file was written.
-    await assert.rejects(() => access(join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md'), constants.F_OK))
-    const logText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'extraction.log'), 'utf8')
+    await assert.rejects(() => access(join(tmp, 'memories', 'preferences', 'pnpm.md'), constants.F_OK))
+    const logText = await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')
     const logLine = JSON.parse(logText.trim().split('\n')[0])
     assert.equal(logLine.outcome, 'parse-error')
     assert.equal(logLine.llmCalls, 2)
@@ -222,7 +221,7 @@ test('session/event window trigger fires extraction through the plugin listener 
     // resetIdle -> ctx.timeout, i.e. the 'timer' inject that was previously missing).
     for (let i = 0; i < 20; i++) ctx.emit('session/event', session, events[i])
     await new Promise((resolve) => setTimeout(resolve, 300))
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-listener-test.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-listener-test.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.equal(checkpoint.checkpoint.seq, 19)
     assert.equal(checkpoint.audit.length, 1)
@@ -254,28 +253,27 @@ test('/memory-status RPC channel serves the tracker snapshot', async () => {
   }
 })
 
-test('/memory-peers RPC channel lists peers and configured mounts', async () => {
+test('/memory-vault RPC channel lists vault topics and privacy settings', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
-  // Seed two peer directories so the RPC has something to list.
-  await mkdir(join(tmp, 'peers', 'alpha-12345678', 'memories'), { recursive: true })
-  await mkdir(join(tmp, 'peers', 'beta-87654321', 'memories'), { recursive: true })
+  const store = new MemoryStore(tmp)
+  await store.writeNewMemory('infra/vps.md', 'VPS', 'contabo')
+  await store.refreshIndexEntry('infra/vps.md', 'Contabo VPS')
+  await store.writeNewMemory('private/health/exam.md', 'Exam', '2026')
+  await store.refreshIndexEntry('private/health/exam.md', '2026 health exam')
   const ctx = await bootCtx(tmp)
   try {
     const conn = ctx.get('connection') as FakeConnectionService
-    const result = await callRpc(conn, 'memory-peers/snapshot', {}) as {
+    const result = await callRpc(conn, 'memory-vault/snapshot', {}) as {
       ok: boolean
-      value: { peers: Array<{ name: string; displayName: string }>; mounts: Array<{ name: string; peer: string; subpath: string; readonly: boolean }> }
+      value: { totalMemories: number; topics: Array<{ topic: string; isPrivate: boolean; count: number }>; privacy: { namespace: string; hidePrivate: boolean } }
     }
     assert.equal(result.ok, true)
-    const peers = result.value.peers.map(p => p.name)
-    assert.ok(peers.includes('alpha-12345678'), 'lists alpha peer: ' + peers.join(','))
-    assert.ok(peers.includes('beta-87654321'), 'lists beta peer: ' + peers.join(','))
-    // displayName defaults to the storage name when no .peer-meta.json exists.
-    const alpha = result.value.peers.find(p => p.name === 'alpha-12345678')!
-    assert.equal(alpha.displayName, 'alpha-12345678')
-    // No mounts configured in the boot row config -> empty mounts list.
-    assert.deepEqual(result.value.mounts, [])
+    assert.equal(result.value.totalMemories, 2)
+    assert.ok(result.value.topics.some(t => t.topic === 'infra' && !t.isPrivate && t.count === 1))
+    assert.ok(result.value.topics.some(t => t.topic === 'private/health' && t.isPrivate && t.count === 1))
+    assert.equal(result.value.privacy.namespace, 'private')
+    assert.equal(result.value.privacy.hidePrivate, false)
   } finally {
     await ctx.fiber.dispose()
     await rm(tmp, { recursive: true, force: true })
@@ -334,14 +332,14 @@ test('extractOnce recovers when a session-format migration renumbered the event 
   try {
     ctx.on('llm/stream', () => mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-rebased', 30)
     // A bookmark written under the PREVIOUS numbering (v0 log, before the
     // v0->v1->v2->v3 migration renumbered events) sits past the log's end.
     const state = { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1 as const, checkpoint: { seq: 1720443 }, digest: '', audit: [] }, idleDispose: null, cancel: null }
     await extractOnce(session, state, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
     // The stale bookmark was discarded and the recent window extracted.
-    await access(join(tmp, 'peers', 'test-peer', 'memories', 'preferences', 'pnpm.md'), constants.F_OK)
+    await access(join(tmp, 'memories', 'preferences', 'pnpm.md'), constants.F_OK)
     assert.equal(state.checkpoint.checkpoint.seq, 30)
   } finally {
     await ctx.fiber.dispose()
@@ -355,7 +353,7 @@ test('extractOnce clears pending and records nothing when the window is empty', 
   const ctx = await bootCtx(tmp)
   try {
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-empty', 5)
     // Counter stuck above the threshold with an already-extracted log: the
     // bookmark is valid (seq 5 == last event), so nothing can be selected.
@@ -363,7 +361,7 @@ test('extractOnce clears pending and records nothing when the window is empty', 
     await extractOnce(session, state, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
     assert.equal(state.pending, 0)
     // No run was recorded (no LLM call, no checkpoint file).
-    await assert.rejects(() => access(join(tmp, 'peers', 'test-peer', 'sessions', 'session-empty.json'), constants.F_OK))
+    await assert.rejects(() => access(join(tmp, 'sessions', 'session-empty.json'), constants.F_OK))
   } finally {
     await ctx.fiber.dispose()
     await rm(tmp, { recursive: true, force: true })
@@ -377,13 +375,13 @@ test('extractOnce keeps the checkpoint when the llm stream fails', async () => {
   try {
     ctx.on('llm/stream', () => (async function* (): AsyncIterable<any> { throw new Error('provider down') })())
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-llmerr', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
-    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-llmerr.json'), 'utf8'))
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'sessions', 'session-llmerr.json'), 'utf8'))
     assert.match(checkpoint.audit[0].note, /llm-error/)
     assert.equal(checkpoint.checkpoint.seq, 0)
-    const logLine = JSON.parse((await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0])
+    const logLine = JSON.parse((await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0])
     assert.equal(logLine.outcome, 'llm-error')
   } finally {
     await ctx.fiber.dispose()
@@ -406,10 +404,10 @@ test('extractOnce records the provider failure detail on a terminal error finish
       }
     })())
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-llmdetail', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
-    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-llmdetail.json'), 'utf8'))
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'sessions', 'session-llmdetail.json'), 'utf8'))
     // The note carries the provider's own wording, so a dead model route is
     // diagnosable from the audit log alone (it used to say only llm-error).
     assert.match(checkpoint.audit[0].note, /llm-error/)
@@ -436,11 +434,11 @@ test('extractOnce treats a max-tokens finish as llm-error instead of parsing tru
       })()
     })
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-maxtokens', 30)
     await extractOnce(session, { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
     assert.equal(seenMaxTokens, 32768)
-    const checkpoint = JSON.parse(await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-maxtokens.json'), 'utf8'))
+    const checkpoint = JSON.parse(await readFile(join(tmp, 'sessions', 'session-maxtokens.json'), 'utf8'))
     assert.equal(checkpoint.audit[0].maxTokens, 32768)
     assert.match(checkpoint.audit[0].note, /llm-error: Error: llm stream finished with max-tokens/)
     assert.equal(checkpoint.checkpoint.seq, 0)
@@ -457,7 +455,7 @@ test('extractOnce uses the global default model when route is unset (§17)', asy
   try {
     ctx.on('llm/stream', () => mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-global-default', 30)
     // No extraction.llm.route; deps.defaultModel supplies the global default.
     const defaultModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
@@ -470,7 +468,7 @@ test('extractOnce uses the global default model when route is unset (§17)', asy
       createStatusTracker(),
     )
 
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-global-default.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-global-default.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.deepEqual(checkpoint.audit[0].route, { provider: 'deepseek-official', model: 'deepseek-v4-flash', reasoningEffort: 'low' })
   } finally {
@@ -489,7 +487,6 @@ test('extractOnce prefers an explicit route over the global default and passes t
     // Route configured: fixed, ignores the global default.
     const config = resolveConfig({
       root: tmp,
-      defaultPeer: 'test-peer',
       extraction: { llm: { route: 'huoshan/deepseek-v4-flash', reasoningEffort: 'high' } },
     })
     const session = sessionLike('session-explicit-route', 30)
@@ -503,7 +500,7 @@ test('extractOnce prefers an explicit route over the global default and passes t
       createStatusTracker(),
     )
 
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-explicit-route.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-explicit-route.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.deepEqual(checkpoint.audit[0].route, { provider: 'huoshan', model: 'deepseek-v4-flash', reasoningEffort: 'high' })
   } finally {
@@ -519,7 +516,7 @@ test('extractOnce falls back to the session header when no route and no global d
   try {
     ctx.on('llm/stream', () => mockStreamText('{"decision":"skip"}'))
     const store = new MemoryStore(tmp)
-    const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
     const session = sessionLike('session-header-fallback', 30)
     // defaultModel returns empty (e.g. service absent) -> falls back to requestHeader.
     const defaultModel = () => ({ provider: '', model: '' })
@@ -532,7 +529,7 @@ test('extractOnce falls back to the session header when no route and no global d
       createStatusTracker(),
     )
 
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-header-fallback.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-header-fallback.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.deepEqual(checkpoint.audit[0].route, { provider: 'huoshan', model: 'deepseek-v4-flash' })
   } finally {
@@ -553,7 +550,6 @@ test('extractOnce splits a route whose model id contains a slash (§17, pi-ai st
     // first segment, the model is everything after it.
     const config = resolveConfig({
       root: tmp,
-      defaultPeer: 'test-peer',
       extraction: { llm: { route: 'commandcode/deepseek/deepseek-v4-flash', reasoningEffort: 'high' } },
     })
     const session = sessionLike('session-slash-route', 30)
@@ -565,7 +561,7 @@ test('extractOnce splits a route whose model id contains a slash (§17, pi-ai st
       new AbortController().signal,
       createStatusTracker(),
     )
-    const checkpointText = await readFile(join(tmp, 'peers', 'test-peer', 'sessions', 'session-slash-route.json'), 'utf8')
+    const checkpointText = await readFile(join(tmp, 'sessions', 'session-slash-route.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
     assert.deepEqual(checkpoint.audit[0].route, { provider: 'commandcode', model: 'deepseek/deepseek-v4-flash', reasoningEffort: 'high' })
   } finally {

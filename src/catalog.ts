@@ -1,49 +1,33 @@
 /**
- * L0 catalog rendering and session-history tracking.
+ * L0 catalog rendering and session-history tracking for the Unified Topic Vault.
  *
- * The injected message uses the OFFICIAL `plugin` source kind with the
- * `catalog` form, so a released session-format migration can classify and
- * carry it (the private `memory-catalog` kind written before 0.2.3 is still read
- * back for old sessions). The official source form carries no payload, so the
- * published state is recovered by comparing the message text itself.
+ * Supports two adaptive layouts transparently:
+ *   1. Full expansion (when visible entries fit inside `index.maxTokens`)
+ *   2. Adaptive Topic Map (preferences + hot topics expanded, remaining topics
+ *      rendered as 1-line map entries inspectable via `read_memory("<topic>/")`)
  * @module dsh-memory-lite/src/catalog
  */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-import type { IndexEntry } from './types.js'
+import { PREFERENCES_TOPIC, type CollapsedTopicNotice, type IndexEntry } from './types.js'
 
-/**
- * The plugin name and source kind stamped on the catalog source:
- * `plugin:dsh-memory-lite` satisfies dsh 0.1.7 v4 producer-owned source admission
- * while remaining fully valid in dsh 0.1.5.
- */
+/** Producer-owned v4 source kind stamped on the catalog message. */
 export const MEMORY_CATALOG_PLUGIN = 'dsh-memory-lite'
 export const MEMORY_CATALOG_SOURCE_KIND = `plugin:${MEMORY_CATALOG_PLUGIN}` as const
 
 const GUIDANCE =
   'You have long-term memory tools (read_memory / search_memory / remember / update_memory / forget_memory). ' +
   'Call remember only when the user explicitly asks to remember something; do not decide on your own. ' +
-  'To load the full text of a memory, call read_memory with the exact path from this index.'
+  'To load the full text of a memory, call read_memory with its exact path (or pass "<topic>/" to list a collapsed topic).'
 
-/** One shared-mount notice rendered into the catalog; not an index entry. */
-export interface SharedMountNotice {
-  readonly name: string
-  readonly peer: string
-  readonly readonly: boolean
-}
-
-/** The shared-mount section of the catalog (empty when no mounts). */
-function renderSharedMounts(mounts: readonly SharedMountNotice[]): string[] {
-  if (mounts.length === 0) return []
-  return [
-    '',
-    '## shared',
-    ...mounts.map(mount =>
-      `- shared/${mount.name}/: read-only mirror of peer '${mount.peer}'. The full index is not preloaded — find content with search_memory, then read_memory for the full text.`,
-    ),
-  ]
+/** Structured render inputs for one catalog publication. */
+export interface RenderCatalogOptions {
+  readonly entries: readonly IndexEntry[]
+  readonly collapsedTopics?: readonly CollapsedTopicNotice[]
+  readonly globalCharter?: string
+  readonly restricted?: boolean
 }
 
 /** The single model-facing text block of one message content array. */
@@ -59,19 +43,13 @@ function textOfContent(content: unknown): string | undefined {
 
 /**
  * Whether one message source is a memory catalog this plugin published.
- * Recognizes all three historical representations:
- * 1. Pre-0.2.3: { kind: 'memory-catalog' }
- * 2. 0.2.3 - 0.3.0 (v3 format): { kind: 'plugin', plugin: 'dsh-memory-lite', form: 'catalog' }
- * 3. 0.1.7+ (v4 format & v3->v4 migrated): { kind: 'plugin:dsh-memory-lite', form: 'catalog' }
+ * Recognizes all three historical representations (pre-0.2.3, v3, v4).
  */
 export function isMemoryCatalogSource(source: unknown): boolean {
   if (typeof source !== 'object' || source === null) return false
   const record = source as { readonly kind?: unknown; readonly plugin?: unknown; readonly form?: unknown }
-  // Generation 1: pre-0.2.3 legacy source
   if (record.kind === 'memory-catalog') return true
-  // Generation 2: 0.2.3 - 0.3.0 v3 source wrapper
   if (record.kind === 'plugin' && record.plugin === MEMORY_CATALOG_PLUGIN && record.form === 'catalog') return true
-  // Generation 3: 0.1.7 v4 producer-owned source kind (and v3->v4 migrated)
   if (record.kind === MEMORY_CATALOG_SOURCE_KIND && record.form === 'catalog') return true
   return false
 }
@@ -92,89 +70,88 @@ function renderGlobalCharter(globalCharter?: string): string[] {
   ]
 }
 
-/** The catalog message for this session's first publication. */
-export function renderCatalogMessage(
-  entries: readonly IndexEntry[],
-  peer: string,
-  sharedMounts: readonly SharedMountNotice[] = [],
-  globalCharter?: string,
-): UserMessage {
-  return createUserMessage({
-    content: [{
-      type: 'text',
-      text: [
-        '<system-reminder>',
-        ...renderGlobalCharter(globalCharter),
-        `This is your long-term memory index for the ${peer} project. It lists what you have memorized, one line per memory.`,
+/** Topic-grouped entry lines (`preferences` annotated as always relevant). */
+function renderTopicSections(entries: readonly IndexEntry[]): string[] {
+  const lines: string[] = []
+  let lastTopic: string | undefined
+  for (const entry of entries) {
+    if (entry.topic !== lastTopic) {
+      lines.push('')
+      const hint = entry.topic === PREFERENCES_TOPIC ? ' (always relevant)' : ''
+      lines.push(`## ${escapeCatalogText(entry.topic)}${hint}`)
+      lastTopic = entry.topic
+    }
+    lines.push(`- ${escapeCatalogText(entry.path)}: ${escapeCatalogText(entry.summary)}`)
+  }
+  return lines
+}
+
+/** Collapsed 1-line Topic Map entries for adaptive mode. */
+function renderCollapsedTopics(collapsed: readonly CollapsedTopicNotice[]): string[] {
+  if (collapsed.length === 0) return []
+  const lines: string[] = [
+    '',
+    '## Collapsed Topics (call read_memory("<topic>/") to list, or search_memory)',
+  ]
+  for (const item of collapsed) {
+    const preview = item.previewTitles.map(escapeCatalogText).join(', ')
+    const previewPart = preview === '' ? '' : `: ${preview}`
+    lines.push(`- ${escapeCatalogText(item.topic)} (${item.count})${previewPart}`)
+  }
+  return lines
+}
+
+/** Build the body text for first publication or replacement update. */
+function buildCatalogBody(options: RenderCatalogOptions, isUpdate: boolean): string {
+  const { entries, collapsedTopics = [], globalCharter, restricted = false } = options
+  const modeNote = restricted ? ' (restricted mode: private memories are hidden)' : ''
+  const header = isUpdate
+    ? [`Your long-term memory catalog changed${modeNote}. This complete catalog replaces every earlier memory catalog in this session:`]
+    : [
+        `This is your long-term memory index${modeNote}. Memories are organized by topic, one line per memory.`,
         'The full text of any memory is NOT loaded until you call read_memory — use the exact path from this index.',
-        ...renderSections(entries),
-        ...renderSharedMounts(sharedMounts),
-        '',
-        GUIDANCE,
-        '</system-reminder>',
-      ].filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'),
-    }],
-    source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
-  })
+      ]
+  return [
+    '<system-reminder>',
+    ...renderGlobalCharter(globalCharter),
+    ...header,
+    ...renderTopicSections(entries),
+    ...renderCollapsedTopics(collapsedTopics),
+    '',
+    GUIDANCE,
+    '</system-reminder>',
+  ].filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n')
 }
 
-/** The catalog message when the index changed and an older catalog is still visible. */
-export function renderCatalogUpdate(
-  entries: readonly IndexEntry[],
-  peer: string,
-  sharedMounts: readonly SharedMountNotice[] = [],
-  globalCharter?: string,
-): UserMessage {
+/** The catalog message for this session's first publication. */
+export function renderCatalogMessage(options: RenderCatalogOptions): UserMessage {
   return createUserMessage({
-    content: [{
-      type: 'text',
-      text: [
-        '<system-reminder>',
-        ...renderGlobalCharter(globalCharter),
-        `The memory catalog for ${peer} changed. This complete catalog replaces every earlier memory catalog in this session:`,
-        ...renderSections(entries),
-        ...renderSharedMounts(sharedMounts),
-        '',
-        GUIDANCE,
-        '</system-reminder>',
-      ].filter((line, i, arr) => !(line === '' && arr[i - 1] === '')).join('\n'),
-    }],
+    content: [{ type: 'text', text: buildCatalogBody(options, false) }],
     source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
   })
 }
 
-/**
- * Whether a published catalog text is still this plugin's current rendering.
- * An unchanged catalog matches whichever framing it was published with, so a
- * first publication and an update that carry the same entries and mounts both
- * count as current.
- */
-export function isCurrentCatalogText(
-  text: string,
-  entries: readonly IndexEntry[],
-  peer: string,
-  sharedMounts: readonly SharedMountNotice[] = [],
-  globalCharter?: string,
-): boolean {
-  return text === catalogText(renderCatalogMessage(entries, peer, sharedMounts, globalCharter))
-    || text === catalogText(renderCatalogUpdate(entries, peer, sharedMounts, globalCharter))
+/** The catalog message when the index or trust level changed while an older catalog is visible. */
+export function renderCatalogUpdate(options: RenderCatalogOptions): UserMessage {
+  return createUserMessage({
+    content: [{ type: 'text', text: buildCatalogBody(options, true) }],
+    source: { kind: MEMORY_CATALOG_SOURCE_KIND, form: 'catalog' },
+  })
 }
 
-/**
- * The latest catalog message this session published, plus the text it
- * published while that message is still on the visible surface (compaction may
- * have moved it off).
- */
+/** Whether a published catalog text still matches the current rendering. */
+export function isCurrentCatalogText(text: string, options: RenderCatalogOptions): boolean {
+  return text === catalogText(renderCatalogMessage(options))
+    || text === catalogText(renderCatalogUpdate(options))
+}
+
+/** Latest catalog message this session published, plus its text while still on the visible surface. */
 export function catalogHistory(agent: Agent): { published: boolean; visibleText?: string } {
   const visible = new Set(agent.session.surface.nodes)
-  // dsh-session >= 0.1.2 replaced the `events` property with snapshotEvents()
-  // and narrowed seq to a branded SessionSeq; both shapes are read-only event
-  // arrays with {type, seq, data} and seq stays comparable with surface.nodes.
   type EventLike = { type: string; seq: unknown; data: { content?: unknown; source?: unknown } }
   const sessionAny = agent.session as { events?: readonly EventLike[]; snapshotEvents?: () => readonly EventLike[] }
   const events = sessionAny.snapshotEvents !== undefined ? sessionAny.snapshotEvents() : (sessionAny.events ?? [])
   for (let index = events.length - 1; index >= 0; index -= 1) {
-    // The loop bound proves the read-only event view contains this index.
     const event = events[index]!
     if (event.type !== 'user/message') continue
     if (!isMemoryCatalogSource(event.data.source)) continue
@@ -191,35 +168,12 @@ export function catalogMessage(
   messages: readonly UserMessage[],
 ): { message: UserMessage; text: string } | undefined {
   for (const message of messages) {
-    // A message without a stamped source (created before the loop or by hand)
-    // is not this plugin's catalog; treat it like any other message.
     const source = (message as { readonly source?: unknown }).source
     if (!isMemoryCatalogSource(source)) continue
     const text = textOfContent((message as { readonly content?: unknown }).content)
     if (text !== undefined) return { message, text }
   }
   return undefined
-}
-
-/** Category-section lines with per-category relevance hints. */
-function renderSections(entries: readonly IndexEntry[]): string[] {
-  const hints: Record<string, string> = {
-    preferences: ' (always relevant)',
-    entities: ' (relevant when mentioned)',
-    events: ' (relevant for time queries)',
-    experiences: ' (relevant for similar tasks)',
-  }
-  const lines: string[] = []
-  let lastCategory: string | undefined
-  for (const entry of entries) {
-    if (entry.category !== lastCategory) {
-      lines.push('')
-      lines.push(`## ${entry.category}${hints[entry.category] ?? ''}`)
-      lastCategory = entry.category
-    }
-    lines.push(`- ${escapeCatalogText(entry.path)}: ${escapeCatalogText(entry.summary)}`)
-  }
-  return lines
 }
 
 /** Escape catalog text for the pseudo-XML framing (applied at render, never stored). */

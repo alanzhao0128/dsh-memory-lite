@@ -1,24 +1,25 @@
 /**
- * The on-disk memory tree: containment, atomic writes through a serial queue,
- * L0 index management, and line search. Instances are created per plugin mount
- * and closed over by the tools and the pre-step injector.
+ * The on-disk Unified Topic Vault (`~/.agent-memory/`): containment, atomic
+ * writes through a serial queue, trust-boundary enforcement, topic-grouped L0
+ * index management, and path+summary+body search.
  * @module dsh-memory-lite/src/memory-store
  */
 
 import { readFile as readFileNode, readdir, rename, stat, unlink } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative } from 'node:path'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import type { IndexEntry } from './types.js'
-import type { HistoryConfig, SharingConfig } from './config.js'
+import { DEFAULT_PRIVATE_NAMESPACE, PREFERENCES_TOPIC, type IndexEntry, type TrustContext } from './types.js'
+import type { HistoryConfig } from './config.js'
 import { containWithin, ensureDir, MemoryPathError, realpathSafe } from './path.js'
 import { applyPatch, bulletLines, lineKey, type PatchOp } from './patch.js'
+import { isPrivatePath, normalizeTopic, topicOfPath, UNRESTRICTED_TRUST } from './privacy.js'
 
 /** Current UTC date as YYYY-MM-DD. */
 function todayUtc(): string {
   return new Date().toISOString().slice(0, 10)
 }
 
-/** Serialize mutations so writers never interleave inside one memory tree. */
+/** Serialize mutations so writers never interleave inside the memory vault. */
 export class MutationQueue {
   private tail: Promise<unknown> = Promise.resolve()
 
@@ -30,7 +31,7 @@ export class MutationQueue {
   }
 }
 
-/** Cap on retained summary-log lines per peer (bounds the rolling log). */
+/** Cap on retained summary-log lines (bounds the rolling log). */
 export const MAX_LOG_LINES = 5000
 
 /** Defaults for the History cap and sidecar archive (see {@link HistoryConfig}). */
@@ -39,28 +40,28 @@ export const DEFAULT_HISTORY: HistoryConfig = { maxEntries: 5, entryMaxChars: 24
 /** Directory (beside `memories/`) that holds full pre-change snapshots. */
 export const ARCHIVE_DIR = '.history'
 
-/** UI-annotation metadata for one peer directory (never a path segment). */
-export interface PeerMeta {
-  /** Human-readable source directory basename, e.g. "健康分析". */
-  readonly displayName: string
-  /** Absolute source working directory the peer was derived from. */
-  readonly sourceCwd?: string
-}
-
-/** One existing peer directory as surfaced to the settings UI. */
-export interface PeerSummary {
-  /** Stable storage name (ASCII, hash-suffixed); used as path/mount identity. */
-  readonly name: string
-  /** Human-readable annotation; equals the name when no annotation exists. */
-  readonly displayName: string
+/** Summary of one topic in the vault (used by L0 map & UI). */
+export interface TopicSummary {
+  readonly topic: string
+  readonly isPrivate: boolean
+  readonly count: number
+  readonly previewTitles: readonly string[]
 }
 
 /** One line-level search hit. */
 export interface SearchMatch {
-  /** Memory path relative to the peer's memories root. */
+  /** Memory path relative to `<root>/memories/`. */
   readonly path: string
-  /** The matching line, capped in length. */
+  /** The matching line (or `[summary]` hit), capped in length. */
   readonly line: string
+}
+
+/** Options for {@link MemoryStore.search}. */
+export interface SearchOptions {
+  readonly topic?: string
+  readonly trust?: TrustContext
+  readonly maxMatches?: number
+  readonly maxLineLength?: number
 }
 
 /** The known sections of a memory file; extra content is preserved verbatim. */
@@ -114,9 +115,7 @@ export function parseMemoryFile(text: string): MemoryFileSections {
 /**
  * Normalize a tool-supplied "new content" value. Models sometimes pass a full
  * rendered memory file (an H1 title line plus `## Current` etc.) instead of
- * the plain new body; detect that shape and extract the Current section body
- * so it is stored as the section's content rather than nested as a literal
- * bullet. Plain text passes through unchanged.
+ * the plain new body; extract Current when detected. Plain text passes through.
  */
 export function normalizeContent(content: string): string {
   const trimmed = content.trim()
@@ -143,41 +142,45 @@ export function summaryOf(content: string, maxLength = 100): string {
   return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3)}...`
 }
 
-/** Render the L0 index document for one peer. */
-export function renderIndex(peer: string, entries: readonly IndexEntry[], now: Date): string {
-  const hints: Record<string, string> = {
-    preferences: '(always relevant)',
-    entities: '(relevant when mentioned)',
-    events: '(relevant for time queries)',
-    experiences: '(relevant for similar tasks)',
-  }
-  const lines: string[] = [`# Memory Index — ${peer}`, '', `> Last updated: ${now.toISOString()} | Total: ${entries.length}`, '']
-  const byCategory = new Map<string, IndexEntry[]>()
+/** Render the topic-grouped L0 index document (`memories/_index.md`). */
+export function renderIndex(
+  entries: readonly IndexEntry[],
+  now: Date,
+  privateNamespace = DEFAULT_PRIVATE_NAMESPACE,
+): string {
+  const lines: string[] = ['# Memory Index', '', `> Last updated: ${now.toISOString()} | Total: ${entries.length}`, '']
+  const byTopic = new Map<string, IndexEntry[]>()
   for (const entry of entries) {
-    const list = byCategory.get(entry.category)
-    if (list === undefined) byCategory.set(entry.category, [entry])
+    const list = byTopic.get(entry.topic)
+    if (list === undefined) byTopic.set(entry.topic, [entry])
     else list.push(entry)
   }
-  // Enforce a stable priority order so preferences and critical entities always render first,
-  // preventing them from being truncated by L0 token caps when experiences grow large.
-  const orderedCategories = [
-    'preferences',
-    'entities',
-    'experiences',
-    'events',
-    ...[...byCategory.keys()].filter(k => !['preferences', 'entities', 'experiences', 'events'].includes(k)),
+  // Stable priority order: preferences first, then public topics (in newest-first
+  // appearance order), then private topics (in newest-first appearance order).
+  const publicTopics: string[] = []
+  const privateTopics: string[] = []
+  for (const topic of byTopic.keys()) {
+    if (topic === PREFERENCES_TOPIC) continue
+    if (isPrivatePath(topic, privateNamespace)) privateTopics.push(topic)
+    else publicTopics.push(topic)
+  }
+  const orderedTopics = [
+    ...(byTopic.has(PREFERENCES_TOPIC) ? [PREFERENCES_TOPIC] : []),
+    ...publicTopics,
+    ...privateTopics,
   ]
-  for (const category of orderedCategories) {
-    const list = byCategory.get(category)
+  for (const topic of orderedTopics) {
+    const list = byTopic.get(topic)
     if (list === undefined || list.length === 0) continue
-    lines.push(`## ${category}${hints[category] !== undefined ? ' ' + hints[category] : ''}`)
+    const hint = topic === PREFERENCES_TOPIC ? ' (always relevant)' : ''
+    lines.push(`## ${topic}${hint}`)
     for (const entry of list) lines.push(`- ${entry.path}: ${entry.summary}`)
     lines.push('')
   }
   return lines.join('\n').replace(/\n+$/, '\n')
 }
 
-/** Parse L0 index entries from an index document; malformed lines are ignored (tolerant of human edits). */
+/** Parse L0 index entries from `_index.md`; malformed lines are ignored (tolerant of human edits). */
 export function parseIndex(text: string): IndexEntry[] {
   const entries: IndexEntry[] = []
   const linePattern = /^- (.+\.md): (.*)$/
@@ -186,17 +189,16 @@ export function parseIndex(text: string): IndexEntry[] {
     if (match === null) continue
     const path = match[1]!.trim()
     if (path === '' || path.startsWith('/') || path.includes('..')) continue
-    const category = path.split('/')[0] ?? ''
-    if (category === '') continue
-    entries.push({ category, path, summary: match[2]!.trim() })
+    const topic = topicOfPath(path)
+    if (topic === '') continue
+    entries.push({ topic, path, summary: match[2]!.trim() })
   }
   return entries
 }
 
 /**
  * A filesystem-safe slug from a title, used as the memory file basename.
- * Keeps Unicode letters and numbers (Chinese titles yield CJK filenames
- * instead of collapsing to the bare 'memory' fallback, which would collide).
+ * Keeps Unicode letters and numbers so CJK titles remain readable and distinct.
  */
 export function slugify(title: string): string {
   const slug = title
@@ -208,35 +210,40 @@ export function slugify(title: string): string {
 }
 
 /**
- * Owns the on-disk memory tree for every peer under one root. All mutations
- * run through {@link MutationQueue}; every read/write goes through
- * {@link MemoryStore.resolve} (the containment boundary).
+ * Owns the Unified Topic Vault under `root`. All mutations run through
+ * {@link MutationQueue}; every read/write passes through
+ * {@link MemoryStore.resolve} (containment + trust-boundary enforcement).
  */
 export class MemoryStore {
   readonly root: string
   private readonly queue = new MutationQueue()
-  readonly sharing: SharingConfig
-  readonly history: HistoryConfig
+  private readonly historySource: () => HistoryConfig
+  private readonly namespaceSource: () => string
 
   constructor(
     root: string,
-    sharing: SharingConfig = { enabled: false, mounts: [] },
-    history: HistoryConfig = DEFAULT_HISTORY,
+    history: HistoryConfig | (() => HistoryConfig) = DEFAULT_HISTORY,
+    privateNamespace: string | (() => string) = DEFAULT_PRIVATE_NAMESPACE,
   ) {
     this.root = root
-    this.sharing = sharing
-    this.history = history
+    this.historySource = typeof history === 'function' ? history : () => history
+    this.namespaceSource = typeof privateNamespace === 'function' ? privateNamespace : () => privateNamespace
   }
 
-  /** Path of the global charter file (SOUL / Identity) directly under root. */
+  get history(): HistoryConfig {
+    return this.historySource()
+  }
+
+  get privateNamespace(): string {
+    return this.namespaceSource()
+  }
+
+  /** Path of the global charter file (`AGENTS.md`) directly under root. */
   globalCharterPath(): string {
     return join(this.root, 'AGENTS.md')
   }
 
-  /**
-   * Read the global charter (AGENTS.md) if present under the memory root.
-   * Returns trimmed content or undefined if absent / empty / unreadable.
-   */
+  /** Read `AGENTS.md` if present; returns trimmed text or undefined when absent/empty. */
   async readGlobalCharter(): Promise<string | undefined> {
     try {
       const text = await readFileNode(this.globalCharterPath(), 'utf8')
@@ -247,66 +254,12 @@ export class MemoryStore {
     }
   }
 
-  peersDir(): string {
-    return join(this.root, 'peers')
+  memoriesRoot(): string {
+    return join(this.root, 'memories')
   }
 
-  /** Absolute path of one peer's UI-annotation metadata file. */
-  peerMetaPath(peer: string): string {
-    return join(this.root, 'peers', peer, '.peer-meta.json')
-  }
-
-  /** Read one peer's annotation metadata, or undefined when absent/unreadable. */
-  async readPeerMeta(peer: string): Promise<PeerMeta | undefined> {
-    try {
-      const raw = await readFileNode(this.peerMetaPath(peer), 'utf8')
-      const parsed = JSON.parse(raw) as { displayName?: unknown; sourceCwd?: unknown }
-      if (typeof parsed.displayName !== 'string') return undefined
-      return {
-        displayName: parsed.displayName,
-        ...(typeof parsed.sourceCwd === 'string' ? { sourceCwd: parsed.sourceCwd } : {}),
-      }
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * Remember the human-readable source directory behind a peer. Written once
-   * (first time a peer is seen with a cwd); later calls are no-ops so a rename
-   * of the source directory never rewrites an established annotation.
-   */
-  async rememberPeerCwd(peer: string, cwd: string): Promise<void> {
-    if (await this.readPeerMeta(peer) !== undefined) return
-    const meta: PeerMeta = { displayName: basename(cwd) || 'workspace', sourceCwd: cwd }
-    await this.queue.enqueue(async () => {
-      await ensureDir(dirname(this.peerMetaPath(peer)))
-      await writeFileAtomic(this.peerMetaPath(peer), JSON.stringify(meta, null, 2), { mode: 0o600, dirMode: 0o700 })
-    })
-  }
-
-  /** One existing peer directory: its storage name plus the UI displayName. */
-  async listPeers(): Promise<PeerSummary[]> {
-    try {
-      const entries = await readdir(this.peersDir(), { withFileTypes: true })
-      const names = entries.filter(e => e.isDirectory() && !e.name.startsWith('.')).map(e => e.name)
-      const out: PeerSummary[] = []
-      for (const name of names) {
-        const meta = await this.readPeerMeta(name)
-        out.push({ name, displayName: meta?.displayName ?? name })
-      }
-      return out
-    } catch {
-      return []
-    }
-  }
-
-  memoriesRoot(peer: string): string {
-    return join(this.root, 'peers', peer, 'memories')
-  }
-
-  sessionsDir(peer: string): string {
-    return join(this.root, 'peers', peer, 'sessions')
+  sessionsDir(): string {
+    return join(this.root, 'sessions')
   }
 
   trashDir(): string {
@@ -314,60 +267,30 @@ export class MemoryStore {
   }
 
   /**
-   * Contain and resolve a tool-supplied relative path inside one peer's memories
-   * root. Paths under `shared/<name>/...` are redirected (Phase 3 sharing) to
-   * the declared target peer's memories root; the model-facing relative path
-   * keeps the `shared/<name>` prefix so tool output stays source-annotated.
-   * `opts.write` marks a mutation so read-only mounts are rejected.
+   * Contain and resolve a relative `.md` path inside `<root>/memories/`,
+   * enforcing the trust boundary (`private/` is blocked in restricted mode).
    */
-  async resolve(peer: string, relPath: string, opts: { write?: boolean } = {}): Promise<{ abs: string; rel: string; base: string }> {
-    if (extname(relPath).toLowerCase() !== '.md') {
+  async resolve(
+    relPath: string,
+    opts: { write?: boolean; trust?: TrustContext } = {},
+  ): Promise<{ abs: string; rel: string; base: string }> {
+    const cleaned = relPath.trim()
+    if (extname(cleaned).toLowerCase() !== '.md') {
       throw new MemoryPathError(`memory path must end in .md: ${JSON.stringify(relPath)}`)
     }
-    if (relPath.startsWith('shared/')) {
-      return this.resolveShared(peer, relPath, opts)
-    }
-    const memories = this.memoriesRoot(peer)
+    const memories = this.memoriesRoot()
     await ensureDir(memories)
-    // containWithin returns the canonical (realpath'd) target; compute the
-    // relative path against the canonical root so /tmp vs /private/tmp and
-    // other symlinked ancestors never leak into tool-facing paths.
     const memoriesReal = await realpathSafe(memories)
-    const abs = await containWithin(memories, relPath)
-    return { abs, rel: relative(memoriesReal, abs), base: memoriesReal }
+    const abs = await containWithin(memories, cleaned)
+    const rel = relative(memoriesReal, abs).replaceAll('\\', '/')
+    if (opts.trust?.restricted === true && isPrivatePath(rel, this.privateNamespace)) {
+      throw new MemoryPathError(`access denied: ${JSON.stringify(rel)} is inside the private namespace (restricted mode)`)
+    }
+    return { abs, rel, base: memoriesReal }
   }
 
-  /** Resolve a `shared/<name>/...` path against the declared mount, enforcing read-only. */
-  private async resolveShared(peer: string, relPath: string, opts: { write?: boolean }): Promise<{ abs: string; rel: string; base: string }> {
-    if (!this.sharing.enabled) {
-      throw new MemoryPathError('shared/ paths are disabled (sharing.enabled = false)')
-    }
-    const rest = relPath.slice('shared/'.length)
-    const slash = rest.indexOf('/')
-    if (slash <= 0) {
-      throw new MemoryPathError(`shared path must be shared/<name>/<file>.md: ${JSON.stringify(relPath)}`)
-    }
-    const name = rest.slice(0, slash)
-    const inner = rest.slice(slash + 1)
-    const mount = this.sharing.mounts.find(mount => mount.name === name)
-    if (mount === undefined) {
-      throw new MemoryPathError(`unknown shared mount ${JSON.stringify(name)}`)
-    }
-    if (mount.peer === peer) {
-      throw new MemoryPathError(`a peer cannot access its own memories via shared/`)
-    }
-    if (opts.write === true && mount.readonly) {
-      throw new MemoryPathError(`shared mount ${JSON.stringify(name)} is read-only`)
-    }
-    const targetMemories = this.memoriesRoot(mount.peer)
-    await ensureDir(targetMemories)
-    const subpath = mount.subpath === '' || mount.subpath === '.' ? '' : mount.subpath + '/'
-    const targetAbs = await containWithin(targetMemories, subpath + inner)
-    return { abs: targetAbs, rel: relPath, base: targetMemories }
-  }
-
-  async fileExists(peer: string, relPath: string): Promise<boolean> {
-    const { abs } = await this.resolve(peer, relPath)
+  async fileExists(relPath: string, trust: TrustContext = UNRESTRICTED_TRUST): Promise<boolean> {
+    const { abs } = await this.resolve(relPath, { trust })
     try {
       return (await stat(abs)).isFile()
     } catch {
@@ -375,8 +298,8 @@ export class MemoryStore {
     }
   }
 
-  async readFile(peer: string, relPath: string): Promise<{ content: string; rel: string }> {
-    const { abs, rel } = await this.resolve(peer, relPath)
+  async readFile(relPath: string, trust: TrustContext = UNRESTRICTED_TRUST): Promise<{ content: string; rel: string }> {
+    const { abs, rel } = await this.resolve(relPath, { trust })
     let content: string
     try {
       content = await readFileNode(abs, 'utf8')
@@ -387,23 +310,26 @@ export class MemoryStore {
   }
 
   /** Create a new memory file with the canonical skeleton. */
-  writeNewMemory(peer: string, relPath: string, title: string, content: string): Promise<void> {
+  writeNewMemory(
+    relPath: string,
+    title: string,
+    content: string,
+    trust: TrustContext = UNRESTRICTED_TRUST,
+  ): Promise<void> {
     const bullets = bulletLines(content).join('\n')
     return this.queue.enqueue(async () => {
-      await this.writeNow(peer, relPath, `# ${title}\n\n## Current\n${bullets}\n\n## History\n\n## Related\n`)
+      await this.writeNow(relPath, `# ${title}\n\n## Current\n${bullets}\n\n## History\n\n## Related\n`, trust)
     })
   }
 
-  /**
-   * Append content as new Current bullets; creates the section when absent.
-   * Lines that already exist in Current (ignoring list markers and surrounding
-   * whitespace) are skipped, and no-op writes are dropped. Lines that are
-   * already list items, headings, table rows or indented keep their shape
-   * instead of being wrapped in a second `- `.
-   */
-  appendCurrent(peer: string, relPath: string, content: string): Promise<void> {
+  /** Append content as new Current bullets, skipping duplicates (marker-insensitive). */
+  appendCurrent(
+    relPath: string,
+    content: string,
+    trust: TrustContext = UNRESTRICTED_TRUST,
+  ): Promise<void> {
     return this.queue.enqueue(async () => {
-      const existing = await this.readFile(peer, relPath)
+      const existing = await this.readFile(relPath, trust)
       const parsed = parseMemoryFile(existing.content)
       const seen = new Set(parsed.current.split('\n').map(lineKey).filter(key => key !== ''))
       const fresh = bulletLines(content).filter(line => {
@@ -414,20 +340,19 @@ export class MemoryStore {
       })
       if (fresh.length === 0) return
       parsed.current = parsed.current === '' ? fresh.join('\n') : `${parsed.current}\n${fresh.join('\n')}`
-      await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
+      await this.writeNow(existing.rel, renderMemoryFile(parsed), trust)
     })
   }
 
-  /**
-   * Replace a memory's current content. The complete previous file is first
-   * saved as a snapshot under `<peer>/.history/<path>/` (outside `memories/`,
-   * so it is never searched or injected); History keeps only the newest
-   * `history.maxEntries` one-line entries.
-   */
-  updateCurrent(peer: string, relPath: string, content: string): Promise<void> {
+  /** Replace a memory's Current section, archiving the full previous file under `<root>/.history/`. */
+  updateCurrent(
+    relPath: string,
+    content: string,
+    trust: TrustContext = UNRESTRICTED_TRUST,
+  ): Promise<void> {
     return this.queue.enqueue(async () => {
-      const resolved = await this.resolve(peer, relPath, { write: true })
-      const existing = await this.readFile(peer, relPath)
+      const resolved = await this.resolve(relPath, { write: true, trust })
+      const existing = await this.readFile(relPath, trust)
       const parsed = parseMemoryFile(existing.content)
       await this.archiveSnapshot(resolved, existing.content)
       if (parsed.current !== '') {
@@ -437,20 +362,19 @@ export class MemoryStore {
         parsed.history = this.pushHistory(parsed.history)
       }
       parsed.current = bulletLines(content).join('\n')
-      await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
+      await this.writeNow(existing.rel, renderMemoryFile(parsed), trust)
     })
   }
 
-  /**
-   * Apply line-targeted patch operations to a memory's Current section (line
-   * numbers are 1-based positions in the Current body, as shown to the
-   * reconcile model). Validates everything before writing; a rejected patch
-   * leaves the file untouched. Returns whether the file changed.
-   */
-  patchCurrent(peer: string, relPath: string, ops: readonly PatchOp[]): Promise<{ changed: boolean; replaced: number; deleted: number; added: number }> {
+  /** Apply line-targeted patch operations to a memory's Current section. */
+  patchCurrent(
+    relPath: string,
+    ops: readonly PatchOp[],
+    trust: TrustContext = UNRESTRICTED_TRUST,
+  ): Promise<{ changed: boolean; replaced: number; deleted: number; added: number }> {
     return this.queue.enqueue(async () => {
-      const resolved = await this.resolve(peer, relPath, { write: true })
-      const existing = await this.readFile(peer, relPath)
+      const resolved = await this.resolve(relPath, { write: true, trust })
+      const existing = await this.readFile(relPath, trust)
       const parsed = parseMemoryFile(existing.content)
       const result = applyPatch(parsed.current === '' ? [] : parsed.current.split('\n'), ops)
       const next = result.lines.join('\n').trim()
@@ -461,7 +385,7 @@ export class MemoryStore {
         parsed.history,
         `- ${todayUtc()}: patch（替换 ${result.replaced} / 删除 ${result.deleted} / 新增 ${result.added} 行）`,
       )
-      await this.writeNow(peer, existing.rel, renderMemoryFile(parsed))
+      await this.writeNow(existing.rel, renderMemoryFile(parsed), trust)
       return { changed: true, replaced: result.replaced, deleted: result.deleted, added: result.added }
     })
   }
@@ -481,11 +405,7 @@ export class MemoryStore {
       .join('\n')
   }
 
-  /**
-   * Save the complete previous file text as `<peer>/.history/<rel>/<utc>.md`
-   * and prune to the newest `history.archiveKeep` snapshots. Best effort: a
-   * failure to archive never blocks the memory write itself.
-   */
+  /** Save the complete previous file text as `<root>/.history/<rel>/<utc>.md` and prune old snapshots. */
   private async archiveSnapshot(resolved: { rel: string; base: string }, previous: string): Promise<void> {
     if (this.history.archiveKeep <= 0) return
     try {
@@ -502,20 +422,16 @@ export class MemoryStore {
     }
   }
 
-  /**
-   * Validate a session id and resolve its checkpoint/audit file under
-   * sessionsDir; the id is constrained so it can never escape the directory.
-   */
-  sessionCheckpointPath(peer: string, sessionId: string): string {
+  /** Validate a session id and resolve its checkpoint/audit file under `<root>/sessions/`. */
+  sessionCheckpointPath(sessionId: string): string {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(sessionId)) {
       throw new MemoryPathError('invalid session id ' + JSON.stringify(sessionId))
     }
-    return join(this.sessionsDir(peer), sessionId + '.json')
+    return join(this.sessionsDir(), sessionId + '.json')
   }
 
-  /** Read a session checkpoint document; a missing file reads as undefined. */
-  async readSessionCheckpoint(peer: string, sessionId: string): Promise<string | undefined> {
-    const abs = this.sessionCheckpointPath(peer, sessionId)
+  async readSessionCheckpoint(sessionId: string): Promise<string | undefined> {
+    const abs = this.sessionCheckpointPath(sessionId)
     try {
       return await readFileNode(abs, 'utf8')
     } catch {
@@ -523,23 +439,21 @@ export class MemoryStore {
     }
   }
 
-  /** Persist a session checkpoint/audit document through the serial queue. */
-  writeSessionCheckpoint(peer: string, sessionId: string, text: string): Promise<void> {
-    const abs = this.sessionCheckpointPath(peer, sessionId)
+  writeSessionCheckpoint(sessionId: string, text: string): Promise<void> {
+    const abs = this.sessionCheckpointPath(sessionId)
     return this.queue.enqueue(async () => {
       await ensureDir(dirname(abs))
       await writeFileAtomic(abs, text, { mode: 0o600, dirMode: 0o700 })
     })
   }
 
-  /** Peer-level rolling run log: peers/{peer}/sessions/extraction.log. */
-  summaryLogPath(peer: string): string {
-    return join(this.sessionsDir(peer), 'extraction.log')
+  /** Vault-wide rolling extraction summary log: `<root>/sessions/extraction.log`. */
+  summaryLogPath(): string {
+    return join(this.sessionsDir(), 'extraction.log')
   }
 
-  /** Append one JSON line to the peer's extraction summary log (capped). */
-  appendExtractionLog(peer: string, line: string): Promise<void> {
-    const abs = this.summaryLogPath(peer)
+  appendExtractionLog(line: string): Promise<void> {
+    const abs = this.summaryLogPath()
     return this.queue.enqueue(async () => {
       await ensureDir(dirname(abs))
       let existing = ''
@@ -555,18 +469,12 @@ export class MemoryStore {
     })
   }
 
-  /**
-   * Diagnostic: append one failed extraction answer (the raw model output that
-   * parseDecision rejected) to peers/{peer}/sessions/failed-answers.log, capped.
-   * Only written when the answer was not salvageable; used to debug parse-error
-   * spikes. Not part of the functional path — callers tolerate failures.
-   */
-  failedAnswerLogPath(peer: string): string {
-    return join(this.sessionsDir(peer), 'failed-answers.log')
+  failedAnswerLogPath(): string {
+    return join(this.sessionsDir(), 'failed-answers.log')
   }
 
-  appendFailedAnswer(peer: string, entry: object): Promise<void> {
-    const abs = this.failedAnswerLogPath(peer)
+  appendFailedAnswer(entry: object): Promise<void> {
+    const abs = this.failedAnswerLogPath()
     return this.queue.enqueue(async () => {
       await ensureDir(dirname(abs))
       let existing = ''
@@ -582,10 +490,10 @@ export class MemoryStore {
     }).catch(() => {})
   }
 
-  /** Soft-delete: move the file under root/.trash/<date>/, never overwriting. */
-  softDelete(peer: string, relPath: string): Promise<void> {
+  /** Soft-delete: move the file under `<root>/.trash/<date>/`, never overwriting. */
+  softDelete(relPath: string, trust: TrustContext = UNRESTRICTED_TRUST): Promise<void> {
     return this.queue.enqueue(async () => {
-      const { abs, rel } = await this.resolve(peer, relPath, { write: true })
+      const { abs, rel } = await this.resolve(relPath, { write: true, trust })
       const day = new Date().toISOString().slice(0, 10)
       const destDir = join(this.trashDir(), day)
       await ensureDir(destDir)
@@ -594,9 +502,9 @@ export class MemoryStore {
     })
   }
 
-  /** Parse the L0 index for one peer; a missing index reads as empty. */
-  async readIndex(peer: string): Promise<IndexEntry[]> {
-    const memories = this.memoriesRoot(peer)
+  /** Parse the full on-disk `_index.md` unfiltered (internal). */
+  private async readIndexRaw(): Promise<IndexEntry[]> {
+    const memories = this.memoriesRoot()
     await ensureDir(memories)
     try {
       return parseIndex(await readFileNode(join(memories, '_index.md'), 'utf8'))
@@ -605,92 +513,169 @@ export class MemoryStore {
     }
   }
 
-  /** Rebuild the L0 index from entries, sorted by file mtime (newest first). */
-  rebuildIndex(peer: string, entries: readonly IndexEntry[]): Promise<void> {
-    return this.queue.enqueue(async () => this.writeIndexNow(peer, entries))
+  /** Read visible L0 index entries, stripping `private/*` when in restricted mode. */
+  async readIndex(trust: TrustContext = UNRESTRICTED_TRUST): Promise<IndexEntry[]> {
+    const all = await this.readIndexRaw()
+    if (!trust.restricted) return all
+    const ns = this.privateNamespace
+    return all.filter(entry => !isPrivatePath(entry.path, ns))
   }
 
-  /** Add or replace one entry, then rebuild. */
-  refreshIndexEntry(peer: string, relPath: string, summary: string): Promise<void> {
+  /** List all index entries inside one topic (or under the private namespace). */
+  async listTopic(rawTopic: string, trust: TrustContext = UNRESTRICTED_TRUST): Promise<{ topic: string; entries: IndexEntry[] }> {
+    const ns = this.privateNamespace
+    const cleaned = rawTopic.trim().replace(/^\/+|\/+$/g, '')
+    if (cleaned === ns) {
+      if (trust.restricted) {
+        throw new MemoryPathError(`access denied: topic ${JSON.stringify(cleaned)} is hidden in restricted mode`)
+      }
+      const entries = (await this.readIndex(trust)).filter(e => isPrivatePath(e.topic, ns))
+      return { topic: ns, entries }
+    }
+    const topic = normalizeTopic(cleaned, ns)
+    if (trust.restricted && isPrivatePath(topic, ns)) {
+      throw new MemoryPathError(`access denied: topic ${JSON.stringify(topic)} is hidden in restricted mode`)
+    }
+    const entries = (await this.readIndex(trust)).filter(e => e.topic === topic)
+    return { topic, entries }
+  }
+
+  /** Group visible index entries into per-topic summaries (for L0 map & UI). */
+  async listTopics(trust: TrustContext = UNRESTRICTED_TRUST, previewLimit = 6): Promise<TopicSummary[]> {
+    const entries = await this.readIndex(trust)
+    const ns = this.privateNamespace
+    const groups = new Map<string, IndexEntry[]>()
+    for (const entry of entries) {
+      const list = groups.get(entry.topic)
+      if (list === undefined) groups.set(entry.topic, [entry])
+      else list.push(entry)
+    }
+    return [...groups.entries()].map(([topic, list]) => ({
+      topic,
+      isPrivate: isPrivatePath(topic, ns),
+      count: list.length,
+      previewTitles: list.slice(0, previewLimit).map(e => basename(e.path, '.md')),
+    }))
+  }
+
+  /** Rebuild `_index.md` from entries, sorted by file mtime (newest first). */
+  rebuildIndex(entries: readonly IndexEntry[]): Promise<void> {
+    return this.queue.enqueue(async () => this.writeIndexNow(entries))
+  }
+
+  /** Add or replace one entry, then rebuild `_index.md`. */
+  refreshIndexEntry(relPath: string, summary: string): Promise<void> {
     return this.queue.enqueue(async () => {
-      const entries = await this.readIndex(peer)
-      const category = relPath.split('/')[0] ?? ''
+      const entries = await this.readIndexRaw()
+      const topic = topicOfPath(relPath)
       const next = entries.filter(entry => entry.path !== relPath)
-      next.push({ category, path: relPath, summary })
-      await this.writeIndexNow(peer, next)
+      next.push({ topic, path: relPath, summary })
+      await this.writeIndexNow(next)
+    })
+  }
+
+  /** Ensure an index entry exists without overwriting an existing summary; re-sorts by mtime. */
+  ensureIndexEntry(relPath: string, fallbackSummary: string): Promise<void> {
+    return this.queue.enqueue(async () => {
+      const entries = await this.readIndexRaw()
+      const topic = topicOfPath(relPath)
+      const existing = entries.find(entry => entry.path === relPath)
+      const next = entries.filter(entry => entry.path !== relPath)
+      next.push({ topic, path: relPath, summary: existing?.summary ?? fallbackSummary })
+      await this.writeIndexNow(next)
+    })
+  }
+
+  /** Drop one entry, then rebuild `_index.md`. */
+  removeIndexEntry(relPath: string): Promise<void> {
+    return this.queue.enqueue(async () => {
+      const entries = await this.readIndexRaw()
+      await this.writeIndexNow(entries.filter(entry => entry.path !== relPath))
     })
   }
 
   /**
-   * Make sure an index entry exists without touching an existing summary. A
-   * summary describes the whole file, so merging a new fact must not replace
-   * it with that fact's first words. The index is still rebuilt (re-sorted by
-   * mtime) so the file moves to the front.
+   * Search visible memories by keyword across filenames, index summaries, and
+   * file bodies. Enforces `trust.restricted` (never reads `private/` files in
+   * restricted mode) and supports optional `topic` scoping.
    */
-  ensureIndexEntry(peer: string, relPath: string, fallbackSummary: string): Promise<void> {
-    return this.queue.enqueue(async () => {
-      const entries = await this.readIndex(peer)
-      const category = relPath.split('/')[0] ?? ''
-      const existing = entries.find(entry => entry.path === relPath)
-      const next = entries.filter(entry => entry.path !== relPath)
-      next.push({ category, path: relPath, summary: existing?.summary ?? fallbackSummary })
-      await this.writeIndexNow(peer, next)
-    })
-  }
-
-  /** Drop one entry, then rebuild. */
-  removeIndexEntry(peer: string, relPath: string): Promise<void> {
-    return this.queue.enqueue(async () => {
-      const entries = await this.readIndex(peer)
-      await this.writeIndexNow(peer, entries.filter(entry => entry.path !== relPath))
-    })
-  }
-
-  /** Line search across a peer's memory files, including enabled shared mounts (index files excluded). */
-  async search(peer: string, query: string, maxMatches = 20, maxLineLength = 300): Promise<SearchMatch[]> {
+  async search(query: string, opts: SearchOptions = {}): Promise<SearchMatch[]> {
     if (query.trim() === '') throw new MemoryPathError('search query must not be empty')
+    const trust = opts.trust ?? UNRESTRICTED_TRUST
+    const maxMatches = opts.maxMatches ?? 20
+    const maxLineLength = opts.maxLineLength ?? 300
+    const ns = this.privateNamespace
+
+    let topicFilter: string | undefined
+    if (opts.topic !== undefined && opts.topic.trim() !== '') {
+      const cleaned = opts.topic.trim().replace(/^\/+|\/+$/g, '')
+      if (cleaned === ns) {
+        if (trust.restricted) {
+          throw new MemoryPathError(`access denied: topic ${JSON.stringify(cleaned)} is hidden in restricted mode`)
+        }
+        topicFilter = ns
+      } else {
+        topicFilter = normalizeTopic(cleaned, ns)
+        if (trust.restricted && isPrivatePath(topicFilter, ns)) {
+          throw new MemoryPathError(`access denied: topic ${JSON.stringify(topicFilter)} is hidden in restricted mode`)
+        }
+      }
+    }
+
+    const matchesTopic = (rel: string): boolean => {
+      if (topicFilter === undefined) return true
+      if (topicFilter === ns) return isPrivatePath(rel, ns)
+      return topicOfPath(rel) === topicFilter
+    }
+
     const needle = query.toLowerCase()
     const matches: SearchMatch[] = []
-    for (const { abs, prefix } of this.searchRoots(peer)) {
-      await ensureDir(abs)
-      await this.walkMarkdown(abs, abs, async (fileAbs, rel) => {
-        if (matches.length >= maxMatches) return
-        let content: string
-        try {
-          content = await readFileNode(fileAbs, 'utf8')
-        } catch {
-          return
-        }
-        for (const line of content.split('\n')) {
-          if (matches.length >= maxMatches) return
-          const trimmed = line.slice(0, maxLineLength)
-          if (trimmed.toLowerCase().includes(needle)) matches.push({ path: prefix + rel, line: trimmed })
-        }
-      })
+    const matchedPaths = new Set<string>()
+
+    // 1. Search index paths & summaries first (high-signal title/topic hits).
+    const indexEntries = await this.readIndex(trust)
+    for (const entry of indexEntries) {
+      if (matches.length >= maxMatches) break
+      if (!matchesTopic(entry.path)) continue
+      const combined = `${entry.path} ${entry.summary}`.toLowerCase()
+      if (combined.includes(needle)) {
+        matches.push({ path: entry.path, line: `[summary] ${entry.summary}`.slice(0, maxLineLength) })
+        matchedPaths.add(entry.path)
+      }
     }
+
+    // 2. Search file bodies across visible markdown files.
+    const memories = this.memoriesRoot()
+    await ensureDir(memories)
+    await this.walkMarkdown(memories, memories, trust, async (fileAbs, rel) => {
+      if (matches.length >= maxMatches) return
+      if (!matchesTopic(rel)) return
+      let content: string
+      try {
+        content = await readFileNode(fileAbs, 'utf8')
+      } catch {
+        return
+      }
+      for (const line of content.split('\n')) {
+        if (matches.length >= maxMatches) return
+        const trimmed = line.slice(0, maxLineLength)
+        if (trimmed.toLowerCase().includes(needle)) {
+          matches.push({ path: rel, line: trimmed })
+        }
+      }
+    })
+
     return matches
   }
 
-  /** Search roots for a peer: its own memories plus each enabled non-self shared mount. */
-  private searchRoots(peer: string): Array<{ abs: string; prefix: string }> {
-    const roots: Array<{ abs: string; prefix: string }> = [{ abs: this.memoriesRoot(peer), prefix: '' }]
-    if (this.sharing.enabled) {
-      for (const mount of this.sharing.mounts) {
-        if (mount.peer === peer) continue
-        const sub = mount.subpath === '' || mount.subpath === '.' ? '' : mount.subpath
-        roots.push({ abs: join(this.memoriesRoot(mount.peer), sub), prefix: 'shared/' + mount.name + '/' })
-      }
-    }
-    return roots
-  }
-
-  private async writeNow(peer: string, relPath: string, content: string): Promise<void> {
-    const { abs } = await this.resolve(peer, relPath, { write: true })
+  private async writeNow(relPath: string, content: string, trust: TrustContext): Promise<void> {
+    const { abs } = await this.resolve(relPath, { write: true, trust })
     await writeFileAtomic(abs, content, { mode: 0o600, dirMode: 0o700 })
   }
 
-  private async writeIndexNow(peer: string, entries: readonly IndexEntry[]): Promise<void> {
-    const memories = this.memoriesRoot(peer)
+  private async writeIndexNow(entries: readonly IndexEntry[]): Promise<void> {
+    const memories = this.memoriesRoot()
+    await ensureDir(memories)
     const byMtime = new Map<string, number>()
     for (const entry of entries) {
       try {
@@ -700,19 +685,31 @@ export class MemoryStore {
       }
     }
     const sorted = [...entries].sort((a, b) => (byMtime.get(b.path) ?? 0) - (byMtime.get(a.path) ?? 0))
-    await writeFileAtomic(join(memories, '_index.md'), renderIndex(peer, sorted, new Date()), { mode: 0o600, dirMode: 0o700 })
+    await writeFileAtomic(
+      join(memories, '_index.md'),
+      renderIndex(sorted, new Date(), this.privateNamespace),
+      { mode: 0o600, dirMode: 0o700 },
+    )
   }
 
-  private async walkMarkdown(base: string, dir: string, visit: (abs: string, rel: string) => Promise<void>): Promise<void> {
+  private async walkMarkdown(
+    base: string,
+    dir: string,
+    trust: TrustContext,
+    visit: (abs: string, rel: string) => Promise<void>,
+  ): Promise<void> {
     const entries = await readdir(dir, { withFileTypes: true })
+    const ns = this.privateNamespace
     for (const entry of entries) {
       const abs = join(dir, entry.name)
+      const rel = relative(base, abs).replaceAll('\\', '/')
       if (entry.isDirectory()) {
-        await this.walkMarkdown(base, abs, visit)
+        // Hard privacy skip: never even descend into private/ when restricted.
+        if (trust.restricted && isPrivatePath(rel, ns)) continue
+        await this.walkMarkdown(base, abs, trust, visit)
       } else if (entry.isFile() && extname(entry.name).toLowerCase() === '.md' && entry.name !== '_index.md') {
-        // rel is always relative to the top-level memories root, so results
-        // stay valid paths for read_memory / update_memory / forget_memory.
-        await visit(abs, relative(base, abs))
+        if (trust.restricted && isPrivatePath(rel, ns)) continue
+        await visit(abs, rel)
       }
     }
   }

@@ -1,40 +1,55 @@
 /**
- * Configuration contracts for dsh-memory-lite. The schemastery `Config`
- * validates the shape a user writes in cordis.yml (every field optional);
- * `resolveConfig` performs explicit defaulting — the only place defaults
- * are applied.
+ * Configuration contracts for dsh-memory-lite v1.0 (Unified Topic Vault).
+ * The schemastery `Config` validates the shape written in cordis.yml (every
+ * field optional); `resolveConfig` performs explicit defaulting — the only
+ * place defaults are applied.
  * @module dsh-memory-lite/src/config
  */
 
 import { resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { expandHomePath } from '@deepseek-ai/dsh-home-paths'
+import { DEFAULT_PRIVATE_NAMESPACE } from './types.js'
 
 /** Default memory root; `~` expands against the user's home. */
 export const DEFAULT_MEMORY_ROOT = '~/.agent-memory'
-/** Default peer used for sessions without a usable cwd. */
-export const DEFAULT_PEER = 'dsh-web'
-/** Default cap on catalog size, in approximate tokens. */
-export const DEFAULT_INDEX_MAX_TOKENS = 2000
+/** Default cap on L0 catalog size, in approximate tokens. */
+export const DEFAULT_INDEX_MAX_TOKENS = 3500
+/** Default fraction of post-preferences budget given to expanded hot topics when collapsing. */
+export const DEFAULT_HOT_BUDGET_RATIO = 0.7
 /** Default session-header indicator slot order (ascending; -1 sits left of the built-in "Session log" capsule). */
 export const DEFAULT_HEADER_ORDER = -1
 
-/** Per-session peer derivation from `SessionHeader.cwd`. */
-export interface WorkspacePeersConfig {
-  /** Derive the peer from each session's cwd. Defaults to true. */
-  enabled: boolean
-  /** Reserved for Phase 2 extraction; peer derivation ignores it. Defaults to true. */
-  excludeSubagents: boolean
-  /** Peer name used when a session has no cwd; the literal `default_peer` selects the default. Defaults to `default_peer`. */
-  cwdFallback: string
+/** One optional safety-net path rule forcing writes/extractions under `pattern` into a private topic. */
+export interface PrivatePathRule {
+  /** Path glob pattern (~ expanded), e.g. `~/Documents/健康分析/**`. */
+  pattern: string
+  /** Target private topic, e.g. `private/health`. */
+  topic: string
 }
 
-/** L0 catalog sizing. */
+/** Trust-boundary configuration guarding the `private/` namespace. */
+export interface PrivacyConfig {
+  /** Top-level namespace for sensitive memories (plain segment). Defaults to `'private'`. */
+  namespace: string
+  /** One-click privacy shield (e.g. screen sharing / demos): hides `private/` everywhere. Defaults to false. */
+  hidePrivate: boolean
+  /** LLM provider IDs that must never receive or access `private/` memories (e.g. corporate gateways). */
+  restrictedProviders: string[]
+  /** Path patterns (~ expanded) where `private/` memories are hidden (e.g. corporate work directories). */
+  restrictedPaths: string[]
+  /** Optional safety-net rules: writes/extractions from matching directories are forced into `private/<subtopic>`. */
+  privatePaths: PrivatePathRule[]
+}
+
+/** L0 catalog sizing and adaptive collapse tuning. */
 export interface IndexConfig {
-  /** Approximate token cap for the catalog; entries past the cap are truncated. Defaults to 2000. */
+  /** Approximate token cap for the L0 catalog. Under cap = full expansion; over cap = adaptive Topic Map. Defaults to 3500. */
   maxTokens: number
   /** Index sort order; `mtime` newest-first is the only supported value. Defaults to `mtime`. */
   sortBy: 'mtime'
+  /** Share of remaining token budget allocated to expanded hot topics in adaptive map mode (0.2–0.9). Defaults to 0.7. */
+  hotBudgetRatio: number
 }
 
 /** Tool-side switches. */
@@ -45,28 +60,8 @@ export interface ToolsConfig {
 
 /** Browser-side indicator options. */
 export interface UiConfig {
-  /** Render order of the memory status indicator in the session-header utilities slot (ascending; smaller = further left, -1 sits left of the built-in "Session log" capsule). Defaults to -1. */
+  /** Render order of the memory status indicator in the session-header utilities slot. Defaults to -1. */
   headerOrder: number
-}
-
-/** One explicit cross-peer share: expose a target peer's memories at shared/<name>/... */
-export interface SharingMountConfig {
-  /** Path prefix exposed to this peer's sessions: shared/<name>/<file>.md. Must be a plain segment. */
-  name: string
-  /** Target peer whose memories root is shared. */
-  peer: string
-  /** Subpath inside the target peer's memories root; '' = the whole root. */
-  subpath: string
-  /** Read-only mirror; write operations are rejected. Defaults to true. */
-  readonly: boolean
-}
-
-/** Cross-peer sharing (Phase 3): explicit, not default. */
-export interface SharingConfig {
-  /** Master switch; when off, shared/ paths are rejected. Defaults to false. */
-  enabled: boolean
-  /** Ordered mount declarations, visible to every peer except the target itself. */
-  mounts: SharingMountConfig[]
 }
 
 /** Retention for a memory file's History section and its full-snapshot archive. */
@@ -75,23 +70,23 @@ export interface HistoryConfig {
   maxEntries: number
   /** Max characters per History line; longer lines are cut with an ellipsis. Defaults to 240. */
   entryMaxChars: number
-  /** Full pre-change snapshots kept per file under `<peer>/.history/`; 0 disables archiving. Defaults to 5. */
+  /** Full pre-change snapshots kept per file under `<root>/.history/`; 0 disables archiving. Defaults to 5. */
   archiveKeep: number
 }
 
 /** Extraction model selection: an explicit route wins; empty = the global default model (agent-default-model). */
 export interface ExtractionLlmConfig {
-  /** Combined "provider/model" route, e.g. 'deepseek-official/deepseek-v4-flash'. Empty = global default. */
+  /** Combined "provider/model" route, e.g. 'claude-official/claude-haiku-5-5'. Empty = global default. */
   route?: string
   /** Adapter-owned reasoning effort id (e.g. 'low'); empty = follow the global default selection. */
   reasoningEffort?: string
-  /** Legacy provider key (kept for compatibility with pre-§17 configs); superseded by route. */
+  /** Legacy provider key; superseded by route. */
   provider?: string
-  /** Legacy model id (kept for compatibility with pre-§17 configs); superseded by route. */
+  /** Legacy model id; superseded by route. */
   model?: string
 }
 
-/** Background implicit extraction (Phase 2, channel B). */
+/** Background implicit extraction (channel B). */
 export interface ExtractionConfig {
   /** incremental | explicit_only | off. Defaults to incremental. */
   mode: 'incremental' | 'explicit_only' | 'off'
@@ -101,17 +96,13 @@ export interface ExtractionConfig {
   idleTimeoutMin: number
   /** Max messages fed to the extraction LLM per run. Defaults to 20. */
   maxMessages: number
-  /** Which event kinds count toward windowTurns and feed the extraction window.
-   * 'user' = real user messages (injections never count), 'assistant' = assistant
-   * messages, 'tool_result' = raw tool results. Tool results are excluded by
-   * default: their raw output adds token cost and noise while the assistant
-   * message already carries the interpretation. Defaults to ['user','assistant']. */
+  /** Which event kinds count toward windowTurns and feed the extraction window. Defaults to ['user','assistant']. */
   messageScope: ('user' | 'assistant' | 'tool_result')[]
   /** Per tool/result content truncation before feeding the LLM. Defaults to 2048. */
   toolResultMaxBytes: number
   /** Carry the rolling session digest. Defaults to true. */
   includeDigest: boolean
-  /** Grep existing memories for dedup/contradiction. Defaults to true. */
+  /** Search existing memories for dedup/contradiction. Defaults to true. */
   dedup: boolean
   /** Extraction model selection; empty route = the global default model (agent-default-model). */
   llm: ExtractionLlmConfig
@@ -123,18 +114,13 @@ export interface ExtractionConfig {
   minTurnExtract: number
   /** Debounce window for turn-boundary extraction, ms. Defaults to 30000. */
   turnDebounceMs: number
-  /** Write audit entries to peers/{peer}/sessions/{id}.json. Defaults to true. */
+  /** Write audit entries to `<root>/sessions/{id}.json`. Defaults to true. */
   auditLog: boolean
   /** Global cap on concurrent extraction LLM requests. Defaults to 1. */
   maxConcurrentRequests: number
   /** On a failed JSON parse, one cheap repair call re-asks the model for valid JSON. Defaults to true. */
   parseRetry: boolean
-  /**
-   * Before a merge/update lands on an existing file, show the model that file's
-   * numbered Current lines and let it answer with line-targeted edits (or noop)
-   * instead of blindly appending. One extra LLM call, only for merge/update
-   * decisions. A failed reconcile falls back to a plain append. Defaults to true.
-   */
+  /** Before merge/update lands on an existing file, run a line-targeted reconcile pass. Defaults to true. */
   reconcile: boolean
   /** Byte budget for the numbered Current shown to the reconcile call; larger files fall back to append. Defaults to 24576. */
   reconcileMaxBytes: number
@@ -143,12 +129,10 @@ export interface ExtractionConfig {
 /** Raw plugin configuration as written in cordis.yml; every field optional. */
 export interface MemoryConfig {
   root?: string
-  defaultPeer?: string
-  workspacePeers?: Partial<WorkspacePeersConfig>
+  privacy?: Partial<PrivacyConfig>
   index?: Partial<IndexConfig>
   tools?: Partial<ToolsConfig>
   extraction?: Partial<ExtractionConfig>
-  sharing?: Partial<SharingConfig>
   history?: Partial<HistoryConfig>
   ui?: Partial<UiConfig>
 }
@@ -157,12 +141,10 @@ export interface MemoryConfig {
 export interface ResolvedConfig {
   /** Absolute, `~`-expanded memory root. */
   root: string
-  defaultPeer: string
-  workspacePeers: WorkspacePeersConfig
+  privacy: PrivacyConfig
   index: IndexConfig
   tools: ToolsConfig
   extraction: ExtractionConfig
-  sharing: SharingConfig
   history: HistoryConfig
   ui: UiConfig
 }
@@ -181,15 +163,20 @@ function asVolatile<T extends z<any>>(schema: T): T {
 /** Validate the plugin configuration shape. Unknown keys are tolerated for forward compatibility. */
 export const Config: z<MemoryConfig> = z.object({
   root: asVolatile(z.string()),
-  defaultPeer: asVolatile(z.string()),
-  workspacePeers: z.object({
-    enabled: z.boolean(),
-    excludeSubagents: z.boolean(),
-    cwdFallback: z.string(),
+  privacy: z.object({
+    namespace: asVolatile(z.string()),
+    hidePrivate: asVolatile(z.boolean()),
+    restrictedProviders: asVolatile(z.array(z.string())),
+    restrictedPaths: asVolatile(z.array(z.string())),
+    privatePaths: asVolatile(z.array(z.object({
+      pattern: z.string(),
+      topic: z.string(),
+    }))),
   }),
   index: z.object({
     maxTokens: asVolatile(z.number()),
     sortBy: z.union([z.const('mtime')]),
+    hotBudgetRatio: asVolatile(z.number()),
   }),
   tools: z.object({
     schemaMinimal: z.boolean(),
@@ -219,15 +206,6 @@ export const Config: z<MemoryConfig> = z.object({
     reconcile: asVolatile(z.boolean()),
     reconcileMaxBytes: asVolatile(z.number()),
   }),
-  sharing: z.object({
-    enabled: asVolatile(z.boolean()),
-    mounts: asVolatile(z.array(z.object({
-      name: z.string(),
-      peer: z.string(),
-      subpath: z.string(),
-      readonly: z.boolean(),
-    }))),
-  }),
   history: z.object({
     maxEntries: asVolatile(z.number()),
     entryMaxChars: asVolatile(z.number()),
@@ -238,8 +216,7 @@ export const Config: z<MemoryConfig> = z.object({
   }),
 })
 
-/** Validate and normalize extraction.messageScope. Invalid entries throw; an
- * absent value yields the default (conversation only, no raw tool results). */
+/** Validate and normalize extraction.messageScope. */
 function normalizeMessageScope(scope: readonly ('user' | 'assistant' | 'tool_result')[] | undefined): ('user' | 'assistant' | 'tool_result')[] {
   if (scope === undefined || scope.length === 0) return ['user', 'assistant']
   const valid = new Set(['user', 'assistant', 'tool_result'])
@@ -248,16 +225,12 @@ function normalizeMessageScope(scope: readonly ('user' | 'assistant' | 'tool_res
       throw new Error('dsh-memory-lite: extraction.messageScope entries must be user | assistant | tool_result, got ' + JSON.stringify(entry))
     }
   }
-  // Drop duplicates while preserving order.
   return [...new Set(scope)]
 }
 
 /**
  * Recursively unwrap Schemastery / Cosmokit `.volatile()` reference objects
- * ({ get(): T }). A volatile field evaluates to a stable reference holder
- * whose .get() yields the current value (or undefined when unconfigured).
- * This unwraps them so resolveConfig and all internal code deal strictly with
- * plain values.
+ * ({ get(): T }) into plain values.
  */
 export function unwrapConfig<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj
@@ -277,27 +250,64 @@ export function unwrapConfig<T>(obj: T): T {
   return obj
 }
 
+/** Validate a plain path segment (no slashes, no dots). */
+function assertPlainSegment(value: string, fieldName: string): string {
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed.includes('/') || trimmed.includes('\\') || trimmed === '.' || trimmed === '..') {
+    throw new Error(`dsh-memory-lite: ${fieldName} must be a plain directory name, got ${JSON.stringify(value)}`)
+  }
+  return trimmed
+}
+
 /** Normalize and default a raw configuration; throws on invalid values. */
 export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
   const config = unwrapConfig(rawConfig) ?? {}
   const root = resolve(expandHomePath(config.root ?? DEFAULT_MEMORY_ROOT))
-  const defaultPeer = config.defaultPeer ?? DEFAULT_PEER
-  if (defaultPeer === '' || defaultPeer.includes('/') || defaultPeer.includes('\\') || defaultPeer === '.' || defaultPeer === '..') {
-    throw new Error(`dsh-memory-lite: defaultPeer must be a plain directory name, got ${JSON.stringify(defaultPeer)}`)
+
+  const namespace = assertPlainSegment(config.privacy?.namespace ?? DEFAULT_PRIVATE_NAMESPACE, 'privacy.namespace')
+  const restrictedProviders = [...new Set(
+    (config.privacy?.restrictedProviders ?? [])
+      .map(p => (typeof p === 'string' ? p.trim() : ''))
+      .filter(Boolean),
+  )]
+  const restrictedPaths = [...new Set(
+    (config.privacy?.restrictedPaths ?? [])
+      .map(p => (typeof p === 'string' ? p.trim() : ''))
+      .filter(Boolean),
+  )]
+  const privatePaths: PrivatePathRule[] = (config.privacy?.privatePaths ?? []).map(rule => {
+    const pattern = typeof rule.pattern === 'string' ? rule.pattern.trim() : ''
+    const topic = typeof rule.topic === 'string' ? rule.topic.trim().replace(/^\/+|\/+$/g, '') : ''
+    if (pattern === '') {
+      throw new Error('dsh-memory-lite: privacy.privatePaths entry requires a non-empty pattern')
+    }
+    const parts = topic.split('/')
+    if (parts.length !== 2 || parts[0] !== namespace || parts[1] === '' || parts[1] === '.' || parts[1] === '..') {
+      throw new Error(`dsh-memory-lite: privacy.privatePaths topic must be "${namespace}/<subtopic>", got ${JSON.stringify(rule.topic)}`)
+    }
+    return { pattern, topic }
+  })
+  const privacy: PrivacyConfig = {
+    namespace,
+    hidePrivate: config.privacy?.hidePrivate ?? false,
+    restrictedProviders,
+    restrictedPaths,
+    privatePaths,
   }
-  const workspacePeers = {
-    enabled: config.workspacePeers?.enabled ?? true,
-    excludeSubagents: config.workspacePeers?.excludeSubagents ?? true,
-    cwdFallback: config.workspacePeers?.cwdFallback ?? 'default_peer',
-  }
-  const index = {
+
+  const index: IndexConfig = {
     maxTokens: config.index?.maxTokens ?? DEFAULT_INDEX_MAX_TOKENS,
-    sortBy: 'mtime' as const,
+    sortBy: 'mtime',
+    hotBudgetRatio: config.index?.hotBudgetRatio ?? DEFAULT_HOT_BUDGET_RATIO,
   }
   if (!Number.isInteger(index.maxTokens) || index.maxTokens < 50) {
     throw new Error(`dsh-memory-lite: index.maxTokens must be an integer >= 50, got ${index.maxTokens}`)
   }
-  const extraction = {
+  if (typeof index.hotBudgetRatio !== 'number' || !Number.isFinite(index.hotBudgetRatio) || index.hotBudgetRatio < 0.2 || index.hotBudgetRatio > 0.9) {
+    throw new Error(`dsh-memory-lite: index.hotBudgetRatio must be between 0.2 and 0.9, got ${index.hotBudgetRatio}`)
+  }
+
+  const extraction: ExtractionConfig = {
     mode: config.extraction?.mode ?? 'incremental',
     windowTurns: config.extraction?.windowTurns ?? 50,
     idleTimeoutMin: config.extraction?.idleTimeoutMin ?? 30,
@@ -336,37 +346,15 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
       throw new Error(`dsh-memory-lite: extraction.${key} must be a non-negative integer, got ${value}`)
     }
   }
-  const llmRoute = extraction.llm.route
+  const llmRoute = extraction.llm.route ?? ''
   if (llmRoute !== '') {
-    // "provider/model-id": the model id itself may contain a slash (pi-ai
-    // routes like commandcode/deepseek/deepseek-v4-flash), so only the first
-    // segment is the provider and the rest is the model id.
     const slash = llmRoute.indexOf('/')
     if (slash <= 0 || slash === llmRoute.length - 1 || llmRoute.includes('\\')) {
       throw new Error(`dsh-memory-lite: extraction.llm.route must be "provider/model", got ${JSON.stringify(llmRoute)}`)
     }
   }
-  const sharing = {
-    enabled: config.sharing?.enabled ?? false,
-    mounts: (config.sharing?.mounts ?? []).map(mount => ({
-      name: mount.name,
-      peer: mount.peer,
-      subpath: mount.subpath ?? '',
-      readonly: mount.readonly ?? true,
-    })),
-  }
-  for (const mount of sharing.mounts) {
-    if (mount.name === '' || /[\\/]/.test(mount.name) || mount.name === '.' || mount.name === '..') {
-      throw new Error('dsh-memory-lite: sharing mount name must be a plain segment, got ' + JSON.stringify(mount.name))
-    }
-    if (mount.peer === '' || mount.peer.includes('/') || mount.peer.includes('\\') || mount.peer === '.' || mount.peer === '..') {
-      throw new Error('dsh-memory-lite: sharing mount peer must be a plain directory name, got ' + JSON.stringify(mount.peer))
-    }
-    if (mount.subpath.startsWith('/') || mount.subpath.split('/').includes('..')) {
-      throw new Error('dsh-memory-lite: sharing mount subpath must not escape the memories root, got ' + JSON.stringify(mount.subpath))
-    }
-  }
-  const history = {
+
+  const history: HistoryConfig = {
     maxEntries: config.history?.maxEntries ?? 5,
     entryMaxChars: config.history?.entryMaxChars ?? 240,
     archiveKeep: config.history?.archiveKeep ?? 5,
@@ -383,20 +371,20 @@ export function resolveConfig(rawConfig: MemoryConfig = {}): ResolvedConfig {
   if (history.entryMaxChars < 20) {
     throw new Error(`dsh-memory-lite: history.entryMaxChars must be >= 20, got ${history.entryMaxChars}`)
   }
-  const ui = {
+
+  const ui: UiConfig = {
     headerOrder: config.ui?.headerOrder ?? DEFAULT_HEADER_ORDER,
   }
   if (!Number.isInteger(ui.headerOrder)) {
     throw new Error(`dsh-memory-lite: ui.headerOrder must be an integer, got ${ui.headerOrder}`)
   }
+
   return {
     root,
-    defaultPeer,
-    workspacePeers,
+    privacy,
     index,
     tools: { schemaMinimal: config.tools?.schemaMinimal ?? true },
     extraction,
-    sharing,
     history,
     ui,
   }

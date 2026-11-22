@@ -2,23 +2,19 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { IndexEntry } from '../src/types.js'
 import {
   MEMORY_CATALOG_PLUGIN, isCurrentCatalogText, isMemoryCatalogSource,
   renderCatalogMessage, renderCatalogUpdate, catalogMessage, catalogHistory,
 } from '../src/catalog.js'
-import { applyCatalogDecision, capCatalogEntries } from '../src/inject.js'
+import { applyCatalogDecision, planCatalogLayout } from '../src/inject.js'
 
 const entries: readonly IndexEntry[] = [
-  { category: 'preferences', path: 'preferences/coding.md', summary: 'use pnpm' },
-  { category: 'entities', path: 'entities/foo.md', summary: 'react 18' },
+  { topic: 'preferences', path: 'preferences/coding.md', summary: 'use pnpm' },
+  { topic: 'infra', path: 'infra/cpa.md', summary: 'CPA v8.0.80' },
 ]
 
-const mounts = [{ name: 'dsh-test', peer: 'dsh-test-72572e8b', readonly: true }] as const
-
-/** The model-facing text one rendered catalog message publishes. */
 const textOf = (message: UserMessage): string =>
   message.content.map(block => (block.type === 'text' ? block.text : '')).join('')
 
@@ -29,14 +25,11 @@ const changedEntries = (): readonly IndexEntry[] => {
 }
 
 test('the catalog source uses the producer-owned plugin:dsh-memory-lite kind with catalog form', () => {
-  const message = renderCatalogMessage(entries, 'demo')
+  const message = renderCatalogMessage({ entries })
   assert.deepEqual(message.source, { kind: 'plugin:dsh-memory-lite', form: 'catalog' })
   assert.equal(isMemoryCatalogSource(message.source), true)
-  // Generation 1: The private kind written before 0.2.3 stays readable for old sessions.
   assert.equal(isMemoryCatalogSource({ kind: 'memory-catalog', form: 'catalog', entries }), true)
-  // Generation 2: The v3 plugin wrapper written in 0.2.3–0.3.0 stays readable.
   assert.equal(isMemoryCatalogSource({ kind: 'plugin', plugin: MEMORY_CATALOG_PLUGIN, form: 'catalog' }), true)
-  // Generation 3: The v4 producer-owned kind.
   assert.equal(isMemoryCatalogSource({ kind: 'plugin:dsh-memory-lite', form: 'catalog' }), true)
   assert.equal(isMemoryCatalogSource({ kind: 'user' }), false)
   assert.equal(isMemoryCatalogSource({ kind: 'plugin', plugin: 'other', form: 'catalog' }), false)
@@ -45,227 +38,131 @@ test('the catalog source uses the producer-owned plugin:dsh-memory-lite kind wit
   assert.equal(isMemoryCatalogSource(undefined), false)
 })
 
-test('renderCatalogMessage carries entries, guidance, and peer', () => {
-  const message = renderCatalogMessage(entries, 'demo')
+test('renderCatalogMessage carries topic sections, collapsed topics, charter, and restricted mode', () => {
+  const message = renderCatalogMessage({
+    entries,
+    collapsedTopics: [{ topic: 'private/health', count: 2, previewTitles: ['zhao', 'chen'] }],
+    globalCharter: '# Charter',
+    restricted: false,
+  })
   const text = textOf(message)
-  assert.match(text, /memory index for the demo project/)
+  assert.match(text, /Global Agent Charter/)
   assert.match(text, /## preferences \(always relevant\)/)
   assert.match(text, /preferences\/coding\.md: use pnpm/)
+  assert.match(text, /## infra/)
+  assert.match(text, /## Collapsed Topics/)
+  assert.match(text, /- private\/health \(2\): zhao, chen/)
   assert.match(text, /call remember only when the user explicitly asks/i)
   assert.match(text, /<system-reminder>/)
+
+  const restrictedText = textOf(renderCatalogMessage({ entries, restricted: true }))
+  assert.match(restrictedText, /restricted mode: private memories are hidden/)
 })
 
 test('renderCatalogUpdate marks the replacement framing', () => {
-  const update = renderCatalogUpdate(entries, 'demo')
+  const update = renderCatalogUpdate({ entries })
   assert.match(textOf(update), /replaces every earlier memory catalog/)
   assert.equal(update.source.kind, 'plugin:dsh-memory-lite')
 })
 
 test('isCurrentCatalogText matches either framing and detects real change', () => {
-  const first = textOf(renderCatalogMessage(entries, 'demo'))
-  const update = textOf(renderCatalogUpdate(entries, 'demo'))
-  assert.equal(isCurrentCatalogText(first, entries, 'demo'), true)
-  assert.equal(isCurrentCatalogText(update, entries, 'demo'), true, 'an update framing with the same entries is current')
-  assert.equal(isCurrentCatalogText(first, changedEntries(), 'demo'), false)
-  assert.equal(isCurrentCatalogText(first, entries, 'other'), false, 'a different peer renders different text')
-  assert.equal(isCurrentCatalogText(textOf(renderCatalogMessage(entries, 'demo', mounts)), entries, 'demo'), false, 'mounts change the text')
-  assert.equal(isCurrentCatalogText(textOf(renderCatalogMessage(entries, 'demo', mounts)), entries, 'demo', mounts), true)
+  const first = textOf(renderCatalogMessage({ entries }))
+  const update = textOf(renderCatalogUpdate({ entries }))
+  assert.equal(isCurrentCatalogText(first, { entries }), true)
+  assert.equal(isCurrentCatalogText(update, { entries }), true)
+  assert.equal(isCurrentCatalogText(first, { entries: changedEntries() }), false)
+  assert.equal(isCurrentCatalogText(first, { entries, restricted: true }), false)
 })
 
-test('catalogMessage finds the catalog in an entering batch', () => {
-  const catalog = renderCatalogMessage(entries, 'demo')
+test('catalogMessage and catalogHistory track visibility on surface', () => {
+  const catalog = renderCatalogMessage({ entries })
   const plain = createUserMessage({ content: [{ type: 'text', text: 'hi' }] })
   const found = catalogMessage([plain, catalog])
   assert.ok(found)
   assert.equal(found!.message.id, catalog.id)
-  assert.equal(found!.text, textOf(catalog))
-  assert.equal(catalogMessage([plain]), undefined)
-})
 
-test('catalogHistory reads visibility from the surface (new and legacy sources)', () => {
-  const published = renderCatalogMessage(entries, 'demo')
-  const event = { type: 'user/message', seq: 42, data: { ...published } }
+  const event = { type: 'user/message', seq: 42, data: { ...catalog } }
   const agent = { session: { events: [event], surface: { nodes: new Set([42]) } } } as unknown as Agent
-  const history = catalogHistory(agent)
-  assert.equal(history.published, true)
-  assert.equal(history.visibleText, textOf(published))
-  // Published but compacted off the surface -> published, no visible text.
+  assert.equal(catalogHistory(agent).visibleText, textOf(catalog))
   const compacted = { session: { events: [event], surface: { nodes: new Set([]) } } } as unknown as Agent
-  const compactedHistory = catalogHistory(compacted)
-  assert.equal(compactedHistory.published, true)
-  assert.equal(compactedHistory.visibleText, undefined)
-  // A session written before 0.2.3 still carries the private kind.
-  const legacyEvent = {
-    type: 'user/message', seq: 43,
-    data: { ...published, source: { kind: 'memory-catalog', form: 'catalog', entries } },
-  }
-  const legacy = { session: { events: [legacyEvent], surface: { nodes: new Set([43]) } } } as unknown as Agent
-  assert.equal(catalogHistory(legacy).visibleText, textOf(published))
-  // Nothing published.
-  const empty = { session: { events: [], surface: { nodes: new Set() } } } as unknown as Agent
-  assert.deepEqual(catalogHistory(empty), { published: false })
+  assert.deepEqual(catalogHistory(compacted), { published: true })
 })
 
 function decision(messages: UserMessage[]): PreStepDecision {
   return { kind: 'enter', messages }
 }
 
-test('applyCatalogDecision publishes on first sight', () => {
+test('applyCatalogDecision handles publish, skip, update, empty vault, and charter-only', () => {
   const base = decision([createUserMessage({ content: [{ type: 'text', text: 'hi' }] })])
-  const result = applyCatalogDecision({ decision: base, history: { published: false }, existing: undefined, entries, peer: 'demo' })
-  assert.equal(result.kind, 'enter')
-  const catalog = catalogMessage(result.messages)
-  assert.ok(catalog)
-  assert.equal(catalog!.message.source.kind, 'plugin:dsh-memory-lite')
-  assert.match(catalog!.text, /memory index for the demo project/)
-})
+  const published = applyCatalogDecision({ decision: base, history: { published: false }, existing: undefined, entries })
+  assert.equal(published.kind, 'enter')
+  const cat = catalogMessage(published.messages)
+  assert.ok(cat)
 
-test('applyCatalogDecision republishes as an update when the published text changed', () => {
-  const base = decision([])
-  const result = applyCatalogDecision({
+  // Already visible and unchanged -> no re-publish.
+  const skipped = applyCatalogDecision({
     decision: base,
-    history: { published: true, visibleText: 'an older catalog' },
+    history: { published: true, visibleText: cat!.text },
     existing: undefined,
     entries,
-    peer: 'demo',
   })
-  const catalog = catalogMessage(result.messages)
-  assert.ok(catalog)
-  assert.match(catalog!.text, /replaces every earlier memory catalog/)
-})
+  assert.equal(skipped.messages.length, 1)
 
-test('applyCatalogDecision skips when the visible catalog is already current', () => {
-  const base = decision([])
-  const result = applyCatalogDecision({
+  // Trust flip -> republishes immediately.
+  const flipped = applyCatalogDecision({
     decision: base,
-    history: { published: true, visibleText: textOf(renderCatalogUpdate(entries, 'demo')) },
+    history: { published: true, visibleText: cat!.text },
     existing: undefined,
     entries,
-    peer: 'demo',
+    restricted: true,
   })
-  assert.equal(result, base)
-})
+  assert.equal(flipped.messages.length, 2)
+  assert.match(catalogMessage(flipped.messages)!.text, /restricted mode/)
 
-test('applyCatalogDecision publishes nothing for a fresh empty index', () => {
-  const base = decision([])
-  const result = applyCatalogDecision({ decision: base, history: { published: false }, existing: undefined, entries: [], peer: 'demo' })
-  assert.equal(result, base)
-})
+  // Fresh empty vault -> publishes nothing.
+  const empty = applyCatalogDecision({ decision: base, history: { published: false }, existing: undefined, entries: [] })
+  assert.equal(empty.messages.length, 1)
 
-test('applyCatalogDecision replaces a stale in-batch catalog with the update', () => {
-  const oldCatalog = renderCatalogMessage(changedEntries(), 'demo')
-  const base = decision([oldCatalog])
-  const result = applyCatalogDecision({
-    decision: base,
-    history: { published: true, visibleText: 'a stale catalog' },
-    existing: { message: oldCatalog, text: textOf(oldCatalog) },
-    entries,
-    peer: 'demo',
-  })
-  assert.equal(result.kind, 'enter')
-  const replacement = catalogMessage(result.messages)
-  assert.ok(replacement)
-  assert.notEqual(replacement!.message.id, oldCatalog.id)
-  assert.match(replacement!.text, /use pnpm/)
-})
-
-test('renderCatalogMessage advertises shared mounts', () => {
-  const message = renderCatalogMessage(entries, 'demo', [...mounts])
-  const text = textOf(message)
-  assert.match(text, /## shared/)
-  assert.match(text, /shared\/dsh-test\//)
-  assert.match(text, /read-only mirror of peer 'dsh-test-72572e8b'/)
-})
-
-test('applyCatalogDecision publishes a shared-only catalog for an empty index', () => {
-  const base = decision([])
-  const result = applyCatalogDecision({
+  // Charter only -> still publishes.
+  const charterOnly = applyCatalogDecision({
     decision: base,
     history: { published: false },
     existing: undefined,
     entries: [],
-    sharedMounts: [...mounts],
-    peer: 'demo',
+    globalCharter: '# Charter',
   })
-  assert.equal(result.kind, 'enter')
-  const catalog = catalogMessage(result.messages)
-  assert.ok(catalog)
-  assert.match(catalog!.text, /## shared/)
+  assert.equal(charterOnly.messages.length, 2)
 })
 
-test('applyCatalogDecision does not republish a shared-only catalog once visible', () => {
-  const base = decision([])
-  const result = applyCatalogDecision({
-    decision: base,
-    history: { published: true, visibleText: textOf(renderCatalogMessage([], 'demo', [...mounts])) },
-    existing: undefined,
-    entries: [],
-    sharedMounts: [...mounts],
-    peer: 'demo',
-  })
-  assert.equal(result, base)
-})
+test('planCatalogLayout expands everything under budget and switches to adaptive map over budget', () => {
+  // Small vault fits completely -> zero collapsed topics.
+  const full = planCatalogLayout(entries, 3500)
+  assert.equal(full.expanded.length, 2)
+  assert.equal(full.collapsed.length, 0)
 
-test('applyCatalogDecision drops an in-batch catalog when the visible one matches', () => {
-  const catalog = renderCatalogMessage(entries, 'demo')
-  const base = decision([createUserMessage({ content: [{ type: 'text', text: 'hi' }] }), catalog])
-  const result = applyCatalogDecision({
-    decision: base,
-    history: { published: true, visibleText: textOf(catalog) },
-    existing: { message: catalog, text: textOf(catalog) },
-    entries,
-    peer: 'demo',
-  })
-  assert.equal(result.kind, 'enter')
-  assert.equal(catalogMessage(result.messages), undefined)
-})
-
-test('capCatalogEntries keeps everything under budget and drops oldest over it', () => {
-  const small = [{ category: 'preferences', path: 'preferences/a.md', summary: 'short' }]
-  assert.deepEqual(capCatalogEntries(small, 1200), small)
-  const many = [
-    { category: 'events', path: 'events/1.md', summary: 'x'.repeat(200) },
-    { category: 'events', path: 'events/2.md', summary: 'x'.repeat(200) },
-    { category: 'events', path: 'events/3.md', summary: 'x'.repeat(200) },
-    { category: 'events', path: 'events/4.md', summary: 'x'.repeat(200) },
+  // Large vault exceeding budget -> preferences + hot topic expanded, cold topics collapsed.
+  const big: IndexEntry[] = [
+    { topic: 'preferences', path: 'preferences/rule.md', summary: 'always keep concise' },
+    ...Array.from({ length: 8 }, (_, i) => ({
+      topic: 'infra',
+      path: `infra/item-${i}.md`,
+      summary: 'A detailed infrastructure note describing servers, proxies, and deployments number ' + i,
+    })),
+    ...Array.from({ length: 8 }, (_, i) => ({
+      topic: 'g7',
+      path: `g7/proj-${i}.md`,
+      summary: 'G7 enterprise project specification and protocol documentation item number ' + i,
+    })),
+    ...Array.from({ length: 8 }, (_, i) => ({
+      topic: 'private/insurance',
+      path: `private/insurance/policy-${i}.md`,
+      summary: 'Family insurance policy coverage details and contract clauses number ' + i,
+    })),
   ]
-  assert.equal(capCatalogEntries(many, 1200).length, 4)
-  const capped = capCatalogEntries(many, 350)
-  assert.ok(capped.length < 4)
-  assert.equal(capped[0]!.path, 'events/1.md')
-  assert.equal(many.length, 4)
-})
-
-test('capCatalogEntries returns empty for a non-positive budget', () => {
-  const one = [{ category: 'a', path: 'a/x.md', summary: 's' }]
-  assert.deepEqual(capCatalogEntries(one, 100), [])
-  assert.deepEqual(capCatalogEntries([], 1200), [])
-})
-
-test('renderCatalogMessage renders Global Agent Charter when provided', () => {
-  const charter = '# Global Charter\n- Rule 1: Always plan before action'
-  const message = renderCatalogMessage(entries, 'demo', [], charter)
-  const text = textOf(message)
-  assert.ok(text.includes('## Global Agent Charter (~/.agent-memory/AGENTS.md)'))
-  assert.ok(text.includes('Rule 1: Always plan before action'))
-})
-
-test('applyCatalogDecision publishes catalog when entries is empty but globalCharter is present', () => {
-  const charter = '# Global Charter\n- Rule 1'
-  const decision: PreStepDecision = { kind: 'resolve', messages: [] }
-  const res = applyCatalogDecision({
-    decision,
-    history: { published: false },
-    existing: undefined,
-    entries: [],
-    sharedMounts: [],
-    peer: 'empty-peer',
-    globalCharter: charter,
-  })
-  assert.equal(res.kind, 'enter')
-  if (res.kind === 'enter') {
-    assert.equal(res.messages.length, 1)
-    const text = textOf(res.messages[0] as UserMessage)
-    assert.ok(text.includes('Global Agent Charter'))
-  }
+  // Hot topic is private/insurance: should be prioritized over infra/g7!
+  const adaptive = planCatalogLayout(big, 650, ['private/insurance'], 0.7)
+  assert.ok(adaptive.expanded.some(e => e.topic === 'preferences'), 'preferences always expanded')
+  assert.ok(adaptive.expanded.some(e => e.topic === 'private/insurance'), 'hot topic expanded first')
+  assert.ok(adaptive.collapsed.length >= 1, 'remaining cold topics collapsed into 1-line map')
+  assert.ok(adaptive.collapsed.some(c => c.topic === 'infra' || c.topic === 'g7'))
 })

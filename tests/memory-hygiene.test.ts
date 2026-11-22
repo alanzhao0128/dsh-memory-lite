@@ -17,12 +17,10 @@ import { buildReconcileUser, extractionSystem, reconcileSystem } from '../src/ex
 import { applyDecision, applyDecisionDetailed, type ReconcileAnswer } from '../src/extract/index.js'
 import { resolveConfig } from '../src/config.js'
 
-const PEER = 'test-peer'
-
 async function makeStore(history?: { maxEntries: number; entryMaxChars: number; archiveKeep: number }): Promise<{ store: MemoryStore; root: string; file: (rel: string) => Promise<string> }> {
   const root = await mkdtemp(join(tmpdir(), 'dsh-hygiene-'))
-  const store = new MemoryStore(root, { enabled: false, mounts: [] }, history)
-  return { store, root, file: rel => readFile(join(root, 'peers', PEER, 'memories', rel), 'utf8') }
+  const store = new MemoryStore(root, history)
+  return { store, root, file: rel => readFile(join(root, 'memories', rel), 'utf8') }
 }
 
 // ---- bulletLines / lineKey -------------------------------------------------
@@ -62,13 +60,13 @@ test('appendCurrent flattens stacked markers, drops empty entries and keeps lega
   const { store, file, root } = await makeStore()
   try {
     // Seed a pre-0.5.2 file on disk: its nested line must survive untouched.
-    await store.writeNewMemory(PEER, 'entities/n.md', 'N', 'placeholder')
-    const abs = join(root, 'peers', PEER, 'memories', 'entities', 'n.md')
+    await store.writeNewMemory('entities/n.md', 'N', 'placeholder')
+    const abs = join(root, 'memories', 'entities', 'n.md')
     await writeFile(abs, (await readFile(abs, 'utf8')).replace('- placeholder', '- - legacy nested'))
-    await store.appendCurrent(PEER, 'entities/n.md', '- - new\n-\n- -\nlegacy nested')
+    await store.appendCurrent('entities/n.md', '- - new\n-\n- -\nlegacy nested')
     const once = await file('entities/n.md')
     assert.equal(parseMemoryFile(once).current, '- - legacy nested\n- new')
-    await store.appendCurrent(PEER, 'entities/n.md', '- - new\n-\n- -\nlegacy nested')
+    await store.appendCurrent('entities/n.md', '- - new\n-\n- -\nlegacy nested')
     assert.equal(await file('entities/n.md'), once)
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -88,8 +86,8 @@ test('applyPatch insert/append flatten stacked markers and drop marker-only line
 test('appendCurrent never nests markers and skips lines that exist under another marker', async () => {
   const { store, file, root } = await makeStore()
   try {
-    await store.writeNewMemory(PEER, 'entities/x.md', 'X', '- alpha\n- beta')
-    await store.appendCurrent(PEER, 'entities/x.md', '- beta\nalpha\n- gamma\n  - detail')
+    await store.writeNewMemory('entities/x.md', 'X', '- alpha\n- beta')
+    await store.appendCurrent('entities/x.md', '- beta\nalpha\n- gamma\n  - detail')
     const text = await file('entities/x.md')
     assert.ok(!text.includes('- - '), text)
     assert.equal(text.split('\n').filter(l => l === '- beta').length, 1)
@@ -105,9 +103,9 @@ test('appendCurrent never nests markers and skips lines that exist under another
 test('updateCurrent keeps only the newest History lines, truncated, and archives the full previous file', async () => {
   const { store, file, root } = await makeStore({ maxEntries: 3, entryMaxChars: 40, archiveKeep: 5 })
   try {
-    await store.writeNewMemory(PEER, 'entities/h.md', 'H', 'v0')
+    await store.writeNewMemory('entities/h.md', 'H', 'v0')
     for (let i = 1; i <= 5; i += 1) {
-      await store.updateCurrent(PEER, 'entities/h.md', `version ${i} ${'x'.repeat(100)}\nsecond line of v${i}`)
+      await store.updateCurrent('entities/h.md', `version ${i} ${'x'.repeat(100)}\nsecond line of v${i}`)
     }
     const parsed = parseMemoryFile(await file('entities/h.md'))
     const history = parsed.history.split('\n')
@@ -117,13 +115,13 @@ test('updateCurrent keeps only the newest History lines, truncated, and archives
     // The newest entry describes version 4 (the content replaced by the last update).
     assert.match(history[2]!, /version 4/)
     // Full previous files live outside memories/.
-    const dir = join(root, 'peers', PEER, '.history', 'entities', 'h.md')
+    const dir = join(root, '.history', 'entities', 'h.md')
     const snapshots = (await readdir(dir)).sort()
     assert.equal(snapshots.length, 5)
     const last = await readFile(join(dir, snapshots[snapshots.length - 1]!), 'utf8')
     assert.match(last, /second line of v4/)
     // And never inside the searchable memories tree.
-    assert.deepEqual(await store.search(PEER, 'second line of v1'), [])
+    assert.deepEqual(await store.search('second line of v1'), [])
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -134,11 +132,11 @@ test('archiveKeep prunes old snapshots and archiveKeep 0 disables archiving', as
   const b = await makeStore({ maxEntries: 5, entryMaxChars: 240, archiveKeep: 0 })
   try {
     for (const { store } of [a, b]) {
-      await store.writeNewMemory(PEER, 'entities/p.md', 'P', 'v0')
-      for (let i = 1; i <= 4; i += 1) await store.updateCurrent(PEER, 'entities/p.md', `v${i}`)
+      await store.writeNewMemory('entities/p.md', 'P', 'v0')
+      for (let i = 1; i <= 4; i += 1) await store.updateCurrent('entities/p.md', `v${i}`)
     }
-    assert.equal((await readdir(join(a.root, 'peers', PEER, '.history', 'entities', 'p.md'))).length, 2)
-    await assert.rejects(readdir(join(b.root, 'peers', PEER, '.history')))
+    assert.equal((await readdir(join(a.root, '.history', 'entities', 'p.md'))).length, 2)
+    await assert.rejects(readdir(join(b.root, '.history')))
   } finally {
     await rm(a.root, { recursive: true, force: true })
     await rm(b.root, { recursive: true, force: true })
@@ -150,14 +148,14 @@ test('a legacy bloated History is trimmed on the next update without losing the 
   try {
     const legacy = ['# L', '', '## Current', '- now', '', '## History',
       ...Array.from({ length: 8 }, (_, i) => `- 2026-10-0${i + 1}: entry ${i}\n  - continuation a\n  - continuation b`), ''].join('\n')
-    await mkdir(join(root, 'peers', PEER, 'memories', 'entities'), { recursive: true })
-    await writeFile(join(root, 'peers', PEER, 'memories', 'entities', 'l.md'), legacy)
-    await store.updateCurrent(PEER, 'entities/l.md', 'next')
+    await mkdir(join(root, 'memories', 'entities'), { recursive: true })
+    await writeFile(join(root, 'memories', 'entities', 'l.md'), legacy)
+    await store.updateCurrent('entities/l.md', 'next')
     const history = parseMemoryFile(await file('entities/l.md')).history.split('\n')
     assert.equal(history.length, 5)
     assert.ok(history.every(line => !line.startsWith(' ')))
-    const snap = (await readdir(join(root, 'peers', PEER, '.history', 'entities', 'l.md')))[0]!
-    assert.match(await readFile(join(root, 'peers', PEER, '.history', 'entities', 'l.md', snap), 'utf8'), /continuation b/)
+    const snap = (await readdir(join(root, '.history', 'entities', 'l.md')))[0]!
+    assert.match(await readFile(join(root, '.history', 'entities', 'l.md', snap), 'utf8'), /continuation b/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -168,10 +166,10 @@ test('a legacy bloated History is trimmed on the next update without losing the 
 test('ensureIndexEntry keeps an existing summary and adds a missing one', async () => {
   const { store, root } = await makeStore()
   try {
-    await store.refreshIndexEntry(PEER, 'entities/a.md', 'describes A')
-    await store.ensureIndexEntry(PEER, 'entities/a.md', 'a fragment of new fact')
-    await store.ensureIndexEntry(PEER, 'entities/b.md', 'fallback B')
-    const entries = await store.readIndex(PEER)
+    await store.refreshIndexEntry('entities/a.md', 'describes A')
+    await store.ensureIndexEntry('entities/a.md', 'a fragment of new fact')
+    await store.ensureIndexEntry('entities/b.md', 'fallback B')
+    const entries = await store.readIndex()
     assert.equal(entries.find(e => e.path === 'entities/a.md')!.summary, 'describes A')
     assert.equal(entries.find(e => e.path === 'entities/b.md')!.summary, 'fallback B')
   } finally {
@@ -241,8 +239,8 @@ test('numberedView numbers non-blank lines, shortens long lines, and gives up wh
 test('store.patchCurrent applies a patch, archives, notes History, and leaves the file alone on rejection', async () => {
   const { store, root, file } = await makeStore()
   try {
-    await store.writeNewMemory(PEER, 'entities/p.md', 'P', 'alpha\nbeta\ngamma')
-    const result = await store.patchCurrent(PEER, 'entities/p.md', [
+    await store.writeNewMemory('entities/p.md', 'P', 'alpha\nbeta\ngamma')
+    const result = await store.patchCurrent('entities/p.md', [
       { op: 'replace', line: 2, content: 'beta v2' },
       { op: 'append', content: 'delta' },
     ])
@@ -251,11 +249,11 @@ test('store.patchCurrent applies a patch, archives, notes History, and leaves th
     assert.equal(parsed.current, '- alpha\n- beta v2\n- gamma\n- delta')
     assert.match(parsed.history, /patch（替换 1 \/ 删除 0 \/ 新增 1 行）/)
     const before = await file('entities/p.md')
-    await assert.rejects(store.patchCurrent(PEER, 'entities/p.md', [{ op: 'delete', line: 99 }]), PatchError)
+    await assert.rejects(store.patchCurrent('entities/p.md', [{ op: 'delete', line: 99 }]), PatchError)
     assert.equal(await file('entities/p.md'), before)
-    const noop = await store.patchCurrent(PEER, 'entities/p.md', [{ op: 'append', content: 'delta' }])
+    const noop = await store.patchCurrent('entities/p.md', [{ op: 'append', content: 'delta' }])
     assert.equal(noop.changed, false)
-    assert.equal((await readdir(join(root, 'peers', PEER, '.history', 'entities', 'p.md'))).length, 1)
+    assert.equal((await readdir(join(root, '.history', 'entities', 'p.md'))).length, 1)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -315,8 +313,8 @@ test('config defaults and validation for history and reconcile', () => {
 
 async function seeded(): Promise<{ store: MemoryStore; root: string; file: (rel: string) => Promise<string> }> {
   const ctx = await makeStore()
-  await ctx.store.writeNewMemory(PEER, 'entities/cpa.md', 'CPA', 'port 8317\nGoogle pool = 1')
-  await ctx.store.refreshIndexEntry(PEER, 'entities/cpa.md', 'CPA reverse proxy handbook')
+  await ctx.store.writeNewMemory('entities/cpa.md', 'CPA', 'port 8317\nGoogle pool = 1')
+  await ctx.store.refreshIndexEntry('entities/cpa.md', 'CPA reverse proxy handbook')
   return ctx
 }
 
@@ -325,14 +323,14 @@ test('merge: reconcile patch replaces the contradicted line and keeps the index 
   try {
     let seen: { current: string; kind: string } | undefined
     const answer: ReconcileAnswer = { kind: 'patch', ops: [{ op: 'replace', line: 2, content: 'Google pool = 0 (2026-11-12)' }] }
-    const applied = await applyDecisionDetailed(store, PEER, { kind: 'merge', path: 'entities/cpa.md', content: 'Google pool is now 0' }, {
+    const applied = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'Google pool is now 0' }, {
       reconcile: async request => { seen = { current: request.current, kind: request.kind }; return answer },
     })
     assert.equal(applied.applied, 'patch')
     assert.deepEqual(seen, { current: '- port 8317\n- Google pool = 1', kind: 'merge' })
     const parsed = parseMemoryFile(await file('entities/cpa.md'))
     assert.equal(parsed.current, '- port 8317\n- Google pool = 0 (2026-11-12)')
-    assert.equal((await store.readIndex(PEER))[0]!.summary, 'CPA reverse proxy handbook')
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA reverse proxy handbook')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -342,7 +340,7 @@ test('merge: reconcile noop writes nothing', async () => {
   const { store, root, file } = await seeded()
   try {
     const before = await file('entities/cpa.md')
-    const applied = await applyDecisionDetailed(store, PEER, { kind: 'merge', path: 'entities/cpa.md', content: 'port 8317' }, {
+    const applied = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'port 8317' }, {
       reconcile: async () => ({ kind: 'noop', reason: 'covered' }),
     })
     assert.equal(applied.applied, 'noop')
@@ -355,12 +353,12 @@ test('merge: reconcile noop writes nothing', async () => {
 test('merge: a failed reconcile falls back to append; a rejected patch does too', async () => {
   const { store, root, file } = await seeded()
   try {
-    const failed = await applyDecisionDetailed(store, PEER, { kind: 'merge', path: 'entities/cpa.md', content: 'fact A' }, {
+    const failed = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'fact A' }, {
       reconcile: async () => ({ kind: 'fallback', reason: 'llm-error: boom' }),
     })
     assert.equal(failed.applied, 'merge')
     assert.equal(failed.fallback, 'llm-error: boom')
-    const rejected = await applyDecisionDetailed(store, PEER, { kind: 'merge', path: 'entities/cpa.md', content: 'fact B' }, {
+    const rejected = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'fact B' }, {
       reconcile: async () => ({ kind: 'patch', ops: [{ op: 'delete', line: 77 }] }),
     })
     assert.match(rejected.fallback ?? '', /patch-rejected/)
@@ -375,7 +373,7 @@ test('merge: a failed reconcile falls back to append; a rejected patch does too'
 test('update: with reconcile active an unreconcilable update appends instead of replacing blindly', async () => {
   const { store, root, file } = await seeded()
   try {
-    const applied = await applyDecisionDetailed(store, PEER, { kind: 'update', path: 'entities/cpa.md', content: 'totally new text' }, {
+    const applied = await applyDecisionDetailed(store, { kind: 'update', path: 'entities/cpa.md', content: 'totally new text' }, {
       reconcile: async () => ({ kind: 'fallback', reason: 'current-too-large' }),
     })
     assert.equal(applied.fallback, 'current-too-large')
@@ -390,13 +388,13 @@ test('update: with reconcile active an unreconcilable update appends instead of 
 test('update without a reconcile hook still replaces Current (archived) and honours an explicit summary', async () => {
   const { store, root, file } = await seeded()
   try {
-    await applyDecision(store, PEER, { kind: 'update', path: 'entities/cpa.md', content: 'rewritten', summary: 'new scope' })
+    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'rewritten', summary: 'new scope' })
     const parsed = parseMemoryFile(await file('entities/cpa.md'))
     assert.equal(parsed.current, '- rewritten')
     assert.match(parsed.history, /port 8317/)
-    assert.equal((await store.readIndex(PEER))[0]!.summary, 'new scope')
-    await applyDecision(store, PEER, { kind: 'update', path: 'entities/cpa.md', content: 'again' })
-    assert.equal((await store.readIndex(PEER))[0]!.summary, 'new scope')
+    assert.equal((await store.readIndex())[0]!.summary, 'new scope')
+    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'again' })
+    assert.equal((await store.readIndex())[0]!.summary, 'new scope')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -405,13 +403,13 @@ test('update without a reconcile hook still replaces Current (archived) and hono
 test('create sets the model-written summary; a later merge never overwrites it', async () => {
   const { store, root } = await makeStore()
   try {
-    await applyDecision(store, PEER, { kind: 'create', category: 'entities', title: 'Thing', content: 'first fact', summary: 'About the Thing system' })
-    await applyDecision(store, PEER, { kind: 'merge', path: 'entities/thing.md', content: 'second fact that must not become the summary' })
-    await applyDecision(store, PEER, { kind: 'create', category: 'entities', title: 'Thing', content: 'third fact', summary: 'ignored for existing file' })
-    assert.equal((await store.readIndex(PEER))[0]!.summary, 'About the Thing system')
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'first fact', summary: 'About the Thing system' })
+    await applyDecision(store, { kind: 'merge', path: 'entities/thing.md', content: 'second fact that must not become the summary' })
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'third fact', summary: 'ignored for existing file' })
+    assert.equal((await store.readIndex())[0]!.summary, 'About the Thing system')
     // Without a model summary a new file falls back to its first content.
-    await applyDecision(store, PEER, { kind: 'create', category: 'entities', title: 'Other', content: 'only fact' })
-    assert.equal((await store.readIndex(PEER)).find(e => e.path === 'entities/other.md')!.summary, 'only fact')
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Other', content: 'only fact' })
+    assert.equal((await store.readIndex()).find(e => e.path === 'entities/other.md')!.summary, 'only fact')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

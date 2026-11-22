@@ -85,11 +85,14 @@ Everything is edited in **Settings → memory-lite** and stored under the `dsh-m
 | History | `history.maxEntries` / `entryMaxChars` | keep only the newest N History lines per file (default 5), each at most M characters (default 240). Set in `cordis.patch.yml` only, **restart to apply** |
 | | `history.archiveKeep` | save the whole previous file as a snapshot before every update / patch (newest 5 kept by default, 0 = off). **Restart to apply** |
 | | Audit log | writes `peers/{peer}/sessions/{session-id}.json` and `extraction.log` |
-| Catalog | Token cap | truncation cap for the L0 catalog, default 1200 |
+| Catalog | Token cap | L0 catalog cap (default 3500): full expansion under cap, adaptive Topic Map over cap |
+| | `index.hotBudgetRatio` | share of post-preferences budget given to expanded hot topics (default `0.7`) |
 | UI | Indicator order | header utilities slot order; refresh the page after saving |
-| Storage | Memory root | `~/.agent-memory` by default, **restart to apply** |
-| | Default peer | owner of cwd-less sessions |
-| | Cross-peer sharing | master switch, **restart to apply**; individual mounts are picked below |
+| Storage & Privacy | Memory root | `~/.agent-memory` by default, **restart to apply** |
+| | Hide private (`privacy.hidePrivate`) | one-click screen-share shield hiding `private/` everywhere (live) |
+| | Private namespace (`privacy.namespace`) | top-level directory for sensitive topics (default `private`, live) |
+| | Restricted exits (`privacy.restrictedProviders` / `restrictedPaths`) | automatically hides & blocks `private/` whenever using restricted providers or directories |
+| | Forced private paths (`privacy.privatePaths`) | optional safety net forcing writes/extractions under matching cwds into `private/<subtopic>` |
 
 Full schema and defaults: [`src/config.ts`](https://github.com/alanzhao0128/dsh-memory-lite/blob/main/src/config.ts).
 
@@ -97,14 +100,18 @@ Full schema and defaults: [`src/config.ts`](https://github.com/alanzhao0128/dsh-
 
 ```
 ~/.agent-memory/
-├── peers/{peer}/
-│   ├── memories/
-│   │   ├── _index.md              # L0 catalog (generated; hand-editable)
-│   │   ├── preferences/  entities/  events/  experiences/
-│   │   │   └── {slug}.md          # L1 full text
-│   ├── .history/{category}/{slug}.md/  # full pre-change snapshots (never searched or injected)
-│   └── sessions/                  # extraction bookmark + audit + extraction.log
-└── .trash/                        # soft-deleted memories (dated folders)
+├── AGENTS.md                       # global agent charter (optional, injected everywhere)
+├── memories/
+│   ├── _index.md                   # unified L0 topic index (generated; hand-editable)
+│   ├── preferences/                # always-expanded cross-topic preferences
+│   ├── infra/  dsh/  g7/  video/   # public topic folders (1 level)
+│   └── private/                    # trust boundary: hidden in restricted mode, connected in personal mode
+│       ├── health/  insurance/     # sensitive subtopics (2 levels)
+│       └── family/  quant/
+├── .history/{topic}/{slug}.md/     # full pre-change snapshots
+├── sessions/                       # unified extraction checkpoints + audit + extraction.log
+├── topic-affinity.json             # auto-learned cwd <-> topic affinity for adaptive expansion
+└── .trash/                         # soft-deleted memories (dated folders)
 ```
 
 Each memory file uses `## Current` / `## History` / `## Related`. Before an update the complete previous file is saved under `.history/`, and `## History` itself keeps only the newest few one-line notes instead of piling up old bodies. The catalog summary describes the whole file: the extractor writes one sentence when it creates the file, and later merges no longer overwrite it with the first words of the newest fact. The four categories are retrieval paths for the model: preferences (always relevant), entities (mentioned knowledge), events (time-related), experiences (task lessons).
@@ -148,6 +155,12 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 - Extraction quality depends on the model you pick; small models produce JSON that needs repair more often.
 
 ## Changelog
+
+### v1.0.0 (2026-11-22)
+- **Unified Topic Vault**: replaces directory-hashed `peers/` and `sharing.mounts` with one human-readable `~/.agent-memory/memories/<topic>/` tree so cross-directory tasks and cross-topic links (e.g. insurance ↔ health) connect with zero manual sharing rules.
+- **Adaptive two-tier L0 catalog (KV-cache friendly)**: expands all visible memories under `index.maxTokens` (default `3500`), and seamlessly switches to `preferences/` + auto-learned `topic-affinity.json` hot topics + 1-line collapsed Topic Map above the cap, pinning per-session hot order to protect prompt cache.
+- **Hard trust-boundary gate (`privacy`)**: adds a `private/<subtopic>` namespace enforced across L0 injection, all 5 tools, and background extraction (checking both session and extraction model providers) via `hidePrivate`, `restrictedProviders`, `restrictedPaths`, and optional `privatePaths` safety nets.
+- **Tool upgrades**: `read_memory("<topic>/")` lists entries of collapsed topics; `search_memory(query, topic?)` searches filenames, summaries, and bodies with optional topic filtering; checkpoints & logs consolidate under `~/.agent-memory/sessions/`.
 
 ### v0.5.2 (2026-11-21)
 - **Collapse stacked bullets**: incoming lines with stacked markers (`- - x`, `  - * x`, `1. - x`) keep only the first marker (→ `- x` / `  - x` / `1. x`); negative numbers like `-1` and `- 1. step` are untouched. Applies to merge / create / update and reconcile patch insert / append.

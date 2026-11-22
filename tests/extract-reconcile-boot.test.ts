@@ -1,7 +1,5 @@
 /**
- * REAL-composition integration for the reconcile pass: a merge decision on an
- * existing file triggers a second LLM call that sees the numbered Current and
- * answers with a patch, a noop, or garbage (append fallback).
+ * REAL-composition integration for the reconcile pass in Unified Topic Vault.
  * @module dsh-memory-lite/tests/extract-reconcile-boot
  */
 
@@ -49,7 +47,6 @@ async function bootCtx(memoryRoot: string): Promise<Awaited<ReturnType<typeof bo
     '  name: "' + PLUGIN_ENTRY + '"',
     '  config:',
     '    root: ' + memoryRoot,
-    '    defaultPeer: test-peer',
     '',
   ].join('\n'))
   return boot('dsh-reconcile-boot', configPath, [], undefined, PROJECT_ROOT)
@@ -63,7 +60,7 @@ function mockStreamText(text: string): AsyncIterable<any> {
   })()
 }
 
-const MERGE = '{"decision":"merge","path":"entities/cpa.md","content":"Google 池 = 0（2026-11-12）"}'
+const MERGE = '{"decision":"merge","path":"infra/cpa.md","content":"Google 池 = 0（2026-11-12）"}'
 
 async function run(
   reconcileAnswer: string | undefined,
@@ -73,8 +70,8 @@ async function run(
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-reconcile-mem-'))
   const ctx = await bootCtx(tmp)
   const store = new MemoryStore(tmp)
-  await store.writeNewMemory('test-peer', 'entities/cpa.md', 'CPA', 'port 8317\nGoogle 池 = 1')
-  await store.refreshIndexEntry('test-peer', 'entities/cpa.md', 'CPA 反代手册')
+  await store.writeNewMemory('infra/cpa.md', 'CPA', 'port 8317\nGoogle 池 = 1')
+  await store.refreshIndexEntry('infra/cpa.md', 'CPA 反代手册')
   const calls: { system: string; user: string }[] = []
   ctx.on('llm/stream', (options: any) => {
     const system = String(options.system)
@@ -83,17 +80,16 @@ async function run(
     if (system.includes('ONE existing memory file')) return mockStreamText(reconcileAnswer ?? '{"decision":"noop"}')
     return mockStreamText(MERGE)
   })
-  const config = resolveConfig({ root: tmp, defaultPeer: 'test-peer', extraction: { messageScope: ['user', 'assistant', 'tool_result'], ...extraction } })
+  const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'], ...extraction } })
   await extractOnce(sessionLike('session-rec1', 30), { pending: 2, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
-  const base = join(tmp, 'peers', 'test-peer')
-  const checkpoint = JSON.parse(await readFile(join(base, 'sessions', 'session-rec1.json'), 'utf8'))
-  const log = JSON.parse((await readFile(join(base, 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0]!)
+  const checkpoint = JSON.parse(await readFile(join(tmp, 'sessions', 'session-rec1.json'), 'utf8'))
+  const log = JSON.parse((await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0]!)
   return {
     calls,
-    text: await readFile(join(base, 'memories', 'entities', 'cpa.md'), 'utf8'),
+    text: await readFile(join(tmp, 'memories', 'infra', 'cpa.md'), 'utf8'),
     audit: checkpoint.audit[0],
     log,
-    index: await readFile(join(base, 'memories', '_index.md'), 'utf8'),
+    index: await readFile(join(tmp, 'memories', '_index.md'), 'utf8'),
     tmp,
     cleanup: async () => { await ctx.fiber.dispose(); await rm(tmp, { recursive: true, force: true }) },
   }
@@ -111,7 +107,7 @@ test('merge on an existing file runs a reconcile call that sees numbered lines a
     assert.equal(r.audit.llmCalls, 2)
     assert.equal(r.audit.inputTokens, 200)
     assert.equal(r.log.outcome, 'patch')
-    assert.match(r.index, /entities\/cpa\.md: CPA 反代手册/)
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册/)
   } finally {
     await r.cleanup()
   }
@@ -138,7 +134,7 @@ test('an unparsable reconcile answer falls back to append and logs why', async (
     assert.match(r.audit.reconcileFallback, /parse-error/)
     assert.match(r.log.reconcileFallback, /parse-error/)
     assert.equal(r.log.outcome, 'merge')
-    await access(join(r.tmp, 'peers', 'test-peer', 'sessions', 'failed-answers.log'), constants.F_OK)
+    await access(join(r.tmp, 'sessions', 'failed-answers.log'), constants.F_OK)
   } finally {
     await r.cleanup()
   }

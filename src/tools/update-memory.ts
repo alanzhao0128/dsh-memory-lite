@@ -1,15 +1,15 @@
 /**
  * The `update_memory` tool: replaces a memory's current content, archiving
- * the previous current into its History section (ADD-only).
+ * the previous file into `.history/` and keeping a one-line History note.
  * @module dsh-memory-lite/src/tools/update-memory
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import type { MemoryDeps } from '../tool-utils.js'
-import { assertNotSubagent, peerForExec } from '../tool-utils.js'
+import { assertNotSubagent, cwdForExec, trustForExec, type MemoryDeps } from '../tool-utils.js'
 import { normalizeContent, summaryOf } from '../memory-store.js'
+import { topicOfPath } from '../privacy.js'
 
 /** Register update_memory. */
 export function applyUpdateMemoryTool(ctx: Context, deps: MemoryDeps): void {
@@ -17,7 +17,7 @@ export function applyUpdateMemoryTool(ctx: Context, deps: MemoryDeps): void {
     name: 'update_memory',
     description: "Replace a memory's current content with new content; the previous file is archived (History keeps a one-line note). Use when a memory is outdated or contradicts new facts.",
     parameters: {
-      path: { type: 'string', required: true, description: 'Memory file path relative to the memory root, e.g. preferences/coding.md.' },
+      path: { type: 'string', required: true, description: 'Memory file path from the catalog, e.g. infra/cpa.md or private/health/checkup.md.' },
       content: { type: 'string', required: true, description: 'The new current content of the memory.' },
     },
     output: {
@@ -35,12 +35,16 @@ export function applyUpdateMemoryTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config())
+      const trust = trustForExec(exec, deps)
+      const cwd = cwdForExec(exec)
       const content = normalizeContent(args.content)
       if (content === '') throw new Error('content must be a non-empty string')
-      await deps.store.updateCurrent(peer, args.path, content)
-      await deps.store.ensureIndexEntry(peer, args.path, summaryOf(content))
-      return { path: args.path, content }
+      const { rel } = await deps.store.resolve(args.path, { write: true, trust })
+      await deps.store.updateCurrent(rel, content, trust)
+      await deps.store.ensureIndexEntry(rel, summaryOf(content))
+      const topic = topicOfPath(rel)
+      if (topic !== '') void deps.affinity?.record(cwd, topic)
+      return { path: rel, content }
     },
     presentCall(args): GenericCallView {
       return { card: 'generic', title: `Update memory ${args.path}`, kind: 'edit', locations: [{ path: args.path }] }

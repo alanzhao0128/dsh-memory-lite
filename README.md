@@ -84,11 +84,14 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 | History | `history.maxEntries` / `entryMaxChars` | 每个文件 History 只留最新 N 行（默认 5），每行最多 M 字符（默认 240）。仅在 `cordis.patch.yml` 里配置，**重启生效** |
 | | `history.archiveKeep` | 每次 update / patch 前把整个旧文件存成快照（默认保留最近 5 份，0 = 不存）。**重启生效** |
 | | 审计日志 | 写 `peers/{peer}/sessions/{session-id}.json` 与 `extraction.log` |
-| 目录注入 | 目录 token 上限 | L0 目录截断上限，默认 1200 |
+| 目录注入 | 目录 token 上限 | L0 目录近似 token 上限（默认 3500）：低于上限全展开，超出自动切为「preferences + 热主题 + 折叠地图」 |
+| | `index.hotBudgetRatio` | 自适应地图模式下热主题展开的预算比例（默认 `0.7`） |
 | 界面 | 指示器位置 | 标题栏 utilities 槽顺序；保存后刷新页面生效 |
-| 存储与共享 | 记忆根目录 | 默认 `~/.agent-memory`，**重启生效** |
-| | 默认 peer | 无 cwd 会话的归属 |
-| | 跨 peer 共享 | 总开关，**重启生效**；具体挂载在下方勾选 |
+| 存储与隐私 | 记忆根目录 | 默认 `~/.agent-memory`，**重启生效** |
+| | 一键隐藏隐私 (`privacy.hidePrivate`) | 投屏/演示模式：所有会话硬屏蔽 `private/`，保存即生效 |
+| | 隐私命名空间 (`privacy.namespace`) | 敏感记忆顶层目录名（默认 `private`），保存即生效 |
+| | 受限模型/目录 (`privacy.restrictedProviders` / `restrictedPaths`) | 命中公司模型或公司目录时自动硬屏蔽 `private/`（L0 注入、5 个工具、后台提取全链路生效） |
+| | 强制私密目录 (`privacy.privatePaths`) | 可选保险丝：命中目录下写入/提取的记忆自动归入对应 `private/<subtopic>` |
 
 完整 schema 与默认值见 [`src/config.ts`](https://github.com/alanzhao0128/dsh-memory-lite/blob/main/src/config.ts)。
 
@@ -96,14 +99,18 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 
 ```
 ~/.agent-memory/
-├── peers/{peer}/
-│   ├── memories/
-│   │   ├── _index.md              # L0 目录（生成；可人工编辑）
-│   │   ├── preferences/  entities/  events/  experiences/
-│   │   │   └── {slug}.md          # L1 全文
-│   ├── .history/{category}/{slug}.md/  # update / patch 前的完整旧文件快照（不参与检索与注入）
-│   └── sessions/                  # 提取书签 + 审计 + extraction.log
-└── .trash/                        # forget 的软删除（按日期分目录）
+├── AGENTS.md                       # 全局行动宪章（可选，所有会话置顶注入）
+├── memories/
+│   ├── _index.md                   # 统一 L0 主题索引（生成；可人工编辑）
+│   ├── preferences/                # 永远展开的跨主题硬偏好
+│   ├── infra/  dsh/  g7/  video/   # 按主题组织的公开记忆（1 级目录）
+│   └── private/                    # 隐私边界：受限环境物理隐身，个人环境完全互通
+│       ├── health/  insurance/     # 按敏感子主题组织（2 级目录）
+│       └── family/  quant/
+├── .history/{topic}/{slug}.md/     # update / patch 前的完整旧文件快照
+├── sessions/                       # 统一提取书签 + 审计 + extraction.log
+├── topic-affinity.json             # 自动学习的 cwd ↔ topic 亲和度（用于大库热展开）
+└── .trash/                         # forget 的软删除（按日期分目录）
 ```
 
 每个记忆文件用 `## Current` / `## History` / `## Related` 三段。更新前会把完整旧文件存进 `.history/` 快照，`## History` 本身只留最新几行一句话记录，不再整段堆旧内容。目录里的摘要描述整个文件：新建时由提取模型写一句话，之后 merge 不会再用最新事实的前几个字覆盖它。四个分类是给模型的检索路径：preferences（总是相关）、entities（被提到的事实）、events（时间相关）、experiences（任务经验）。
@@ -147,6 +154,12 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 - 隐式提取的质量取决于你选的模型；小模型更容易产出需要 repair 的 JSON。
 
 ## 变更历史 (Changelog)
+
+### v1.0.0（2026-11-22）
+- **架构跃迁 — 统一主题库（Unified Topic Vault）**：彻底废除按工作目录哈希切碎的 `peers/` 与 `sharing.mounts` 拼接，改为单一 `~/.agent-memory/memories/<topic>/` 人类可读主题树；跨目录同任务（如文档与代码分处不同目录）与跨主题关联（如保单 ↔ 体检）天然零配置互通。
+- **自适应两档 L0 目录（护 KV Cache）**：可见记忆低于 `index.maxTokens`（默认 `3500`）时全展开零额外跳数；超出上限后自动切为「`preferences/` 必展 + 自动学习 `topic-affinity.json` 热主题展开 + 冷主题 1 行折叠地图」，并通过每会话锁定热主题顺序避免中途打爆 Prompt Cache。
+- **硬信任边界门控（`privacy`）**：引入 `private/<subtopic>` 隐私命名空间，支持 `hidePrivate` 一键投屏屏蔽、`restrictedProviders`（模型通道出口门控）、`restrictedPaths`（公司目录门控）与可选 `privatePaths` 强制归私保险丝，在 L0 注入、全部 5 个工具及后台提取器（含提取模型本身）全链路硬拦截。
+- **工具体验升级**：`read_memory("<topic>/")` 支持直接列出折叠主题清单；`search_memory(query, topic?)` 支持按主题过滤并同时检索文件名、索引摘要与正文；提取日志与书签统一收口到 `~/.agent-memory/sessions/`。
 
 ### v0.5.2（2026-11-21）
 - **折叠叠层项目符号**：新写入的行若带叠层标记（`- - x`、`  - * x`、`1. - x`），只保留首个标记（→ `- x` / `  - x` / `1. x`）；`-1` 这类负数、`- 1. 步骤` 不受影响。作用于 merge / create / update 与对账补丁的 insert / append。

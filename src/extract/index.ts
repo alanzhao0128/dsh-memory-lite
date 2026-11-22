@@ -1,11 +1,10 @@
 /**
- * Implicit extraction (Phase 2, channel B): trigger wiring and the background
- * extraction job. Event handlers only count and schedule; the LLM work runs
- * inside a ctx.jobs task, never awaited inside serial event callbacks (the
- * agent/turn-stopping contract, verified in dsh-agent-loop source).
+ * Implicit extraction (channel B): trigger wiring and the background extraction
+ * job for the Unified Topic Vault.
  *
- * Model resolution: config.extraction.llm wins when set; otherwise the
- * session's current model (session.requestHeader().config) is reused.
+ * Enforces the dual trust boundary: if EITHER the session (cwd/provider) OR the
+ * extraction LLM route is restricted, `private/` is completely withheld from
+ * the extractor and any write targeting `private/` is dropped cleanly.
  * @module dsh-memory-lite/src/extract
  */
 
@@ -16,11 +15,12 @@ import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-
 import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/cordis-plugin-timer'
 import type { MemoryStore } from '../memory-store.js'
-import { peerForHeader } from '../peer.js'
-import type { MemoryDeps } from '../tool-utils.js'
+import type { TrustContext } from '../types.js'
+import { trustForSession, type MemoryDeps, type SessionContextLike } from '../tool-utils.js'
 import type { StatusTracker } from '../status.js'
-import { MEMORY_CATEGORIES } from '../types.js'
 import { parseMemoryFile, slugify, summaryOf } from '../memory-store.js'
+import { isPrivatePath, normalizeTopic, topicOfPath, UNRESTRICTED_TRUST } from '../privacy.js'
+import { MemoryPathError } from '../path.js'
 import { numberedView, PatchError } from '../patch.js'
 import { countsTowardExtraction, selectWindow, renderEventText } from './window.js'
 import { shouldExtractIdle, shouldExtractTurn, shouldExtractWindow } from './triggers.js'
@@ -32,15 +32,11 @@ import { buildExtractionUser, buildReconcileUser, extractionSystem, reconcileSys
 const DIGEST_MAX_TOKENS = 100
 const MAX_KEYWORDS = 8
 const MAX_GREP_HITS = 8
-// Bumped 1024 -> 4096 (2026-08-28) -> 32768 (2026-11-15): reasoning models
-// share maxTokens between thinking and the JSON decision body (including the
-// reconcile pass), so 4096 can still exhaust on heavier windows.
 const EXTRACTION_MAX_TOKENS = 32768
 
 interface Route {
   readonly provider: string
   readonly model: string
-  /** Adapter-owned reasoning effort; absent = adapter/provider default. */
   readonly reasoningEffort?: import('@deepseek-ai/dsh-llm').ReasoningEffortId
 }
 
@@ -49,7 +45,6 @@ interface GrepHit {
   readonly line: string
 }
 
-/** Per-run metrics accumulated across LLM calls (1 call, or 2 with a repair). */
 interface RunMetrics {
   llmCalls: number
   inputTokens: number
@@ -58,12 +53,10 @@ interface RunMetrics {
   cacheWriteTokens: number
 }
 
-/** Fixed inputs for one run's record; metrics accumulate as calls happen. */
 interface RunRecordCtx {
   readonly ctx: Context
   readonly state: ExtractionState
   readonly store: MemoryStore
-  readonly peer: string
   readonly sessionId: string
   readonly windowStart: number
   readonly windowEnd: number
@@ -88,13 +81,11 @@ interface ExtractionState {
 export interface ExtractionSessionLike {
   readonly id: string
   readonly header: { readonly cwd?: string; readonly origin?: 'subagent' }
-  /** dsh-session <= 0.1.1 exposed the full log as `events`; >= 0.1.2 uses snapshotEvents(). */
   readonly events?: readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
   snapshotEvents?(fromSeq?: number, toSeqExclusive?: number): readonly { readonly type: string; readonly seq: number; readonly data: unknown }[]
   requestHeader(): { readonly config?: { readonly provider?: string; readonly model?: string } } | undefined
 }
 
-/** Read a session's full event log across dsh-session versions (events vs snapshotEvents). */
 function sessionEvents(session: ExtractionSessionLike): readonly { readonly type: string; readonly seq: number; readonly data: unknown }[] {
   if (session.snapshotEvents !== undefined) return session.snapshotEvents()
   return session.events ?? []
@@ -141,9 +132,6 @@ export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusT
 
   ctx.on('session/event', (session, event) => {
     if (session.header.origin === 'subagent') return
-    // One predicate for both the counter and the window: injections (memory
-    // catalog, runtime context, …) must neither count toward windowTurns nor
-    // keep re-arming the idle timer.
     if (!countsTowardExtraction(event, ext().messageScope)) return
     const state = stateOf(session)
     state.pending += 1
@@ -152,9 +140,6 @@ export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusT
   })
 
   ctx.on('agent/turn-stopping', ({ agent }) => {
-    // Disabled 2026-08-25 (方案 C): turn-boundary extraction turned off to cut
-    // LLM calls; the 30-min idle timer remains the timeliness backstop. Re-enable
-    // by setting extraction.turnStoppingTrigger back to true (IMPLEMENTATION.md §13.2 偏差 12).
     if (!ext().turnStoppingTrigger) return
     const session = agent.session
     if (session.header.origin === 'subagent') return
@@ -183,7 +168,6 @@ export function applyExtraction(ctx: Context, deps: MemoryDeps, tracker: StatusT
   })
 }
 
-/** Fire-and-forget extraction producer; never awaited in serial event callbacks. */
 function runExtraction(
   session: Session,
   state: ExtractionState,
@@ -212,7 +196,7 @@ function runExtraction(
   })()
 }
 
-/** One extraction run: window -> grep -> LLM -> write -> checkpoint. */
+/** One extraction run: window -> trust gate -> grep -> LLM -> reconcile -> checkpoint. */
 export async function extractOnce(
   session: ExtractionSessionLike,
   state: ExtractionState,
@@ -224,17 +208,11 @@ export async function extractOnce(
   const config = deps.config()
   const ext = config.extraction
   const store = deps.store
-  const peer = peerForHeader(session.header as Parameters<typeof peerForHeader>[0], config)
   if (state.checkpoint.checkpoint.seq === 0 && state.checkpoint.audit.length === 0) {
-    const raw = await store.readSessionCheckpoint(peer, session.id)
+    const raw = await store.readSessionCheckpoint(session.id)
     if (raw !== undefined) state.checkpoint = parseCheckpoint(raw)
   }
   const events = sessionEvents(session)
-  // The checkpoint records a session-log seq. A released session-format
-  // migration (v0 -> v1 -> v2 -> v3) renumbers every event, so a bookmark
-  // written under the previous numbering sits beyond the log's end and the
-  // window would silently select nothing forever. Detect that rebase and
-  // resume from the recent window instead of staying dead.
   let maxSeq = 0
   for (const event of events) {
     if (event.seq > maxSeq) maxSeq = event.seq
@@ -243,8 +221,6 @@ export async function extractOnce(
   const fromSeq = storedSeq > maxSeq ? 0 : storedSeq
   const windowEvents = selectWindow(events, fromSeq, ext.maxMessages, ext.messageScope)
   if (windowEvents.length === 0) {
-    // Nothing new to read: clear the pending count so an oversized counter
-    // cannot re-schedule an empty scan on every subsequent event.
     state.pending = 0
     return
   }
@@ -252,21 +228,23 @@ export async function extractOnce(
   const windowEnd = windowEvents[windowEvents.length - 1]!.seq
   const windowText = windowEvents.map(event => renderEventText(event, ext.toolResultMaxBytes)).join('\n')
 
-  let hits: readonly GrepHit[] = []
-  if (ext.dedup) {
-    const keywords = extractKeywords(windowText, MAX_KEYWORDS)
-    hits = await grepHits(store, peer, keywords, MAX_GREP_HITS)
-  }
-  // Full-memory index for de-fragmentation: lets the model merge into an
-  // existing file instead of creating a new one for the same topic. Already
-  // sorted newest-first; read failures fall back to an empty index.
-  const indexEntries = await store.readIndex(peer).catch(() => [])
-
   const startedAt = Date.now()
   const metrics: RunMetrics = { llmCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
   const route = resolveRoute(ext.llm.route, ext.llm.reasoningEffort, deps.defaultModel, session)
+
+  // Dual trust gate: restricted if EITHER the session OR the extraction model provider is restricted.
+  const trust = trustForSession(session as unknown as SessionContextLike, deps, [route?.provider])
+
+  let hits: readonly GrepHit[] = []
+  if (ext.dedup) {
+    const keywords = extractKeywords(windowText, MAX_KEYWORDS)
+    hits = await grepHits(store, keywords, MAX_GREP_HITS, trust)
+  }
+  const indexEntries = await store.readIndex(trust).catch(() => [])
+  const existingTopics = [...new Set(indexEntries.map(e => e.topic))]
+
   const rc: RunRecordCtx = {
-    ctx, state, store, peer, sessionId: session.id, windowStart, windowEnd, hits, route, metrics, startedAt,
+    ctx, state, store, sessionId: session.id, windowStart, windowEnd, hits, route, metrics, startedAt,
     auditLog: ext.auditLog, tracker,
   }
   if (route === undefined) {
@@ -274,13 +252,18 @@ export async function extractOnce(
     return
   }
 
-  const system = extractionSystem()
+  const system = extractionSystem({
+    restricted: trust.restricted,
+    privateNamespace: config.privacy.namespace,
+  })
   const user = buildExtractionUser(
     state.checkpoint.digest === '' ? undefined : state.checkpoint.digest,
     windowText,
     indexEntries,
     hits,
+    existingTopics,
   )
+
   let text = ''
   try {
     metrics.llmCalls += 1
@@ -299,25 +282,18 @@ export async function extractOnce(
     decision = parseDecision(text)
   } catch (error) {
     const note = 'parse-error: ' + String(error).slice(0, 200)
-    // Diagnostic: persist the raw failed answer so a parse-error spike can be
-    // investigated (the model's output shape decides whether the repair is
-    // helping). Best-effort; never blocks the run.
-    void store.appendFailedAnswer(peer, {
+    void store.appendFailedAnswer({
       at: new Date().toISOString(),
       session: session.id,
       win: [windowStart, windowEnd],
-      route: route === undefined ? null : route,
+      route,
       error: String(error).slice(0, 300),
       text,
     })
-    // Bounded one-shot repair (Phase 2.1): re-ask the model to emit valid JSON
-    // from the failed answer only — cheap, no window resend. A second failure
-    // is accepted and the checkpoint still advances (no infinite retry loop).
     if (ext.parseRetry) {
       metrics.llmCalls += 1
-      const repairSystem = extractionSystem()
       const repairUser = buildRepairUser(text)
-      const repaired = await callExtraction(ctx, route, repairSystem, repairUser, signal).catch(() => undefined)
+      const repaired = await callExtraction(ctx, route, system, repairUser, signal).catch(() => undefined)
       if (repaired !== undefined) {
         addUsage(metrics, repaired)
         try {
@@ -329,7 +305,7 @@ export async function extractOnce(
           return
         }
       } else {
-        metrics.inputTokens += digestApproxTokens(repairSystem) + digestApproxTokens(repairUser)
+        metrics.inputTokens += digestApproxTokens(system) + digestApproxTokens(repairUser)
         await recordRun(rc, note, undefined, undefined, undefined, false)
         return
       }
@@ -339,53 +315,57 @@ export async function extractOnce(
     }
   }
 
-  // Reconcile: when a merge/update/create lands on an existing file, show the
-  // model that file's numbered lines so it can replace/delete/insert instead of
-  // blindly appending. One extra call, only on those paths.
-  const hooks: ApplyHooks = ext.reconcile
-    ? {
-        reconcile: async (request): Promise<ReconcileAnswer> => {
-          const view = numberedView(request.current, ext.reconcileMaxBytes)
-          if (view === undefined) return { kind: 'fallback', reason: 'current-too-large' }
-          const reconcileSystemText = reconcileSystem()
-          const reconcileUser = buildReconcileUser(request.title, view.text, view.truncated, request.kind, request.content)
-          metrics.llmCalls += 1
-          let call: Awaited<ReturnType<typeof callExtraction>>
-          try {
-            call = await callExtraction(ctx, route, reconcileSystemText, reconcileUser, signal)
-          } catch (error) {
-            if (signal.aborted) throw error
-            metrics.inputTokens += digestApproxTokens(reconcileSystemText) + digestApproxTokens(reconcileUser)
-            return { kind: 'fallback', reason: 'llm-error: ' + String(error).slice(0, 160) }
-          }
-          addUsage(metrics, call)
-          try {
-            return parseReconcile(call.text)
-          } catch (error) {
-            void store.appendFailedAnswer(peer, {
-              at: new Date().toISOString(),
-              session: session.id,
-              win: [windowStart, windowEnd],
-              route,
-              stage: 'reconcile',
-              error: String(error).slice(0, 300),
-              text: call.text,
-            })
-            return { kind: 'fallback', reason: 'parse-error: ' + String(error).slice(0, 160) }
-          }
-        },
-      }
-    : {}
+  const hooks: ApplyHooks = {
+    trust,
+    ...(ext.reconcile
+      ? {
+          reconcile: async (request): Promise<ReconcileAnswer> => {
+            const view = numberedView(request.current, ext.reconcileMaxBytes)
+            if (view === undefined) return { kind: 'fallback', reason: 'current-too-large' }
+            const reconcileSystemText = reconcileSystem()
+            const reconcileUser = buildReconcileUser(request.title, view.text, view.truncated, request.kind, request.content)
+            metrics.llmCalls += 1
+            let call: Awaited<ReturnType<typeof callExtraction>>
+            try {
+              call = await callExtraction(ctx, route, reconcileSystemText, reconcileUser, signal)
+            } catch (error) {
+              if (signal.aborted) throw error
+              metrics.inputTokens += digestApproxTokens(reconcileSystemText) + digestApproxTokens(reconcileUser)
+              return { kind: 'fallback', reason: 'llm-error: ' + String(error).slice(0, 160) }
+            }
+            addUsage(metrics, call)
+            try {
+              return parseReconcile(call.text)
+            } catch (error) {
+              void store.appendFailedAnswer({
+                at: new Date().toISOString(),
+                session: session.id,
+                win: [windowStart, windowEnd],
+                route,
+                stage: 'reconcile',
+                error: String(error).slice(0, 300),
+                text: call.text,
+              })
+              return { kind: 'fallback', reason: 'parse-error: ' + String(error).slice(0, 160) }
+            }
+          },
+        }
+      : {}),
+  }
 
   let applied: AppliedDecision
   try {
-    applied = await applyDecisionDetailed(store, peer, decision, hooks)
+    applied = await applyDecisionDetailed(store, decision, hooks)
   } catch (error) {
     await recordRun(rc, 'apply-error: ' + String(error).slice(0, 200), decision.kind, undefined, undefined, false)
     return
   }
   if (applied.fallback !== undefined) {
     ctx.logger.warn('dsh-memory-lite: reconcile fell back to append for ' + String(applied.path) + ' (' + applied.fallback + ')')
+  }
+  if (applied.path !== undefined && applied.applied !== 'skip' && applied.applied !== 'noop') {
+    const topic = topicOfPath(applied.path)
+    if (topic !== '') void deps.affinity?.record(session.header.cwd, topic)
   }
 
   const digest = rollDigest(state.checkpoint.digest, windowText, DIGEST_MAX_TOKENS)
@@ -400,7 +380,6 @@ export async function extractOnce(
   )
 }
 
-/** The repair turn: convert a failed non-JSON answer into a valid JSON decision. */
 function buildRepairUser(failedAnswer: string): string {
   return [
     'An earlier extraction answer was not valid JSON. Convert it into exactly ONE JSON decision object following the schema and STRICT OUTPUT RULES in the system instructions.',
@@ -411,12 +390,6 @@ function buildRepairUser(failedAnswer: string): string {
   ].join('\n')
 }
 
-/**
- * Persist the run outcome: advance the checkpoint (bounds retry loops), append
- * the run metrics to the session audit and the peer summary log, and log a
- * one-line summary. When auditLog is off the audit entry and summary log are
- * skipped but the checkpoint seq still advances (functional requirement).
- */
 async function recordRun(
   rc: RunRecordCtx,
   note: string | undefined,
@@ -426,7 +399,7 @@ async function recordRun(
   advance: boolean,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
-  const { ctx, state, store, peer, sessionId, windowStart, windowEnd, hits, route, metrics, startedAt, auditLog, tracker } = rc
+  const { ctx, state, store, sessionId, windowStart, windowEnd, hits, route, metrics, startedAt, auditLog, tracker } = rc
   const durationMs = Date.now() - startedAt
   const outcome = note !== undefined ? note.split(':')[0]!.trim() : (decision ?? 'error')
   const at = new Date().toISOString()
@@ -447,9 +420,6 @@ async function recordRun(
     durationMs,
     ...extra,
   }
-  // A failed run keeps the previous checkpoint so the same window is retried
-  // on the next trigger; only a completed decision advances past it. The audit
-  // entry is appended either way (the failure is the evidence).
   const nextSeq = advance ? windowEnd : state.checkpoint.checkpoint.seq
   state.checkpoint = auditLog
     ? withRun(state.checkpoint, nextSeq, entry)
@@ -458,7 +428,7 @@ async function recordRun(
     state.checkpoint = { ...state.checkpoint, digest }
   }
   state.pending = 0
-  await store.writeSessionCheckpoint(peer, sessionId, renderCheckpoint(state.checkpoint))
+  await store.writeSessionCheckpoint(sessionId, renderCheckpoint(state.checkpoint))
 
   if (auditLog) {
     const logLine = {
@@ -478,7 +448,7 @@ async function recordRun(
       route: route ?? null,
       ...extra,
     }
-    await store.appendExtractionLog(peer, JSON.stringify(logLine))
+    await store.appendExtractionLog(JSON.stringify(logLine))
     ctx.logger.info(
       'dsh-memory-lite: extraction ' + outcome + ' calls=' + metrics.llmCalls +
       ' in=' + metrics.inputTokens + ' out=' + metrics.outputTokens + ' ms=' + durationMs +
@@ -492,72 +462,78 @@ async function recordRun(
 export interface ReconcileRequest {
   readonly path: string
   readonly title: string
-  /** The file's Current body (its numbering is what the model's line numbers refer to). */
   readonly current: string
   readonly kind: 'create' | 'merge' | 'update'
-  /** The proposed addition exactly as the extractor wrote it. */
   readonly content: string
 }
 
-/** Reconcile result; `fallback` means "could not reconcile, append instead". */
 export type ReconcileAnswer = ReconcileDecision | { readonly kind: 'fallback'; readonly reason: string }
 
-/** Optional collaborators for {@link applyDecisionDetailed}. */
 export interface ApplyHooks {
-  /** Present = reconcile merge/update/create against an existing file before writing. */
   readonly reconcile?: (request: ReconcileRequest) => Promise<ReconcileAnswer>
+  readonly trust?: TrustContext
 }
 
-/** How a decision was actually applied (`patch`/`noop` come from reconcile). */
 export interface AppliedDecision {
   readonly path: string | undefined
   readonly applied: 'create' | 'merge' | 'update' | 'patch' | 'noop' | 'skip'
-  /** Why reconcile gave up and the change was appended instead. */
   readonly fallback?: string
 }
 
 /** Apply one decision through the store (all writes go through the queue). */
 export async function applyDecision(
   store: MemoryStore,
-  peer: string,
   decision: ExtractionDecision,
   hooks: ApplyHooks = {},
 ): Promise<string | undefined> {
-  return (await applyDecisionDetailed(store, peer, decision, hooks)).path
+  return (await applyDecisionDetailed(store, decision, hooks)).path
 }
 
-/**
- * Apply one decision and report how it landed. Index summaries describe the
- * whole file, so only a brand-new file (or an explicit `summary`) sets one;
- * merging a fact never replaces it with that fact's first words.
- */
+/** Apply one decision and report how it landed, enforcing trust-boundary rules. */
 export async function applyDecisionDetailed(
   store: MemoryStore,
-  peer: string,
   decision: ExtractionDecision,
   hooks: ApplyHooks = {},
 ): Promise<AppliedDecision> {
   if (decision.kind === 'skip') return { path: undefined, applied: 'skip' }
+  const trust = hooks.trust ?? UNRESTRICTED_TRUST
+  const ns = store.privateNamespace
+
   let path: string
   let title: string | undefined
   if (decision.kind === 'create') {
-    if (!MEMORY_CATEGORIES.includes(decision.category as never)) {
-      throw new Error('unknown category: ' + decision.category)
+    let topic = normalizeTopic(decision.topic, ns)
+    // Restricted mode: never allow background extraction to write private/.
+    if (trust.restricted && isPrivatePath(topic, ns)) {
+      return { path: undefined, applied: 'skip' }
     }
-    // Model sometimes writes a title ending in ".md"; strip it so the
-    // slug does not produce a double extension (e.g. foo.md.md).
+    // Private-path safety net: force writes inside privatePaths into their private topic.
+    if (!trust.restricted && trust.forcedPrivateTopic !== undefined && !isPrivatePath(topic, ns)) {
+      topic = trust.forcedPrivateTopic
+    }
     title = decision.title.replace(/\.md$/i, '')
-    path = decision.category + '/' + slugify(title) + '.md'
+    path = `${topic}/${slugify(title)}.md`
   } else {
     path = decision.path
+    if (trust.restricted && isPrivatePath(path, ns)) {
+      return { path, applied: 'skip' }
+    }
+    // Verify write permission early so illegal paths never slip through.
+    try {
+      await store.resolve(path, { write: true, trust })
+    } catch (error) {
+      if (error instanceof MemoryPathError && trust.restricted) {
+        return { path, applied: 'skip' }
+      }
+      throw error
+    }
   }
-  // Conservative implicit-channel rule: a create never overwrites an existing
-  // memory (it may hold explicit user content); it folds into it instead.
-  const exists = await store.fileExists(peer, path).catch(() => false)
+
+  const exists = await store.fileExists(path, trust).catch(() => false)
   let fallback: string | undefined
 
   if (exists && hooks.reconcile !== undefined) {
-    const file = await store.readFile(peer, path)
+    const file = await store.readFile(path, trust)
     const parsed = parseMemoryFile(file.content)
     if (parsed.current !== '') {
       const answer = await hooks.reconcile({
@@ -570,9 +546,9 @@ export async function applyDecisionDetailed(
       if (answer.kind === 'noop') return { path, applied: 'noop' }
       if (answer.kind === 'patch') {
         try {
-          const result = await store.patchCurrent(peer, path, answer.ops)
-          if (answer.summary !== undefined) await store.refreshIndexEntry(peer, path, answer.summary)
-          else if (result.changed) await store.ensureIndexEntry(peer, path, summaryOf(parsed.title === '' ? decision.content : parsed.title))
+          const result = await store.patchCurrent(path, answer.ops, trust)
+          if (answer.summary !== undefined) await store.refreshIndexEntry(path, answer.summary)
+          else if (result.changed) await store.ensureIndexEntry(path, summaryOf(parsed.title === '' ? decision.content : parsed.title))
           return { path, applied: result.changed ? 'patch' : 'noop' }
         } catch (error) {
           if (!(error instanceof PatchError)) throw error
@@ -586,32 +562,22 @@ export async function applyDecisionDetailed(
 
   const summary = decision.kind === 'update' || decision.kind === 'create' ? decision.summary : undefined
   if (decision.kind === 'create' && !exists) {
-    await store.writeNewMemory(peer, path, decision.title, decision.content)
-    await store.refreshIndexEntry(peer, path, summary ?? summaryOf(decision.content))
+    await store.writeNewMemory(path, title ?? decision.title, decision.content, trust)
+    await store.refreshIndexEntry(path, summary ?? summaryOf(decision.content))
     return { path, applied: 'create' }
   }
-  // With reconcile active, an update that could not be reconciled is appended:
-  // replacing Current with text the model wrote without seeing it would lose data.
   const blindReplace = decision.kind === 'update' && !(exists && hooks.reconcile !== undefined)
   if (blindReplace) {
-    await store.updateCurrent(peer, path, decision.content)
-    if (summary !== undefined) await store.refreshIndexEntry(peer, path, summary)
-    else await store.ensureIndexEntry(peer, path, summaryOf(decision.content))
+    await store.updateCurrent(path, decision.content, trust)
+    if (summary !== undefined) await store.refreshIndexEntry(path, summary)
+    else await store.ensureIndexEntry(path, summaryOf(decision.content))
     return { path, applied: 'update' }
   }
-  await store.appendCurrent(peer, path, decision.content)
-  await store.ensureIndexEntry(peer, path, summaryOf(decision.content))
+  await store.appendCurrent(path, decision.content, trust)
+  await store.ensureIndexEntry(path, summaryOf(decision.content))
   return { path, applied: decision.kind === 'create' ? 'create' : decision.kind, ...(fallback === undefined ? {} : { fallback }) }
 }
 
-/**
- * Model route resolution order (§17):
- * 1. extraction.llm.route (explicit "provider/model") — fixed, ignores the global default.
- * 2. The global default model selection (agent-default-model), read live each run.
- * 3. Fallback: the session's current request-header model (legacy behavior).
- * Reasoning effort travels with whichever route won: explicit config first,
- * else the selection's own effort.
- */
 function resolveRoute(
   configuredRoute: string | undefined,
   configuredEffort: string | undefined,
@@ -650,12 +616,6 @@ function resolveRoute(
   return undefined
 }
 
-/**
- * Provider-facing detail of a failed finish. The harness carries the real
- * reason on `finish.failure` (unknown model, context overflow, transport
- * error, …); without it the audit log only says "llm-error" and the cause has
- * to be re-derived from scratch (the 2026-09-16 `UNKNOWN_MODEL` incident).
- */
 function finishFailureDetail(finish: {
   readonly failure?: { readonly message?: string; readonly code?: string; readonly status?: number }
 }): string {
@@ -668,7 +628,6 @@ function finishFailureDetail(finish: {
   return message + (code === '' ? '' : ' [' + code + (status === '' ? '' : ' ' + status) + ']')
 }
 
-/** Assemble the streamed text and real token usage; a non-success finish throws. */
 async function collectStream(stream: AsyncIterable<StreamChunk>): Promise<{ text: string; usage: TokenUsage | undefined }> {
   const assembler = new BlockAssembler()
   for await (const chunk of stream) assembler.push(chunk)
@@ -690,11 +649,6 @@ async function collectStream(stream: AsyncIterable<StreamChunk>): Promise<{ text
   }
 }
 
-/**
- * One extraction LLM call. Token counts prefer the provider's real usage from
- * the stream; when absent they fall back to the bytes/3 estimate so a run
- * still records a defensible figure.
- */
 async function callExtraction(
   ctx: Context,
   route: Route,
@@ -724,7 +678,6 @@ async function callExtraction(
   }
 }
 
-/** Fold one call's token figures into the run-wide accumulator. */
 function addUsage(
   metrics: RunMetrics,
   call: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number },
@@ -752,18 +705,17 @@ export function extractKeywords(text: string, max: number): string[] {
     .map(entry => entry[0])
 }
 
-/** Deduplicated grep hits across keywords, capped. */
 async function grepHits(
   store: MemoryStore,
-  peer: string,
   keywords: readonly string[],
   max: number,
+  trust: TrustContext,
 ): Promise<GrepHit[]> {
   const seen = new Set<string>()
   const hits: GrepHit[] = []
   for (const keyword of keywords) {
     if (hits.length >= max) break
-    for (const match of await store.search(peer, keyword)) {
+    for (const match of await store.search(keyword, { trust })) {
       const key = match.path + '\u0000' + match.line
       if (seen.has(key)) continue
       seen.add(key)

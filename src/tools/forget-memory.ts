@@ -1,14 +1,13 @@
 /**
- * The `forget_memory` tool: soft-deletes a memory into the trash directory
- * (never overwrites; approval wiring lands in Phase 3).
+ * The `forget_memory` tool: soft-deletes a memory into `.trash/` and removes
+ * its L0 index entry.
  * @module dsh-memory-lite/src/tools/forget-memory
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import type { MemoryDeps } from '../tool-utils.js'
-import { assertNotSubagent, peerForExec } from '../tool-utils.js'
+import { assertNotSubagent, trustForExec, type MemoryDeps } from '../tool-utils.js'
 
 /** Register forget_memory. */
 export function applyForgetMemoryTool(ctx: Context, deps: MemoryDeps): void {
@@ -16,7 +15,7 @@ export function applyForgetMemoryTool(ctx: Context, deps: MemoryDeps): void {
     name: 'forget_memory',
     description: 'Delete one memory. The file moves to the memory trash and its index entry is removed; this cannot be undone by the model.',
     parameters: {
-      path: { type: 'string', required: true, description: 'Memory file path relative to the memory root, e.g. preferences/coding.md.' },
+      path: { type: 'string', required: true, description: 'Memory file path from the catalog, e.g. infra/cpa.md.' },
     },
     output: {
       schema: {
@@ -30,10 +29,10 @@ export function applyForgetMemoryTool(ctx: Context, deps: MemoryDeps): void {
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
-      const peer = peerForExec(exec, deps.config())
-      const { rel } = await deps.store.resolve(peer, args.path)
-      await deps.store.softDelete(peer, args.path)
-      await deps.store.removeIndexEntry(peer, args.path)
+      const trust = trustForExec(exec, deps)
+      const { rel } = await deps.store.resolve(args.path, { write: true, trust })
+      await deps.store.softDelete(rel, trust)
+      await deps.store.removeIndexEntry(rel)
       return { path: rel }
     },
     presentCall(args): GenericCallView {

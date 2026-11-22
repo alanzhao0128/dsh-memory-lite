@@ -1,19 +1,13 @@
 /**
- * dsh-memory-lite: lightweight Markdown-file memory for DeepSeek Harness.
+ * dsh-memory-lite v1.0: Unified Topic Vault for DeepSeek Harness.
  *
- * - Five model-facing tools: read_memory, search_memory, remember,
- *   update_memory, forget_memory (explicit capture only — the implicit
- *   extraction channel is Phase 2).
- * - L0 catalog injection (`agent/pre-step` waterfall): the peer's memory
- *   index is published as a durable user message and re-published when the
- *   index changes or compaction moves it off the visible surface.
- * - Peer isolation: each session's cwd derives its own memory root.
- * - All file access goes through a containment boundary; subagent sessions
- *   get no catalog and no tool access.
- *
- * Model Experience: the 5 tool schemas are injected every step; the L0
- * catalog is one durable surface message resident for the session (re-sent
- * after compaction or index changes). See README.md and IMPLEMENTATION.md.
+ * - Single topic-organized Markdown vault (`~/.agent-memory/memories/<topic>/`).
+ * - Adaptive two-tier L0 catalog (full expansion under budget; preferences +
+ *   auto-learned hot topics + 1-line Topic Map when larger).
+ * - Hard trust-boundary gate (`privacy`): hides and blocks `private/` when
+ *   `hidePrivate` is on, or when the session/extractor uses a restricted
+ *   provider or restricted working directory.
+ * - Five model-facing tools + background incremental extraction with reconcile.
  * @module dsh-memory-lite
  */
 
@@ -22,14 +16,11 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-session'
 import type { ConnectionFetchRoute } from '@deepseek-ai/dsh-client-connection'
-// dsh-settings >= 0.1.2 exposes SettingsProvider.installSection (the old
-// module-level installSettingsSection moved onto the provider). The host
-// settings service is that provider, so we call the method directly.
 import type { SettingsProvider, SettingsSectionHooks } from '@deepseek-ai/dsh-settings'
 import { Config, resolveConfig, unwrapConfig } from './config.js'
 import type { MemoryConfig, ResolvedConfig } from './config.js'
 import { MemoryStore } from './memory-store.js'
-import { peerForHeader } from './peer.js'
+import { TopicAffinityStore } from './affinity.js'
 import type { MemoryDeps } from './tool-utils.js'
 import { applyReadMemoryTool } from './tools/read-memory.js'
 import { applySearchMemoryTool } from './tools/search-memory.js'
@@ -43,55 +34,34 @@ import { createStatusTracker } from './status.js'
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'dsh-memory-lite'
 
-/** Services this plugin requires to activate: the tool registry, the agent registry,
- * the LLM stream, and the timer service (ctx.timeout for the extraction idle
- * backstop). `connection` is a web-app service and is injected optionally below, so
- * a headless profile loads the plugin (tools + extraction) without browser surfaces. */
+/** Services this plugin requires to activate; `connection` is injected optionally below. */
 export const inject = ['tools', 'agents', 'llm', 'timer']
 
 export { Config }
 
-/**
- * Install the memory-lite settings namespace on the host SettingsProvider
- * (dsh <= 0.1.5 via `installSection`) or adapt to SettingsForms (dsh >= 0.1.7).
- *
- * In 0.1.5: `installSection` registers the namespace with the composition entry
- * as the base layer and wires up live updates.
- * In 0.1.7: SettingsForms manages schema-derived volatile forms; `configure({ auto: false })`
- * disables auto-generated fallback UI in favor of our own custom settings page, and
- * `app-boot/config-reload` propagates live config updates from `cordis.patch.yml`.
- *
- * Rides ctx.inject so an absent settings service (host without one) is a
- * silent no-op rather than a hard inject failure.
- */
+/** Install settings namespace across dsh <= 0.1.5 (SettingsProvider) and dsh >= 0.1.7 (SettingsForms). */
 function installSettingsCompat<T>(ctx: Context, ns: string, schema: unknown, entry: T, hooks: SettingsSectionHooks<T>): void {
   void ctx.inject(['settings'], (sctx) => {
     const settings = sctx.settings as (SettingsProvider & { configure?: (opts: { auto?: boolean }, owner?: unknown) => () => void }) | undefined
     if (settings === undefined) return
-    // Branch A: dsh <= 0.1.5 (SettingsProvider with installSection)
     if (typeof (settings as any).installSection === 'function') {
       settings.installSection(sctx, ns as never, schema as never, entry, hooks)
       return
     }
-    // Branch B: dsh >= 0.1.7 (SettingsForms)
-    // 1. Point source to read from live entry / fiber config if available
     hooks.setSource(() => {
       const entryConfig = (ctx as any).fiber?.entry?.options?.config as T | undefined
       const fiberConfig = (ctx as any).fiber?.config as T | undefined
       return entryConfig ?? fiberConfig ?? entry
     })
-    // 2. Disable auto-generated settings form if configure() is available
     if (typeof settings.configure === 'function') {
       sctx.effect(
         () => settings.configure!({ auto: false }, (ctx as any).fiber),
         'dsh-memory-lite: disable auto-generated settings form',
       )
     }
-    // 3. Listen to profile config reloads
     ;(sctx as any).on('app-boot/config-reload', () => {
       hooks.onChange()
     })
-    // 4. Trigger initial change notification to sync with fiber config
     hooks.onChange()
   })
 }
@@ -121,17 +91,7 @@ function rpcSuccessResponse(rpcId: string, result: unknown): Response {
   return Response.json({ type: 'server-response', rpcId, result })
 }
 
-/**
- * dsh 0.1.5 channel migration: connection.rpc.handle 对第三方插件不可用
- * （官方 #5926：connection 顶层 inject 不再声明 webServer，注册时抛
- * "cannot get property webServer without inject"，master 未修）。插件 RPC
- * 改为 /api 共享通道的精确 Fetch 路由（connection.fetch.register），信封
- * 协议与旧 rpc.handle 一致（复刻官方 rpcFetchHandler）。
- *
- * 与官方 rpcFetchHandler 的差异（有意）：handler 抛错时返回 200 + 结构化
- * error envelope（官方为 500 纯文本），让浏览器端 rpc.call 能拿到
- * { ok:false, error } 而不是 transport failure。
- */
+/** Shared `/api/<endpoint>` RPC route matching the official rpcFetchHandler envelope. */
 function rpcRoute(
   endpoint: string,
   handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
@@ -170,16 +130,18 @@ function rpcRoute(
 
 /** Register the memory capability for the lifetime of `ctx`. */
 export function apply(ctx: Context, config: MemoryConfig = {}): void {
-  // The live config is a mutable reference; settings changes swap it in place
-  // (see installSettingsSection below), so every consumer reading through the
-  // deps getter sees the newest value without re-registering.
   let live: ResolvedConfig = resolveConfig(config)
-  // MemoryStore pins root + sharing at construction, so build it on first use:
-  // the settings layer installs asynchronously at boot, and it must be able to
-  // supply root/sharing for THIS boot (a later edit stays restart-applied —
-  // see the onChange pinning below).
+  // MemoryStore & TopicAffinityStore pin `root` at construction (first use,
+  // after settings seed loads); `history` and `privacy` resolve live.
   let store: MemoryStore | undefined
-  const storeOf = (): MemoryStore => (store ??= new MemoryStore(live.root, live.sharing, live.history))
+  let affinity: TopicAffinityStore | undefined
+  const storeOf = (): MemoryStore => (store ??= new MemoryStore(
+    live.root,
+    () => live.history,
+    () => live.privacy.namespace,
+  ))
+  const affinityOf = (): TopicAffinityStore => (affinity ??= new TopicAffinityStore(live.root))
+
   const defaultModel = (): { provider: string; model: string; reasoningEffort?: string } => {
     const svc = ctx.get('agentDefaultModel') as { currentSelection?: () => { provider: string; model: string; reasoningEffort?: string } } | undefined
     if (svc?.currentSelection === undefined) return { provider: '', model: '' }
@@ -189,7 +151,14 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       return { provider: '', model: '' }
     }
   }
-  const deps: MemoryDeps = { config: () => live, get store() { return storeOf() }, defaultModel }
+
+  const deps: MemoryDeps = {
+    config: () => live,
+    get store() { return storeOf() },
+    get affinity() { return affinityOf() },
+    defaultModel,
+  }
+
   const readTool = applyReadMemoryTool(ctx, deps)
   applySearchMemoryTool(ctx, deps)
   applyRememberTool(ctx, deps)
@@ -199,23 +168,6 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
   const tracker = createStatusTracker()
   applyExtraction(ctx, deps, tracker)
 
-  // Peer UI annotations: whenever a session with a working directory is seen,
-  // ensure its peer carries a human-readable displayName (e.g. 健康分析 behind
-  // workspace-aad65ea5). Idempotent and async — rememberPeerCwd reads first
-  // and writes exactly once per peer.
-  ctx.on('session/event', (session) => {
-    const header = session.header as { cwd?: string; origin?: string } | undefined
-    if (header?.cwd === undefined || header?.origin === 'subagent') return
-    const peer = peerForHeader(header as Parameters<typeof peerForHeader>[0], live)
-    void storeOf().rememberPeerCwd(peer, header.cwd)
-  })
-
-  // Settings-backed overrides (方案 A, IMPLEMENTATION.md §16): the cordis row
-  // config is the composition base; user edits land in ~/.dsh/settings.yaml
-  // under the dsh-memory-lite namespace. `root` + `sharing` are restart-applied
-  // (MemoryStore holds both at construction): the settings layer supplies them
-  // until the store is built, then the built pair stays pinned; every other
-  // field resolves live on each change.
   let source: () => MemoryConfig = () => config
   installSettingsCompat(ctx, 'dsh-memory-lite', Config, unwrapConfig(config), {
     setSource: (get) => { source = get },
@@ -223,42 +175,44 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       const next = resolveConfig(source())
       live = store === undefined
         ? next
-        : { ...next, root: live.root, sharing: live.sharing }
+        : { ...next, root: live.root }
     },
   })
 
-  // Browser-facing RPC routes (status indicator + settings page). `connection`
-  // is a web-app service, so inject it optionally: a headless profile then loads
-  // the plugin (tools + extraction) and simply gets no browser surfaces, instead
-  // of failing the whole profile boot on a missing service.
   void ctx.inject(['connection'], (cctx) => {
-    // Browser indicator channel: the header dot polls this snapshot.
     cctx.effect(
       () => cctx.connection.fetch.register(rpcRoute('memory-status/snapshot', async (_endpoint, _payload, _signal) => ({
         ok: true,
-        value: tracker.snapshot(live.extraction.mode),
+        value: {
+          ...tracker.snapshot(live.extraction.mode),
+          hidePrivate: live.privacy.hidePrivate,
+        },
       }))),
       'dsh-memory-lite: /api/memory-status/snapshot',
     )
 
-    // Settings UI: list existing peers so sharing.mounts can be edited as
-    // checkboxes instead of raw YAML (IMPLEMENTATION.md §16.9 known limit).
     cctx.effect(
-      () => cctx.connection.fetch.register(rpcRoute('memory-peers/snapshot', async (_endpoint, _payload, _signal) => ({
-        ok: true,
-        value: {
-          peers: await storeOf().listPeers(),
-          mounts: live.sharing.mounts.map(m => ({ name: m.name, peer: m.peer, subpath: m.subpath, readonly: m.readonly })),
-        },
-      }))),
-      'dsh-memory-lite: /api/memory-peers/snapshot',
+      () => cctx.connection.fetch.register(rpcRoute('memory-vault/snapshot', async (_endpoint, _payload, _signal) => {
+        const topics = await storeOf().listTopics()
+        const totalMemories = topics.reduce((sum, t) => sum + t.count, 0)
+        return {
+          ok: true,
+          value: {
+            totalMemories,
+            topics,
+            privacy: {
+              namespace: live.privacy.namespace,
+              hidePrivate: live.privacy.hidePrivate,
+              restrictedProviders: live.privacy.restrictedProviders,
+              restrictedPaths: live.privacy.restrictedPaths,
+              privatePaths: live.privacy.privatePaths,
+            },
+          },
+        }
+      })),
+      'dsh-memory-lite: /api/memory-vault/snapshot',
     )
 
-    // Settings UI: model catalog for the extraction-model dropdown (§17). rc.1
-    // removed the browser connection.api.llm.models aggregate; rebuild the same
-    // {groups:[{id,name,models:[{id,name,reasoning?}]}]} shape host-side from
-    // ctx.llm (listProviders + listModels + resolveModelInfo) so the client
-    // settings page keeps working across host versions over our own RPC.
     cctx.effect(
       () => cctx.connection.fetch.register(rpcRoute('memory-models/snapshot', async (_endpoint, _payload, _signal) => {
         const groups: unknown[] = []
@@ -266,7 +220,6 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
           const llm = ctx.llm as {
             listProviders?: () => readonly { readonly id: string; readonly name: string }[]
             listModels?: (provider: string) => Promise<readonly { readonly id: string; readonly name: string; readonly description?: string }[]>
-            resolveModelInfo?: (provider: string, model: string) => Promise<{ readonly reasoning?: { readonly efforts?: readonly { readonly id: string; readonly name: string; readonly description?: string }[]; readonly defaultEffort?: string } }>
           } | undefined
           if (llm?.listProviders !== undefined) {
             const providers = llm.listProviders()
@@ -283,8 +236,6 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       'dsh-memory-lite: /api/memory-models/snapshot',
     )
 
-    // Per-route reasoning efforts for the effort dropdown: resolved lazily so
-    // the catalog RPC stays cheap (resolveModelInfo per model would be N calls).
     cctx.effect(
       () => cctx.connection.fetch.register(rpcRoute('memory-model-efforts/snapshot', async (_endpoint, payload, _signal) => {
         const route = String((payload as { route?: unknown } | null)?.route ?? '')
@@ -307,5 +258,5 @@ export function apply(ctx: Context, config: MemoryConfig = {}): void {
       'dsh-memory-lite: /api/memory-model-efforts/snapshot',
     )
   })
-  ctx.logger.info(`dsh-memory-lite: memory enabled (root ${live.root}, default peer ${live.defaultPeer}, extraction ${live.extraction.mode})`)
+  ctx.logger.info(`dsh-memory-lite: unified vault enabled (root ${live.root}, extraction ${live.extraction.mode})`)
 }

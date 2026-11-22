@@ -15,19 +15,22 @@ test('extractJsonObject normalizes full-width braces and quotes', () => {
 })
 
 test('extractJsonObject salvages broken-brace JSON from key:value pairs', () => {
-  // Truncated before the closing brace: complete key:value pairs are rebuilt.
   assert.equal(
-    extractJsonObject('{"decision":"create","category":"preferences","title":"pnpm","content":"use pnpm"'),
-    '{"decision":"create","category":"preferences","title":"pnpm","content":"use pnpm"}',
+    extractJsonObject('{"decision":"create","topic":"preferences","title":"pnpm","content":"use pnpm"'),
+    '{"decision":"create","topic":"preferences","title":"pnpm","content":"use pnpm"}',
   )
   assert.throws(() => extractJsonObject('only prose, no braces, no pairs'))
 })
 
-test('parseDecision accepts the four closed kinds', () => {
+test('parseDecision accepts the four closed kinds (and legacy category alias)', () => {
   assert.deepEqual(DECISION_KINDS, ['create', 'merge', 'update', 'skip'])
   assert.deepEqual(
-    parseDecision('{"decision":"create","category":"preferences","title":"pnpm","content":"use pnpm"}'),
-    { kind: 'create', category: 'preferences', title: 'pnpm', content: 'use pnpm' },
+    parseDecision('{"decision":"create","topic":"preferences","title":"pnpm","content":"use pnpm"}'),
+    { kind: 'create', topic: 'preferences', title: 'pnpm', content: 'use pnpm' },
+  )
+  assert.deepEqual(
+    parseDecision('{"decision":"create","category":"infra","title":"vps","content":"contabo"}'),
+    { kind: 'create', topic: 'infra', title: 'vps', content: 'contabo' },
   )
   assert.deepEqual(
     parseDecision('{"decision":"merge","path":"preferences/tools.md","content":"podman"}'),
@@ -45,22 +48,22 @@ test('parseDecision tolerates fences and prose', () => {
   const fenced = [
     'Here is my answer:',
     '```json',
-    '{"decision":"create","category":"entities","title":"proj","content":"react 18"}',
+    '{"decision":"create","topic":"dev","title":"proj","content":"react 18"}',
     '```',
   ].join('\n')
-  assert.deepEqual(parseDecision(fenced), { kind: 'create', category: 'entities', title: 'proj', content: 'react 18' })
+  assert.deepEqual(parseDecision(fenced), { kind: 'create', topic: 'dev', title: 'proj', content: 'react 18' })
 })
 
 test('parseDecision tolerates full-width braces', () => {
   assert.deepEqual(
-    parseDecision('｛"decision":"create","category":"entities","title":"proj","content":"react 18"｝'),
-    { kind: 'create', category: 'entities', title: 'proj', content: 'react 18' },
+    parseDecision('｛"decision":"create","topic":"dev","title":"proj","content":"react 18"｝'),
+    { kind: 'create', topic: 'dev', title: 'proj', content: 'react 18' },
   )
 })
 
 test('parseDecision rejects unknown kinds and missing fields', () => {
   assert.throws(() => parseDecision('{"decision":"delete","path":"a.md"}'), /one of create\/merge\/update\/skip/)
-  assert.throws(() => parseDecision('{"decision":"create","category":"preferences"}'), /requires category, title, and content/)
+  assert.throws(() => parseDecision('{"decision":"create","topic":"preferences"}'), /requires topic, title, and content/)
   assert.throws(() => parseDecision('{"decision":"update","path":"a.md"}'), /requires path and content/)
   assert.throws(() => parseDecision('no json'), /contains no JSON/)
 })
