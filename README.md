@@ -37,7 +37,7 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 
 | 能力 | 说明 |
 |---|---|
-| 显式记忆（5 个工具） | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`；`update` 把旧内容归档进 `## History`，`forget` 是软删除（进 `.trash/`） |
+| 显式记忆（5 个工具） | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`；`update` 把旧内容归档进 `## History`，`forget` 是软删除（进 `.trash/`）；`remember` / `update_memory` 新增**必填**参数 `summary`（一句话目录摘要，或 `"keep"`），见下文「目录摘要一致性」 |
 | L0 目录注入 | 每个会话注入一条常驻的记忆目录消息（`_index.md` 渲染）；目录变化、或压缩把它挤出可见面时自动重发 |
 | 隐式提取 | 后台把新增对话窗口喂给模型，产出 create / merge / update / skip 决策，带去重检索与解析失败重试；落到已有文件前会再让模型对照该文件的编号行做一次「对账」（replace / delete / insert / noop），而不是盲目追加 |
 | 跨 peer 共享 | 把别的 peer 的记忆以只读方式挂到 `shared/<name>/` 下 |
@@ -55,7 +55,7 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 | 每一步 | 5 个工具 schema 注入（约 300–800 tokens） |
 | 每个会话 | L0 目录一条常驻消息，默认上限 1200 tokens；命中 KV cache 后增量接近 0 |
 | 每次显式 remember | 一次工具调用；索引重建不花 LLM |
-| 每次隐式提取 | **1 次 LLM 调用**（解析失败重试时 2 次），用你的默认模型或指定模型 |
+| 每次隐式提取 | **1 次 LLM 调用**（解析失败重试时 2 次）；若模型没给出摘要判定且正文确实变了，**再加 1 次轻量「重摘要」调用**；用你的默认模型或指定模型 |
 
 默认触发条件：新增 50 条会话消息（`windowTurns`）或空闲 30 分钟（`idleTimeoutMin`）；回合边界与落盘触发默认关闭。
 
@@ -113,12 +113,22 @@ dsh plugin --profile web add @alanzhao/dsh-memory-lite
 └── .trash/                         # forget 的软删除（按日期分目录）
 ```
 
-每个记忆文件用 `## Current` / `## History` / `## Related` 三段。更新前会把完整旧文件存进 `.history/` 快照，`## History` 本身只留最新几行一句话记录，不再整段堆旧内容。目录里的摘要描述整个文件：新建时由提取模型写一句话，之后 merge 不会再用最新事实的前几个字覆盖它。四个分类是给模型的检索路径：preferences（总是相关）、entities（被提到的事实）、events（时间相关）、experiences（任务经验）。
+每个记忆文件用 `## Current` / `## History` / `## Related` 三段。更新前会把完整旧文件存进 `.history/` 快照，`## History` 本身只留最新几行一句话记录，不再整段堆旧内容。目录里的摘要描述整个文件，正文每变一次都会有一次显式判定（见下节）。四个分类是给模型的检索路径：preferences（总是相关）、entities（被提到的事实）、events（时间相关）、experiences（任务经验）。
+
+### 目录摘要一致性
+
+`_index.md` 里每个文件的一行摘要不会再在正文变化后悄悄过时：**每次正文变化，摘要必有一次显式判定**——要么 `keep`（现有摘要仍完全准确），要么给出新文本。分三层保证：
+
+1. **显式工具（`remember` / `update_memory`）**：`summary` 是必填参数——一句话新摘要，或 `"keep"`。缺失/为空会在**任何写入之前**报错（`remember` 新建文件时 `keep` 也会报错：新文件没有旧摘要可留）。工具返回里多一行 `Index summary: kept «…»` 或 `Index summary: «旧» → «新»`，可当场复核。
+2. **隐式提取**：`update` 决策与对账补丁（patch）都要带 `summary`（`keep` 或新文本）；对账提示词里会显示该文件当前的目录摘要。`create` 仍必填摘要。
+3. **兜底（重摘要）**：提取模型漏给判定时，**绝不拒绝或回退正文写入**；正文照常写入后，多一次小调用单独判定摘要。这次调用也失败时，摘要末尾会被标上 ` ⚠stale`，表示「正文已变、摘要未经确认」。
+
+`⚠stale` 是可见标记，不会静默过时：下一次提取触及该文件时，对账/重摘要提示词会看到它，判定为 `keep` 或重写后标记即被清除；你也可以直接编辑 `_index.md`。本机制保证「每次变化都有一次判定」，不保证判定本身一定正确（模型可能错选 `keep`），所以输出做了可见化。提取日志（`extraction.log`）新增 `summaryResummarized`（重摘要调用次数）与 `summaryStaleMarked`（打标次数），重摘要失败会在 `failed-answers.log` 记 `stage: "summary"`。
 
 ## 工作原理（简版）
 
 - **目录注入**：在 `agent/pre-step` 瀑布里把 `_index.md` 渲染成一条带官方 `plugin` + `catalog` 形式的 `user/message`；子代理会话不注入。
-- **提取**：按 `windowTurns` 或空闲触发 → 取窗口内消息 → grep 已有记忆去重 → 一次 LLM 决策 → （落到已有文件时）第二次 LLM「对账」：看着该文件的编号行输出 replace / delete / insert / append 或 noop，行号越界、整行被大幅缩写、一次删太多都会被拒绝并退回追加 → 写文件 → 推进每会话书签。**失败不推进书签**，下次触发重试。
+- **提取**：按 `windowTurns` 或空闲触发 → 取窗口内消息 → grep 已有记忆去重 → 一次 LLM 决策 → （落到已有文件时）第二次 LLM「对账」：看着该文件的编号行输出 replace / delete / insert / append 或 noop，行号越界、整行被大幅缩写、一次删太多都会被拒绝并退回追加 → 写文件 → 摘要判定（必要时再来一次重摘要调用）→ 推进每会话书签。**失败不推进书签**，下次触发重试。
 - **安全**：所有文件访问过包含边界（只允许相对路径；`..`、绝对路径、symlink 逃逸在执行层拒绝）。
 - **并发**：所有写入走串行队列 + 原子替换（tmp + rename）。
 
@@ -154,6 +164,13 @@ dsh plugin --profile web remove @alanzhao/dsh-memory-lite
 - 隐式提取的质量取决于你选的模型；小模型更容易产出需要 repair 的 JSON。
 
 ## 变更历史 (Changelog)
+
+### v2.0.0（2026-11-24）
+- **目录摘要防过时（硬约束）**：正文每变一次，目录摘要必有一次显式判定（`keep` 或新文本）；判定失败留下可见的 `⚠stale` 标记，绝不静默过时。
+- **Breaking — 工具参数**：`remember` 与 `update_memory` 新增**必填**参数 `summary`（一句话目录摘要，或 `"keep"`）。缺失/为空会在写入前报错；`remember` 新建文件时不能传 `keep`。依赖旧参数集的调用方/提示词需要更新。输出新增 `summary: { before?, after, action: 'kept' | 'changed' }` 与 `Index summary:` 渲染行。
+- **隐式提取**：`update` 决策与对账补丁必须带 `summary`（`keep` / 新文本），对账提示词新增「Current catalog summary」段；缺判定时新增一次「重摘要」LLM 调用（`resummarize`），再失败则打 `⚠stale`——缺 summary 永远不会拒绝或回退正文写入。追加路径（merge 无对账 / 对账退回 / create 撞已存在文件）一律重摘要。
+- 新增指标 `summaryResummarized` / `summaryStaleMarked`（`extraction.log`）；重摘要失败记入 `failed-answers.log`（`stage: "summary"`）。
+- 新增 `src/summary.ts`、`MemoryStore.readIndexEntry` / `applySummaryVerdict` / `markIndexStale`（均走串行队列）；`appendCurrent` 现返回「正文是否变化」。
 
 ### v1.0.0（2026-11-22）
 - **架构跃迁 — 统一主题库（Unified Topic Vault）**：彻底废除按工作目录哈希切碎的 `peers/` 与 `sharing.mounts` 拼接，改为单一 `~/.agent-memory/memories/<topic>/` 人类可读主题树；跨目录同任务（如文档与代码分处不同目录）与跨主题关联（如保单 ↔ 体检）天然零配置互通。

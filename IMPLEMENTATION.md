@@ -26,6 +26,7 @@
 - §17 提取模型可配置（Phase 6）
 - §18 提取治理（A/B/C，2026-08-28/29）
 - §19 后续待办
+- §26 目录摘要防过时（v2.0.0）
 
 ---
 
@@ -240,8 +241,8 @@ ctx.on('agent/pre-step', ...):
 |---|---|---|
 | `read_memory` | `path` (req) | 读 L1 全文；越界抛错 |
 | `search_memory` | `query` (req) | grep 行匹配，`{matches: [{path, line}]}` |
-| `remember` | `category` (req, enum), `title` (req), `content` (req) | 创建/追加；slug 化 title |
-| `update_memory` | `path` (req), `content` (req) | 旧内容入 History，新内容入 Current |
+| `remember` | `topic` (req), `title` (req), `content` (req), `summary` (req, v2.0.0) | 创建/追加；slug 化 title；`summary` 见 §26 |
+| `update_memory` | `path` (req), `content` (req), `summary` (req, v2.0.0) | 旧内容入 History，新内容入 Current；`summary` 见 §26 |
 | `forget_memory` | `path` (req) | 软删到 `root/.trash/` |
 
 - 每个工具 `execute` 首行：subagent 来源拒绝。
@@ -1050,3 +1051,49 @@ fake-connection，断言五个工具仍注册且 `connection` 确实不存在。
 
 ### 25.4 未做（第三期，待定）
 超过阈值后的自动整理（consolidation）与保真闸、`consolidate_memory` 工具。
+
+---
+
+## 26. 目录摘要防过时：硬约束（v2.0.0，2026-11-24）
+
+### 26.1 根因与目标
+`_index.md` 的一行摘要在正文变化后不随之更新：`update_memory` 只 `ensureIndexEntry`（保留旧摘要）；`remember` 追加同理；隐式提取 reconcile 的 summary 可选且输入里没有旧摘要；blind update 不要 summary；append 路径永远保留旧摘要。
+目标：**每次正文变化，摘要必有一次显式判定（keep 或新文本）**，由代码保证；判定失败必须留下 `⚠stale` 可见标记。不保证判定本身正确；不做数字/日期启发式、不新增配置项、不动 `forget_memory`、不做启动时全库扫描。
+
+### 26.2 公共基础
+- `src/summary.ts`：`STALE_MARK = ' ⚠stale'`；`SummaryVerdict = keep | set(text)`；`parseSummaryField`（`keep` 不分大小写或 `=` → keep；其余非空字符串压平空白、剥掉末尾 stale 标记、>160 字截成 159+`…` → set；空/非字符串 → undefined）；`stripStale` / `isStale`。`parseIndex` 正则不变，标记就是摘要文本的一部分。
+- `MemoryStore`（全部走 `MutationQueue`）：`readIndexEntry(rel, trust?)`（受限信任看不到 `private/*`）；`applySummaryVerdict(rel, verdict, fallback)` → `{ before?, after, action: 'kept'|'changed' }`（set 等同旧值视为 keep；keep 有条目则保留并去 stale，无条目写 fallback）；`markIndexStale(rel, fallback)`（幂等；无条目写 `fallback + STALE_MARK`）。`appendCurrent` 返回 `boolean`（正文是否变化）。`refreshIndexEntry` / `ensureIndexEntry` 保持不变。
+
+### 26.3 显式工具
+- `update_memory`：`summary` 必填。顺序：`parseSummaryField` → undefined 则**在任何写入前**抛 `summary is required: pass a one-line summary or "keep"` → `resolve` + `updateCurrent` → `applySummaryVerdict(rel, verdict, summaryOf(content))`。
+- `remember`：`summary` 必填。先 `fileExists`，再校验；新建文件 + keep → 写前抛 `new memory file has no existing summary; provide one`；新建 set → `writeNewMemory` 后 `refreshIndexEntry`；追加 → `appendCurrent` 后 `applySummaryVerdict`。
+- 两者输出增加 `summary: { before?, after, action }`，render 增加 `Index summary: kept «…»` / `Index summary: «旧|(none)» → «新»`。隐私/restricted/forcedPrivateTopic 逻辑未动。
+- 框架层对「缺失」会先抛 `missing required property "summary"`；工具自己的前置校验兜住空串/纯空白。
+
+### 26.4 隐式提取写路径（`applyDecisionDetailed`）
+缺 summary **绝不拒绝或回退正文写入**；解析阶段缺 summary 不抛错（`CreateDecision` / `PathDecision` / patch 的 `summary?: string` 迁移为 `summaryVerdict?: SummaryVerdict`；merge 不读 summary）。
+
+| 路径 | 条件 | 摘要处理 |
+|---|---|---|
+| P1 create | 文件不存在 | verdict 为 set → `refreshIndexEntry`；keep 或缺失 → 重摘要；再失败 → 写 fallback 并标 stale |
+| P2 reconcile patch | `changed=true` | 有 verdict → `applySummaryVerdict`；缺失 → 重摘要；再失败 → `markIndexStale`（fallback 沿用 `summaryOf(title || content)`） |
+| P2′ | patch `changed=false` / noop | 不动摘要 |
+| P3 blind update | update 且无 reconcile 钩子（或文件不存在） | 同 P2 |
+| P4 append | create 撞已存在文件 / merge 无 reconcile / reconcile 退回 | 正文变了一律重摘要（忽略决策自带 verdict，因为它描述的是另一个底稿）；再失败 → `markIndexStale` |
+
+统一收尾函数 `settleSummary`：①有（可用的）verdict → 应用；②否则 `hooks.resummarize` → 应用其结果；③仍无 → `markIndexStale`。`ReconcileRequest.summary` 由 `store.readIndexEntry` 填入，`buildReconcileUser` 在 Current lines 之前输出 `## Current catalog summary`（无条目 `(none)`，stale 则去掉标记并加注「flagged as possibly outdated」）。
+
+### 26.5 重摘要钩子与指标
+- `ApplyHooks.resummarize?: (req: { path, title, current, oldSummary? }) => Promise<SummaryVerdict | undefined>`，在 `extractOnce` 构造 hooks 处实现（**不受 `extraction.reconcile` 开关影响**）：`summarySystem()` / `buildSummaryUser(title, current, oldSummary?, truncated?)`，只要求 `{"summary":"keep"}` 或 `{"summary":"..."}`；Current 超 `reconcileMaxBytes` 按整行截断并标注；复用 `callExtraction` 与同一 route，`llmCalls += 1`、`addUsage`。
+- 钩子**永不抛错**（含 abort）：LLM 出错/解析失败 → 返回 undefined 并 `appendFailedAnswer({ stage: 'summary', path, error, text })`，调用方随后 `markIndexStale`，保证「正文写了而摘要无痕」不会发生。
+- 写入后由 `settleSummary` 重新 `readFile` + `parseMemoryFile` 取最新 Current 传给钩子。无钩子（单测/无路由）直接标 stale。
+- 指标：`summaryResummarized`（重摘要调用数）、`summaryStaleMarked`（打标次数）写入 `extraction.log` 汇总行（始终）与会话审计（仅 >0）；`status.ts` 不展示提取统计，未改。
+
+### 26.6 偏差与说明
+- P4 append 在 `appendCurrent` 返回「正文未变」（全部是重复行）时不重摘要、不标 stale，仅 `ensureIndexEntry`（无条目时补 fallback），避免无谓的 LLM 调用与误标。
+- P1 无条目时 stale 写法为 `refreshIndexEntry(fallback)` + `markIndexStale`（顺带清掉孤儿条目的旧摘要）。
+- `remember`/`update_memory` 的「缺失」由工具框架先拦截，错误文案为框架的 `missing required property "summary"`；空串/空白才走 `summary is required…`。
+
+### 26.7 测试
+新增 `tests/summary.test.ts`（解析器 / 三个 store 方法 / 队列串行）、`tests/tools-summary.test.ts`（两个工具的写前校验、keep/set、渲染行、restricted 拦截）；`memory-hygiene` / `extract-reconcile-boot` / `extract-boot` / `boot` 同步更新：缺 summary → 额外一次重摘要调用、重摘要失败 → `⚠stale` 且正文 patch 仍正确。
+

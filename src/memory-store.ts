@@ -13,6 +13,7 @@ import type { HistoryConfig } from './config.js'
 import { containWithin, ensureDir, MemoryPathError, realpathSafe } from './path.js'
 import { applyPatch, bulletLines, lineKey, type PatchOp } from './patch.js'
 import { isPrivatePath, normalizeTopic, topicOfPath, UNRESTRICTED_TRUST } from './privacy.js'
+import { isStale, STALE_MARK, stripStale, type SummaryVerdict } from './summary.js'
 
 /** Current UTC date as YYYY-MM-DD. */
 function todayUtc(): string {
@@ -322,12 +323,12 @@ export class MemoryStore {
     })
   }
 
-  /** Append content as new Current bullets, skipping duplicates (marker-insensitive). */
+  /** Append content as new Current bullets, skipping duplicates (marker-insensitive); resolves whether the body changed. */
   appendCurrent(
     relPath: string,
     content: string,
     trust: TrustContext = UNRESTRICTED_TRUST,
-  ): Promise<void> {
+  ): Promise<boolean> {
     return this.queue.enqueue(async () => {
       const existing = await this.readFile(relPath, trust)
       const parsed = parseMemoryFile(existing.content)
@@ -338,9 +339,10 @@ export class MemoryStore {
         seen.add(key)
         return true
       })
-      if (fresh.length === 0) return
+      if (fresh.length === 0) return false
       parsed.current = parsed.current === '' ? fresh.join('\n') : `${parsed.current}\n${fresh.join('\n')}`
       await this.writeNow(existing.rel, renderMemoryFile(parsed), trust)
+      return true
     })
   }
 
@@ -570,6 +572,64 @@ export class MemoryStore {
       const topic = topicOfPath(relPath)
       const next = entries.filter(entry => entry.path !== relPath)
       next.push({ topic, path: relPath, summary })
+      await this.writeIndexNow(next)
+    })
+  }
+
+  /** Read one index entry (or undefined); restricted trust never sees `private/*` entries. */
+  readIndexEntry(relPath: string, trust: TrustContext = UNRESTRICTED_TRUST): Promise<IndexEntry | undefined> {
+    return this.queue.enqueue(async () => {
+      if (trust.restricted && isPrivatePath(relPath, this.privateNamespace)) return undefined
+      return (await this.readIndexRaw()).find(entry => entry.path === relPath)
+    })
+  }
+
+  /**
+   * Settle the catalog summary after a body change, according to an explicit
+   * verdict. `set` replaces the summary (identical text counts as keep);
+   * `keep` retains the existing one, clearing any stale marker, or writes
+   * `fallback` when the file has no entry yet.
+   */
+  applySummaryVerdict(
+    relPath: string,
+    verdict: SummaryVerdict,
+    fallback: string,
+  ): Promise<{ before?: string; after: string; action: 'kept' | 'changed' }> {
+    return this.queue.enqueue(async () => {
+      const entries = await this.readIndexRaw()
+      const existing = entries.find(entry => entry.path === relPath)
+      const before = existing?.summary
+      let after: string
+      let action: 'kept' | 'changed'
+      if (verdict.kind === 'set') {
+        const unchanged = existing !== undefined && verdict.text === stripStale(existing.summary)
+        after = verdict.text
+        action = unchanged ? 'kept' : 'changed'
+      } else if (existing !== undefined) {
+        after = stripStale(existing.summary)
+        action = 'kept'
+      } else {
+        after = fallback
+        action = 'changed'
+      }
+      const next = entries.filter(entry => entry.path !== relPath)
+      next.push({ topic: topicOfPath(relPath), path: relPath, summary: after })
+      await this.writeIndexNow(next)
+      return { ...(before === undefined ? {} : { before }), after, action }
+    })
+  }
+
+  /**
+   * Flag the catalog summary as possibly outdated (appends {@link STALE_MARK},
+   * idempotent). A file without an entry gets `fallback` plus the marker.
+   */
+  markIndexStale(relPath: string, fallback: string): Promise<void> {
+    return this.queue.enqueue(async () => {
+      const entries = await this.readIndexRaw()
+      const existing = entries.find(entry => entry.path === relPath)
+      if (existing !== undefined && isStale(existing.summary)) return
+      const next = entries.filter(entry => entry.path !== relPath)
+      next.push({ topic: topicOfPath(relPath), path: relPath, summary: `${existing?.summary ?? fallback}${STALE_MARK}` })
       await this.writeIndexNow(next)
     })
   }

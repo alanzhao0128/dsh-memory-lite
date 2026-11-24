@@ -6,6 +6,7 @@
  */
 
 import type { PatchOp } from '../patch.js'
+import { parseSummaryField, type SummaryVerdict } from '../summary.js'
 
 export type ExtractionDecisionKind = 'create' | 'merge' | 'update' | 'skip'
 
@@ -15,16 +16,16 @@ export interface CreateDecision {
   readonly topic: string
   readonly title: string
   readonly content: string
-  /** One-sentence description of the whole file for the L0 index (optional). */
-  readonly summary?: string
+  /** The model's catalog-summary judgement; absent when it gave none (never an error). */
+  readonly summaryVerdict?: SummaryVerdict
 }
 
 export interface PathDecision {
   readonly kind: 'merge' | 'update'
   readonly path: string
   readonly content: string
-  /** Replacement index summary; only honoured for `update` (optional). */
-  readonly summary?: string
+  /** The model's catalog-summary judgement; only asked for on `update` (absent is never an error). */
+  readonly summaryVerdict?: SummaryVerdict
 }
 
 export interface SkipDecision {
@@ -60,8 +61,8 @@ export function parseDecision(text: string): ExtractionDecision {
       if (topic === '' || title === '' || content === '') {
         throw new Error('create decision requires topic, title, and content')
       }
-      const summary = cleanSummary(record.summary)
-      return { kind, topic, title, content, ...(summary === undefined ? {} : { summary }) }
+      const summaryVerdict = parseSummaryField(record.summary)
+      return { kind, topic, title, content, ...(summaryVerdict === undefined ? {} : { summaryVerdict }) }
     }
     case 'merge':
     case 'update': {
@@ -70,8 +71,9 @@ export function parseDecision(text: string): ExtractionDecision {
       if (path === '' || content === '') {
         throw new Error(`${kind} decision requires path and content`)
       }
-      const summary = cleanSummary(record.summary)
-      return { kind, path, content, ...(summary === undefined ? {} : { summary }) }
+      // merge never asks for a summary; the body writer re-judges it afterwards.
+      const summaryVerdict = kind === 'update' ? parseSummaryField(record.summary) : undefined
+      return { kind, path, content, ...(summaryVerdict === undefined ? {} : { summaryVerdict }) }
     }
     default: {
       const reason = str(record.reason)
@@ -138,16 +140,10 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function cleanSummary(value: unknown): string | undefined {
-  const text = str(value).replaceAll(/\s+/g, ' ')
-  if (text === '') return undefined
-  return text.length <= 160 ? text : text.slice(0, 159) + '…'
-}
-
 /** Outcome of the reconcile call that follows a merge/update on an existing file. */
 export type ReconcileDecision =
   | { readonly kind: 'noop'; readonly reason?: string }
-  | { readonly kind: 'patch'; readonly ops: readonly PatchOp[]; readonly summary?: string }
+  | { readonly kind: 'patch'; readonly ops: readonly PatchOp[]; readonly summaryVerdict?: SummaryVerdict }
 
 /** Parse the reconcile model's answer (`noop` or `patch` with line-targeted ops). */
 export function parseReconcile(text: string): ReconcileDecision {
@@ -183,8 +179,22 @@ export function parseReconcile(text: string): ReconcileDecision {
         throw new Error(`patch op ${index} has unknown op ${JSON.stringify(op.op)}`)
     }
   })
-  const summary = cleanSummary(record.summary)
-  return { kind: 'patch', ops, ...(summary === undefined ? {} : { summary }) }
+  const summaryVerdict = parseSummaryField(record.summary)
+  return { kind: 'patch', ops, ...(summaryVerdict === undefined ? {} : { summaryVerdict }) }
+}
+
+/**
+ * Parse the dedicated re-summarize answer (`{"summary":"keep"}` or
+ * `{"summary":"..."}`). Throws when no usable verdict is present.
+ */
+export function parseSummaryAnswer(text: string): SummaryVerdict {
+  const parsed: unknown = JSON.parse(extractJsonObject(text))
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('summary answer is not an object')
+  }
+  const verdict = parseSummaryField((parsed as Record<string, unknown>).summary)
+  if (verdict === undefined) throw new Error('summary answer has no usable "summary" field')
+  return verdict
 }
 
 function int(value: unknown, index: number): number {

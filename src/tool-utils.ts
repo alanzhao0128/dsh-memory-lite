@@ -69,3 +69,10 @@ export function trustForExec(exec: ToolExecution, deps: Pick<MemoryDeps, 'config
 export function cwdForExec(exec: ToolExecution): string | undefined {
   return exec.agent?.session.header.cwd
 }
+
+/** Render the `Index summary:` line shared by the write tools. */
+export function renderSummaryLine(summary: { before?: string; after: string; action: 'kept' | 'changed' }): string {
+  return summary.action === 'kept'
+    ? `Index summary: kept «${summary.after}»`
+    : `Index summary: «${summary.before ?? '(none)'}» → «${summary.after}»`
+}

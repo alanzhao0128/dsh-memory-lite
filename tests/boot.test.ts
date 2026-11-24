@@ -59,6 +59,12 @@ test('boots through the Loader and registers the five memory tools', async () =>
         assert.ok(tool, `expected tool ${name}`)
         assert.equal(tool.name, name)
       }
+      // The write tools must demand a catalog-summary judgement (a line or "keep").
+      for (const name of ['remember', 'update_memory']) {
+        const parameters = tools.get(name)!.parameters as { required?: readonly string[]; properties?: Record<string, { type?: string }> }
+        assert.ok(parameters.required?.includes('summary'), `${name} requires summary`)
+        assert.equal(parameters.properties?.summary?.type, 'string')
+      }
     } finally {
       await ctx.fiber.dispose()
     }

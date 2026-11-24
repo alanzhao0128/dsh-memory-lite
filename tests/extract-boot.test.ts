@@ -86,7 +86,7 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
   const ctx = await bootCtx(tmp)
   try {
     ctx.on('llm/stream', () => mockStreamText(
-      '{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm 作为包管理器"}',
+      '{"decision":"create","category":"preferences","title":"pnpm","summary":"用户的包管理器偏好：pnpm","content":"用户使用 pnpm 作为包管理器"}',
       { inputTokens: 1234, outputTokens: 42 },
     ))
     const store = new MemoryStore(tmp)
@@ -101,7 +101,7 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
     assert.match(memory, /用户使用 pnpm/)
 
     const index = await readFile(join(tmp, 'memories', '_index.md'), 'utf8')
-    assert.match(index, /preferences\/pnpm\.md/)
+    assert.match(index, /preferences\/pnpm\.md: 用户的包管理器偏好：pnpm\n/)
 
     const checkpointText = await readFile(join(tmp, 'sessions', 'session-abc123.json'), 'utf8')
     const checkpoint = JSON.parse(checkpointText)
@@ -131,6 +131,34 @@ test('extractOnce writes a create decision, index, and checkpoint through a mock
   }
 })
 
+test('a create without a summary costs one re-summarize call and lands its answer in the index', async () => {
+  await access(PLUGIN_ENTRY, constants.F_OK)
+  const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
+  const ctx = await bootCtx(tmp)
+  try {
+    const systems: string[] = []
+    ctx.on('llm/stream', (options: any) => {
+      systems.push(String(options.system))
+      return String(options.system).includes('catalog summary of ONE memory file')
+        ? mockStreamText('{"summary":"用户的包管理器偏好"}')
+        : mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}')
+    })
+    const store = new MemoryStore(tmp)
+    const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })
+    await extractOnce(sessionLike('session-nosummary', 30), { pending: 3, lastExtractAt: null, inFlight: true, checkpoint: { version: 1, checkpoint: { seq: 0 }, digest: '', audit: [] }, idleDispose: null, cancel: null }, ctx, { config: () => config, store }, new AbortController().signal, createStatusTracker())
+    assert.equal(systems.length, 2)
+    assert.match(await readFile(join(tmp, 'memories', 'preferences', 'pnpm.md'), 'utf8'), /用户使用 pnpm/)
+    assert.match(await readFile(join(tmp, 'memories', '_index.md'), 'utf8'), /preferences\/pnpm\.md: 用户的包管理器偏好\n/)
+    const logLine = JSON.parse((await readFile(join(tmp, 'sessions', 'extraction.log'), 'utf8')).trim().split('\n')[0])
+    assert.equal(logLine.llmCalls, 2)
+    assert.equal(logLine.summaryResummarized, 1)
+    assert.equal(logLine.summaryStaleMarked, 0)
+  } finally {
+    await ctx.fiber.dispose()
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('extractOnce recovers a prose answer via one bounded repair call', async () => {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-extract-mem-'))
@@ -141,7 +169,7 @@ test('extractOnce recovers a prose answer via one bounded repair call', async ()
       calls += 1
       return calls === 1
         ? mockStreamText('I think Alan uses pnpm as his package manager. Decision: create a preferences memory.')
-        : mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","content":"用户使用 pnpm"}')
+        : mockStreamText('{"decision":"create","category":"preferences","title":"pnpm","summary":"pnpm 偏好","content":"用户使用 pnpm"}')
     })
     const store = new MemoryStore(tmp)
     const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'] } })

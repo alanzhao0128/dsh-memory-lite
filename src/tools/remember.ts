@@ -1,15 +1,17 @@
 /**
  * The `remember` tool: explicit memory capture — creates a new memory file
- * under `<topic>/<slug>.md` or appends to an existing one.
+ * under `<topic>/<slug>.md` or appends to an existing one. Every call must
+ * also supply the catalog summary (a new line, or `keep` when appending).
  * @module dsh-memory-lite/src/tools/remember
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import { assertNotSubagent, cwdForExec, trustForExec, type MemoryDeps } from '../tool-utils.js'
+import { assertNotSubagent, cwdForExec, renderSummaryLine, trustForExec, type MemoryDeps } from '../tool-utils.js'
 import { normalizeContent, slugify, summaryOf } from '../memory-store.js'
 import { isPrivatePath, normalizeTopic } from '../privacy.js'
+import { parseSummaryField } from '../summary.js'
 
 /** Register remember. */
 export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
@@ -24,6 +26,11 @@ export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
       },
       title: { type: 'string', required: true, description: 'Short title; becomes the memory file name.' },
       content: { type: 'string', required: true, description: 'The fact or preference to remember.' },
+      summary: {
+        type: 'string',
+        required: true,
+        description: 'One-line catalog summary of the memory file (≤80 chars). When appending to an existing file whose catalog summary is still accurate, pass "keep".',
+      },
     },
     output: {
       schema: {
@@ -32,9 +39,24 @@ export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
         properties: {
           path: { type: 'string', required: true },
           appended: { type: 'boolean', required: true },
+          summary: {
+            type: 'object',
+            required: true,
+            additionalProperties: false,
+            properties: {
+              before: { type: 'string' },
+              after: { type: 'string', required: true },
+              action: { type: 'string', required: true, enum: ['kept', 'changed'] },
+            },
+          },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: value.appended ? `Appended to ${value.path}` : `Remembered ${value.path}` }],
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: `${value.appended ? `Appended to ${value.path}` : `Remembered ${value.path}`}\n${renderSummaryLine(value.summary)}`,
+        },
+      ],
     },
     async execute(args, exec) {
       assertNotSubagent(exec)
@@ -58,15 +80,21 @@ export function applyRememberTool(ctx: Context, deps: MemoryDeps): void {
 
       const relPath = `${topic}/${slugify(title)}.md`
       const existed = await deps.store.fileExists(relPath, trust)
+      // Validate before any write: a missing summary must never leave a changed body behind.
+      const verdict = parseSummaryField(args.summary)
+      if (verdict === undefined) throw new Error('summary is required: pass a one-line summary or "keep"')
+      let summary: { before?: string; after: string; action: 'kept' | 'changed' }
       if (existed) {
         await deps.store.appendCurrent(relPath, content, trust)
-        await deps.store.ensureIndexEntry(relPath, summaryOf(content))
+        summary = await deps.store.applySummaryVerdict(relPath, verdict, summaryOf(content))
       } else {
+        if (verdict.kind === 'keep') throw new Error('new memory file has no existing summary; provide one')
         await deps.store.writeNewMemory(relPath, title, content, trust)
-        await deps.store.refreshIndexEntry(relPath, summaryOf(content))
+        await deps.store.refreshIndexEntry(relPath, verdict.text)
+        summary = { after: verdict.text, action: 'changed' }
       }
       void deps.affinity?.record(cwd, topic)
-      return { path: relPath, appended: existed }
+      return { path: relPath, appended: existed, summary }
     },
     presentCall(args): GenericCallView {
       return { card: 'generic', title: `Remember ${args.topic}/${args.title}`, kind: 'edit' }

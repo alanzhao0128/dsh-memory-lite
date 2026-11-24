@@ -24,10 +24,11 @@ import { MemoryPathError } from '../path.js'
 import { numberedView, PatchError } from '../patch.js'
 import { countsTowardExtraction, selectWindow, renderEventText } from './window.js'
 import { shouldExtractIdle, shouldExtractTurn, shouldExtractWindow } from './triggers.js'
-import { parseDecision, parseReconcile, type ExtractionDecision, type ReconcileDecision } from './decision.js'
+import { parseDecision, parseReconcile, parseSummaryAnswer, type ExtractionDecision, type ReconcileDecision } from './decision.js'
+import type { SummaryVerdict } from '../summary.js'
 import { digestApproxTokens, rollDigest } from './digest.js'
 import { emptyCheckpoint, parseCheckpoint, withRun, renderCheckpoint, type CheckpointFile } from './checkpoint.js'
-import { buildExtractionUser, buildReconcileUser, extractionSystem, reconcileSystem } from './prompt.js'
+import { buildExtractionUser, buildReconcileUser, buildSummaryUser, extractionSystem, reconcileSystem, summarySystem } from './prompt.js'
 
 const DIGEST_MAX_TOKENS = 100
 const MAX_KEYWORDS = 8
@@ -51,6 +52,10 @@ interface RunMetrics {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  /** Dedicated re-summarize calls issued to settle a catalog summary. */
+  summaryResummarized: number
+  /** Files whose catalog summary ended up flagged `⚠stale`. */
+  summaryStaleMarked: number
 }
 
 interface RunRecordCtx {
@@ -229,7 +234,7 @@ export async function extractOnce(
   const windowText = windowEvents.map(event => renderEventText(event, ext.toolResultMaxBytes)).join('\n')
 
   const startedAt = Date.now()
-  const metrics: RunMetrics = { llmCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }
+  const metrics: RunMetrics = { llmCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, summaryResummarized: 0, summaryStaleMarked: 0 }
   const route = resolveRoute(ext.llm.route, ext.llm.reasoningEffort, deps.defaultModel, session)
 
   // Dual trust gate: restricted if EITHER the session OR the extraction model provider is restricted.
@@ -323,7 +328,7 @@ export async function extractOnce(
             const view = numberedView(request.current, ext.reconcileMaxBytes)
             if (view === undefined) return { kind: 'fallback', reason: 'current-too-large' }
             const reconcileSystemText = reconcileSystem()
-            const reconcileUser = buildReconcileUser(request.title, view.text, view.truncated, request.kind, request.content)
+            const reconcileUser = buildReconcileUser(request.title, view.text, view.truncated, request.kind, request.content, request.summary)
             metrics.llmCalls += 1
             let call: Awaited<ReturnType<typeof callExtraction>>
             try {
@@ -351,6 +356,42 @@ export async function extractOnce(
           },
         }
       : {}),
+    // Always available (even with reconcile off): settles the catalog summary when the model gave no verdict.
+    resummarize: async (request): Promise<SummaryVerdict | undefined> => {
+      const clipped = clipLines(request.current, ext.reconcileMaxBytes)
+      const summarySystemText = summarySystem()
+      const summaryUser = buildSummaryUser(request.title, clipped.text, request.oldSummary, clipped.truncated)
+      const failed = (error: string, answer: string): void => {
+        void store.appendFailedAnswer({
+          at: new Date().toISOString(),
+          session: session.id,
+          win: [windowStart, windowEnd],
+          route,
+          stage: 'summary',
+          path: request.path,
+          error: error.slice(0, 300),
+          text: answer,
+        })
+      }
+      metrics.llmCalls += 1
+      metrics.summaryResummarized += 1
+      let call: Awaited<ReturnType<typeof callExtraction>>
+      try {
+        call = await callExtraction(ctx, route, summarySystemText, summaryUser, signal)
+      } catch (error) {
+        // Never throw: the caller must still flag the summary stale, even when the run was aborted.
+        metrics.inputTokens += digestApproxTokens(summarySystemText) + digestApproxTokens(summaryUser)
+        failed(String(error), '')
+        return undefined
+      }
+      addUsage(metrics, call)
+      try {
+        return parseSummaryAnswer(call.text)
+      } catch (error) {
+        failed(String(error), call.text)
+        return undefined
+      }
+    },
   }
 
   let applied: AppliedDecision
@@ -362,6 +403,10 @@ export async function extractOnce(
   }
   if (applied.fallback !== undefined) {
     ctx.logger.warn('dsh-memory-lite: reconcile fell back to append for ' + String(applied.path) + ' (' + applied.fallback + ')')
+  }
+  if (applied.summary === 'stale') {
+    metrics.summaryStaleMarked += 1
+    ctx.logger.warn('dsh-memory-lite: catalog summary of ' + String(applied.path) + ' flagged stale (no confirmed re-judgement)')
   }
   if (applied.path !== undefined && applied.applied !== 'skip' && applied.applied !== 'noop') {
     const topic = topicOfPath(applied.path)
@@ -417,6 +462,8 @@ async function recordRun(
     outputTokens: metrics.outputTokens,
     ...(metrics.cacheReadTokens > 0 ? { cacheReadTokens: metrics.cacheReadTokens } : {}),
     ...(metrics.cacheWriteTokens > 0 ? { cacheWriteTokens: metrics.cacheWriteTokens } : {}),
+    ...(metrics.summaryResummarized > 0 ? { summaryResummarized: metrics.summaryResummarized } : {}),
+    ...(metrics.summaryStaleMarked > 0 ? { summaryStaleMarked: metrics.summaryStaleMarked } : {}),
     durationMs,
     ...extra,
   }
@@ -440,6 +487,8 @@ async function recordRun(
       outputTokens: metrics.outputTokens,
       cacheReadTokens: metrics.cacheReadTokens,
       cacheWriteTokens: metrics.cacheWriteTokens,
+      summaryResummarized: metrics.summaryResummarized,
+      summaryStaleMarked: metrics.summaryStaleMarked,
       durationMs,
       outcome,
       decision: decision ?? null,
@@ -465,19 +514,37 @@ export interface ReconcileRequest {
   readonly current: string
   readonly kind: 'create' | 'merge' | 'update'
   readonly content: string
+  /** The file's current catalog summary (may carry `⚠stale`), when it has an index entry. */
+  readonly summary?: string
 }
 
 export type ReconcileAnswer = ReconcileDecision | { readonly kind: 'fallback'; readonly reason: string }
 
+/** What the re-summarize model is asked to judge after a body change. */
+export interface ResummarizeRequest {
+  readonly path: string
+  readonly title: string
+  /** The file's Current section as written (already includes the change). */
+  readonly current: string
+  readonly oldSummary?: string
+}
+
 export interface ApplyHooks {
   readonly reconcile?: (request: ReconcileRequest) => Promise<ReconcileAnswer>
+  /** Judge the catalog summary after a body change; `undefined` means "could not tell" (never throws). */
+  readonly resummarize?: (request: ResummarizeRequest) => Promise<SummaryVerdict | undefined>
   readonly trust?: TrustContext
 }
+
+/** How the catalog summary was settled after a body write. */
+export type SummaryOutcome = 'kept' | 'changed' | 'stale'
 
 export interface AppliedDecision {
   readonly path: string | undefined
   readonly applied: 'create' | 'merge' | 'update' | 'patch' | 'noop' | 'skip'
   readonly fallback?: string
+  /** Set whenever the body changed (or a new entry was written); absent for noop/skip. */
+  readonly summary?: SummaryOutcome
 }
 
 /** Apply one decision through the store (all writes go through the queue). */
@@ -487,6 +554,51 @@ export async function applyDecision(
   hooks: ApplyHooks = {},
 ): Promise<string | undefined> {
   return (await applyDecisionDetailed(store, decision, hooks)).path
+}
+
+/**
+ * Settle the catalog summary after the body was written. Order: an explicit
+ * model verdict; else the re-summarize hook; else flag `⚠stale`. A missing
+ * summary never rejects or rolls back the body write. `fresh` means the file
+ * was just created, so the index holds nothing worth keeping for it.
+ */
+async function settleSummary(
+  store: MemoryStore,
+  hooks: ApplyHooks,
+  path: string,
+  fallback: string,
+  verdict: SummaryVerdict | undefined,
+  fresh = false,
+): Promise<SummaryOutcome> {
+  const apply = async (v: SummaryVerdict): Promise<SummaryOutcome> => {
+    if (fresh) {
+      await store.refreshIndexEntry(path, v.kind === 'set' ? v.text : fallback)
+      return 'changed'
+    }
+    return (await store.applySummaryVerdict(path, v, fallback)).action
+  }
+  // A fresh file has no summary to keep, so only a rewrite counts as an answer.
+  if (verdict !== undefined && !(fresh && verdict.kind === 'keep')) return apply(verdict)
+  if (hooks.resummarize !== undefined) {
+    let resolved: SummaryVerdict | undefined
+    try {
+      const trust = hooks.trust ?? UNRESTRICTED_TRUST
+      const parsed = parseMemoryFile((await store.readFile(path, trust)).content)
+      const oldSummary = fresh ? undefined : (await store.readIndexEntry(path, trust))?.summary
+      resolved = await hooks.resummarize({
+        path,
+        title: parsed.title === '' ? path : parsed.title,
+        current: parsed.current,
+        ...(oldSummary === undefined ? {} : { oldSummary }),
+      })
+    } catch {
+      resolved = undefined
+    }
+    if (resolved !== undefined) return apply(resolved)
+  }
+  if (fresh) await store.refreshIndexEntry(path, fallback)
+  await store.markIndexStale(path, fallback)
+  return 'stale'
 }
 
 /** Apply one decision and report how it landed, enforcing trust-boundary rules. */
@@ -536,20 +648,24 @@ export async function applyDecisionDetailed(
     const file = await store.readFile(path, trust)
     const parsed = parseMemoryFile(file.content)
     if (parsed.current !== '') {
+      const currentSummary = (await store.readIndexEntry(path, trust))?.summary
       const answer = await hooks.reconcile({
         path,
         title: parsed.title === '' ? path : parsed.title,
         current: parsed.current,
         kind: decision.kind,
         content: decision.content,
+        ...(currentSummary === undefined ? {} : { summary: currentSummary }),
       })
       if (answer.kind === 'noop') return { path, applied: 'noop' }
       if (answer.kind === 'patch') {
         try {
           const result = await store.patchCurrent(path, answer.ops, trust)
-          if (answer.summary !== undefined) await store.refreshIndexEntry(path, answer.summary)
-          else if (result.changed) await store.ensureIndexEntry(path, summaryOf(parsed.title === '' ? decision.content : parsed.title))
-          return { path, applied: result.changed ? 'patch' : 'noop' }
+          if (!result.changed) return { path, applied: 'noop' }
+          const summary = await settleSummary(
+            store, hooks, path, summaryOf(parsed.title === '' ? decision.content : parsed.title), answer.summaryVerdict,
+          )
+          return { path, applied: 'patch', summary }
         } catch (error) {
           if (!(error instanceof PatchError)) throw error
           fallback = 'patch-rejected: ' + error.message
@@ -560,22 +676,47 @@ export async function applyDecisionDetailed(
     }
   }
 
-  const summary = decision.kind === 'update' || decision.kind === 'create' ? decision.summary : undefined
+  const fallbackSummary = summaryOf(decision.content)
+  const verdict = decision.kind === 'merge' ? undefined : decision.summaryVerdict
   if (decision.kind === 'create' && !exists) {
     await store.writeNewMemory(path, title ?? decision.title, decision.content, trust)
-    await store.refreshIndexEntry(path, summary ?? summaryOf(decision.content))
-    return { path, applied: 'create' }
+    const summary = await settleSummary(store, hooks, path, fallbackSummary, verdict, true)
+    return { path, applied: 'create', summary }
   }
   const blindReplace = decision.kind === 'update' && !(exists && hooks.reconcile !== undefined)
   if (blindReplace) {
     await store.updateCurrent(path, decision.content, trust)
-    if (summary !== undefined) await store.refreshIndexEntry(path, summary)
-    else await store.ensureIndexEntry(path, summaryOf(decision.content))
-    return { path, applied: 'update' }
+    const summary = await settleSummary(store, hooks, path, fallbackSummary, verdict)
+    return { path, applied: 'update', summary }
   }
-  await store.appendCurrent(path, decision.content, trust)
-  await store.ensureIndexEntry(path, summaryOf(decision.content))
-  return { path, applied: decision.kind === 'create' ? 'create' : decision.kind, ...(fallback === undefined ? {} : { fallback }) }
+  // Append paths (create colliding with an existing file, merge without/after failed reconcile):
+  // a model-given verdict described a different base, so the summary is always re-judged.
+  const changed = await store.appendCurrent(path, decision.content, trust)
+  let summary: SummaryOutcome | undefined
+  if (changed) summary = await settleSummary(store, hooks, path, fallbackSummary, undefined)
+  else await store.ensureIndexEntry(path, fallbackSummary)
+  return {
+    path,
+    applied: decision.kind === 'create' ? 'create' : decision.kind,
+    ...(fallback === undefined ? {} : { fallback }),
+    ...(summary === undefined ? {} : { summary }),
+  }
+}
+
+/** Keep whole lines of `text` up to `maxBytes` (UTF-8); reports whether anything was dropped. */
+function clipLines(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: false }
+  const kept: string[] = []
+  let used = 0
+  for (const line of text.split('\n')) {
+    const size = Buffer.byteLength(line, 'utf8') + 1
+    if (used + size > maxBytes) break
+    kept.push(line)
+    used += size
+  }
+  // A single oversized first line: fall back to a character cut so the model still sees something.
+  if (kept.length === 0) return { text: text.slice(0, maxBytes), truncated: true }
+  return { text: kept.join('\n'), truncated: true }
 }
 
 function resolveRoute(

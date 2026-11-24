@@ -38,7 +38,7 @@ Compatibility: **dsh ≥ 0.1.5** (full support for dsh 0.2.1-rc.2 specification 
 
 | What | Notes |
 |---|---|
-| Explicit memory (5 tools) | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`; `update` archives the previous content into `## History`, `forget` is a soft delete into `.trash/` |
+| Explicit memory (5 tools) | `read_memory` / `search_memory` / `remember` / `update_memory` / `forget_memory`; `update` archives the previous content into `## History`, `forget` is a soft delete into `.trash/`; `remember` / `update_memory` take a **required** `summary` parameter (a one-line catalog summary, or `"keep"`) — see "Catalog summary consistency" below |
 | L0 catalog injection | one resident catalog message per session (rendered from `_index.md`); re-published when the index changes or compaction moves it off the visible surface |
 | Implicit extraction | a background run feeds the new conversation window to the model and applies a create / merge / update / skip decision, with dedup search and parse-failure repair; before landing on an existing file the model is shown that file's numbered lines for a reconcile pass (replace / delete / insert / noop) instead of a blind append |
 | Cross-peer sharing | mount another peer's memories read-only under `shared/<name>/` |
@@ -56,7 +56,7 @@ Compatibility: **dsh ≥ 0.1.5** (full support for dsh 0.2.1-rc.2 specification 
 | Every step | the 5 tool schemas are injected (~300–800 tokens) |
 | Every session | one resident catalog message, capped at 1200 tokens by default; near-zero incremental cost once the KV cache hits |
 | Every explicit remember | one tool call; the index rebuild costs no LLM |
-| Every implicit extraction | **one LLM call** (two when the answer needs a repair), using your default model or a pinned one |
+| Every implicit extraction | **one LLM call** (two when the answer needs a repair); when the model gave no summary judgement and the body really changed, **one more small "re-summarize" call**; using your default model or a pinned one |
 
 Default triggers: 50 new conversation messages (`windowTurns`) or 30 minutes idle (`idleTimeoutMin`); turn-boundary and flush triggers are off by default.
 
@@ -114,12 +114,22 @@ Full schema and defaults: [`src/config.ts`](https://github.com/alanzhao0128/dsh-
 └── .trash/                         # soft-deleted memories (dated folders)
 ```
 
-Each memory file uses `## Current` / `## History` / `## Related`. Before an update the complete previous file is saved under `.history/`, and `## History` itself keeps only the newest few one-line notes instead of piling up old bodies. The catalog summary describes the whole file: the extractor writes one sentence when it creates the file, and later merges no longer overwrite it with the first words of the newest fact. The four categories are retrieval paths for the model: preferences (always relevant), entities (mentioned knowledge), events (time-related), experiences (task lessons).
+Each memory file uses `## Current` / `## History` / `## Related`. Before an update the complete previous file is saved under `.history/`, and `## History` itself keeps only the newest few one-line notes instead of piling up old bodies. The catalog summary describes the whole file, and every body change gets an explicit summary judgement (next section). The four categories are retrieval paths for the model: preferences (always relevant), entities (mentioned knowledge), events (time-related), experiences (task lessons).
+
+### Catalog summary consistency
+
+The one-line summary of each file in `_index.md` no longer goes quietly stale after the body changes: **every body change gets exactly one explicit judgement of the summary** — either `keep` (the current summary is still fully accurate) or new text. Three layers enforce it:
+
+1. **Explicit tools (`remember` / `update_memory`)**: `summary` is a required parameter — a new one-line summary, or `"keep"`. A missing/blank value throws **before any write** (`remember` creating a new file also rejects `keep`: a new file has no old summary to keep). The tool result gains an `Index summary: kept «…»` or `Index summary: «old» → «new»` line so the call can be checked on the spot.
+2. **Implicit extraction**: `update` decisions and reconcile patches must carry `summary` (`keep` or new text); the reconcile prompt now shows the file's current catalog summary. `create` still requires a summary.
+3. **Fallback (re-summarize)**: when the extractor omits the judgement it **never rejects or rolls back the body write**; the body is written as usual and a small extra call judges the summary on its own. If that call also fails, the summary is suffixed with ` ⚠stale` — "body changed, summary not confirmed".
+
+`⚠stale` is a visible marker, not a silent state: the next extraction that touches the file shows it to the reconcile/re-summarize prompt, and once the model answers `keep` or rewrites it the marker is cleared; you can also edit `_index.md` by hand. The mechanism guarantees a judgement per change, not that the judgement is right (a model can still wrongly pick `keep`), which is why the output is made visible. `extraction.log` gains `summaryResummarized` (re-summarize calls) and `summaryStaleMarked` (files flagged), and a failed re-summarize is recorded in `failed-answers.log` with `stage: "summary"`.
 
 ## How it works (short version)
 
 - **Catalog injection**: in the `agent/pre-step` waterfall the peer's `_index.md` is rendered into one `user/message` carrying the official `plugin` source kind with the `catalog` form; subagent sessions get none.
-- **Extraction**: triggered by `windowTurns` or idle → select the window → grep existing memories for dedup → one LLM decision → (when it lands on an existing file) a second LLM reconcile call that sees the file's numbered lines and answers with replace / delete / insert / append or noop; out-of-range lines, heavily shortened lines and mass deletions are rejected and fall back to append → write files → advance the per-session bookmark. **A failed run keeps the bookmark**, so the same window is retried on the next trigger.
+- **Extraction**: triggered by `windowTurns` or idle → select the window → grep existing memories for dedup → one LLM decision → (when it lands on an existing file) a second LLM reconcile call that sees the file's numbered lines and answers with replace / delete / insert / append or noop; out-of-range lines, heavily shortened lines and mass deletions are rejected and fall back to append → write files → settle the catalog summary (one extra re-summarize call when needed) → advance the per-session bookmark. **A failed run keeps the bookmark**, so the same window is retried on the next trigger.
 - **Safety**: every file access goes through a containment boundary (relative paths only; `..`, absolute paths and symlink escapes are rejected at the executor).
 - **Concurrency**: all writes go through a serial queue with atomic tmp+rename replacement.
 
@@ -155,6 +165,13 @@ Your memories are not deleted: `~/.agent-memory` is left for you to keep or remo
 - Extraction quality depends on the model you pick; small models produce JSON that needs repair more often.
 
 ## Changelog
+
+### v2.0.0 (2026-11-24)
+- **Catalog summaries can no longer silently go stale (hard guarantee)**: every body change gets one explicit summary judgement (`keep` or new text); a failed judgement leaves a visible `⚠stale` marker.
+- **Breaking — tool parameters**: `remember` and `update_memory` gain a **required** `summary` parameter (a one-line catalog summary, or `"keep"`). A missing/blank value throws before any write; `remember` cannot pass `keep` when it creates a new file. Callers/prompts built against the old parameter set must be updated. Results gain `summary: { before?, after, action: 'kept' | 'changed' }` and an `Index summary:` render line.
+- **Implicit extraction**: `update` decisions and reconcile patches must carry `summary` (`keep` / new text), and the reconcile prompt gets a "Current catalog summary" section; a missing judgement triggers one extra re-summarize LLM call (`resummarize`), and if that fails the summary is flagged `⚠stale` — a missing summary never rejects or rolls back the body write. Append paths (merge without reconcile / reconcile fallback / create colliding with an existing file) always re-summarize.
+- New metrics `summaryResummarized` / `summaryStaleMarked` (`extraction.log`); failed re-summarizes land in `failed-answers.log` (`stage: "summary"`).
+- New `src/summary.ts` and `MemoryStore.readIndexEntry` / `applySummaryVerdict` / `markIndexStale` (all serialized through the mutation queue); `appendCurrent` now resolves whether the body changed.
 
 ### v1.0.0 (2026-11-22)
 - **Unified Topic Vault**: replaces directory-hashed `peers/` and `sharing.mounts` with one human-readable `~/.agent-memory/memories/<topic>/` tree so cross-directory tasks and cross-topic links (e.g. insurance ↔ health) connect with zero manual sharing rules.

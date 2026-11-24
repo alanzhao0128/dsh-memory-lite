@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { MemoryStore, parseMemoryFile } from '../src/memory-store.js'
 import { applyPatch, bulletLines, lineKey, numberedView, PatchError } from '../src/patch.js'
 import { parseDecision, parseReconcile } from '../src/extract/decision.js'
-import { buildReconcileUser, extractionSystem, reconcileSystem } from '../src/extract/prompt.js'
+import { buildReconcileUser, buildSummaryUser, extractionSystem, reconcileSystem, summarySystem } from '../src/extract/prompt.js'
 import { applyDecision, applyDecisionDetailed, type ReconcileAnswer } from '../src/extract/index.js'
 import { resolveConfig } from '../src/config.js'
 
@@ -261,15 +261,19 @@ test('store.patchCurrent applies a patch, archives, notes History, and leaves th
 
 // ---- decision parsing + prompts -------------------------------------------
 
-test('parseDecision carries an optional one-line summary on create and update', () => {
+test('parseDecision carries a summary verdict on create and update and never fails without one', () => {
   const create = parseDecision('{"decision":"create","category":"entities","title":"T","summary":"  whole\\nfile  topic ","content":"c"}')
-  assert.equal(create.kind === 'create' && create.summary, 'whole file topic')
+  assert.deepEqual(create.kind === 'create' && create.summaryVerdict, { kind: 'set', text: 'whole file topic' })
   const update = parseDecision('{"decision":"update","path":"entities/t.md","content":"c","summary":"s"}')
-  assert.equal(update.kind === 'update' && update.summary, 's')
-  const none = parseDecision('{"decision":"merge","path":"entities/t.md","content":"c"}')
-  assert.equal('summary' in none, false)
+  assert.deepEqual(update.kind === 'update' && update.summaryVerdict, { kind: 'set', text: 's' })
+  const keep = parseDecision('{"decision":"update","path":"entities/t.md","content":"c","summary":"Keep"}')
+  assert.deepEqual(keep.kind === 'update' && keep.summaryVerdict, { kind: 'keep' })
+  const missing = parseDecision('{"decision":"update","path":"entities/t.md","content":"c"}')
+  assert.equal('summaryVerdict' in missing, false)
+  const none = parseDecision('{"decision":"merge","path":"entities/t.md","content":"c","summary":"ignored"}')
+  assert.equal('summaryVerdict' in none, false)
   const long = parseDecision(`{"decision":"create","category":"entities","title":"T","summary":"${'z'.repeat(300)}","content":"c"}`)
-  assert.ok(long.kind === 'create' && long.summary!.length <= 160)
+  assert.ok(long.kind === 'create' && long.summaryVerdict?.kind === 'set' && long.summaryVerdict.text.length <= 160)
 })
 
 test('parseReconcile accepts noop and every patch op, and rejects malformed answers', () => {
@@ -287,16 +291,36 @@ test('parseReconcile accepts noop and every patch op, and rejects malformed answ
 test('extraction prompt asks for a summary and plain lines; reconcile prompts are strict', () => {
   const system = extractionSystem()
   assert.ok(system.includes('"summary"'))
+  assert.ok(system.includes('"summary":"keep|..."'))
+  assert.ok(system.includes('required for create and for update'))
+  assert.ok(system.includes('merge needs no summary'))
   assert.ok(system.includes('CONTENT FORMAT'))
   assert.ok(system.includes('Do NOT prefix lines'))
   const reconcile = reconcileSystem()
-  for (const word of ['noop', 'replace', 'delete', 'insert', 'append', 'STRICT OUTPUT RULES', 'half-width']) assert.ok(reconcile.includes(word), word)
+  for (const word of ['noop', 'replace', 'delete', 'insert', 'append', 'STRICT OUTPUT RULES', 'half-width', 'required for patch', '"keep"']) assert.ok(reconcile.includes(word), word)
   const user = buildReconcileUser('My file', '1| - a', true, 'update', 'new fact')
   assert.ok(user.includes('My file'))
   assert.ok(user.includes('1| - a'))
   assert.ok(user.includes('OUTDATED'))
   assert.ok(user.includes('shortened'))
   assert.ok(buildReconcileUser('t', '1| x', false, 'merge', 'p').includes('proposes adding'))
+  // The current catalog summary precedes the lines; a stale marker is stripped and flagged.
+  const withSummary = buildReconcileUser('t', '1| x', false, 'merge', 'p', 'CPA handbook')
+  assert.ok(withSummary.includes('## Current catalog summary\nCPA handbook'))
+  assert.ok(withSummary.indexOf('Current catalog summary') < withSummary.indexOf('Current lines'))
+  assert.ok(buildReconcileUser('t', '1| x', false, 'merge', 'p').includes('## Current catalog summary\n(none)'))
+  const stale = buildReconcileUser('t', '1| x', false, 'merge', 'p', 'CPA handbook ⚠stale')
+  assert.ok(stale.includes('CPA handbook\n(This summary is flagged as possibly outdated'))
+  assert.ok(!stale.includes('⚠stale'))
+})
+
+test('summary prompts are strict and show the existing summary', () => {
+  const system = summarySystem()
+  for (const word of ['{"summary":"keep"}', 'STRICT OUTPUT RULES', 'half-width', '80 characters']) assert.ok(system.includes(word), word)
+  const user = buildSummaryUser('CPA', '- port 8317', 'old one ⚠stale', true)
+  assert.ok(user.includes('## Existing catalog summary\nold one\n(This summary is flagged'))
+  assert.ok(user.includes('truncated'))
+  assert.ok(buildSummaryUser('CPA', '- a').includes('(none)'))
 })
 
 test('config defaults and validation for history and reconcile', () => {
@@ -318,19 +342,80 @@ async function seeded(): Promise<{ store: MemoryStore; root: string; file: (rel:
   return ctx
 }
 
-test('merge: reconcile patch replaces the contradicted line and keeps the index summary', async () => {
+test('merge: reconcile patch replaces the contradicted line; a keep from resummarize leaves the summary', async () => {
   const { store, root, file } = await seeded()
   try {
-    let seen: { current: string; kind: string } | undefined
+    let seen: { current: string; kind: string; summary: string | undefined } | undefined
+    let resummarized: { current: string; oldSummary: string | undefined } | undefined
     const answer: ReconcileAnswer = { kind: 'patch', ops: [{ op: 'replace', line: 2, content: 'Google pool = 0 (2026-11-12)' }] }
     const applied = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'Google pool is now 0' }, {
-      reconcile: async request => { seen = { current: request.current, kind: request.kind }; return answer },
+      reconcile: async request => { seen = { current: request.current, kind: request.kind, summary: request.summary }; return answer },
+      resummarize: async request => { resummarized = { current: request.current, oldSummary: request.oldSummary }; return { kind: 'keep' } },
     })
     assert.equal(applied.applied, 'patch')
-    assert.deepEqual(seen, { current: '- port 8317\n- Google pool = 1', kind: 'merge' })
+    assert.equal(applied.summary, 'kept')
+    assert.deepEqual(seen, { current: '- port 8317\n- Google pool = 1', kind: 'merge', summary: 'CPA reverse proxy handbook' })
+    // The re-summarize hook sees the file AFTER the patch plus the old summary.
+    assert.deepEqual(resummarized, { current: '- port 8317\n- Google pool = 0 (2026-11-12)', oldSummary: 'CPA reverse proxy handbook' })
     const parsed = parseMemoryFile(await file('entities/cpa.md'))
     assert.equal(parsed.current, '- port 8317\n- Google pool = 0 (2026-11-12)')
     assert.equal((await store.readIndex())[0]!.summary, 'CPA reverse proxy handbook')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('merge: a patch without a summary and without a resummarize hook flags the summary stale but still patches', async () => {
+  const { store, root, file } = await seeded()
+  try {
+    const applied = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'Google pool is now 0' }, {
+      reconcile: async () => ({ kind: 'patch', ops: [{ op: 'replace', line: 2, content: 'Google pool = 0 (2026-11-12)' }] }),
+    })
+    assert.equal(applied.applied, 'patch')
+    assert.equal(applied.summary, 'stale')
+    assert.equal(parseMemoryFile(await file('entities/cpa.md')).current, '- port 8317\n- Google pool = 0 (2026-11-12)')
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA reverse proxy handbook ⚠stale')
+    // Stale marking is idempotent, and a later keep verdict clears it.
+    await store.markIndexStale('entities/cpa.md', 'x')
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA reverse proxy handbook ⚠stale')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('merge: a summary verdict inside the reconcile patch settles the summary without a resummarize call', async () => {
+  const { store, root } = await seeded()
+  try {
+    let called = false
+    const resummarize = async (): Promise<undefined> => { called = true; return undefined }
+    await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'pool is 0' }, {
+      reconcile: async () => ({ kind: 'patch', ops: [{ op: 'replace', line: 2, content: 'Google pool = 0' }], summaryVerdict: { kind: 'set', text: 'CPA handbook, Google pool exhausted' } }),
+      resummarize,
+    })
+    assert.equal(called, false)
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA handbook, Google pool exhausted')
+    await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'port 9000' }, {
+      reconcile: async () => ({ kind: 'patch', ops: [{ op: 'replace', line: 1, content: 'port 9000' }], summaryVerdict: { kind: 'keep' } }),
+      resummarize,
+    })
+    assert.equal(called, false)
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA handbook, Google pool exhausted')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('merge: an unchanged patch or a noop never touches the summary', async () => {
+  const { store, root } = await seeded()
+  try {
+    await store.markIndexStale('entities/cpa.md', 'x')
+    const before = (await store.readIndex())[0]!.summary
+    const unchanged = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'port 8317' }, {
+      reconcile: async () => ({ kind: 'patch', ops: [{ op: 'replace', line: 1, content: 'port 8317' }], summaryVerdict: { kind: 'set', text: 'should not land' } }),
+    })
+    assert.equal(unchanged.applied, 'noop')
+    assert.equal(unchanged.summary, undefined)
+    assert.equal((await store.readIndex())[0]!.summary, before)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -385,31 +470,91 @@ test('update: with reconcile active an unreconcilable update appends instead of 
   }
 })
 
-test('update without a reconcile hook still replaces Current (archived) and honours an explicit summary', async () => {
+test('update without a reconcile hook still replaces Current (archived) and honours an explicit verdict', async () => {
   const { store, root, file } = await seeded()
   try {
-    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'rewritten', summary: 'new scope' })
+    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'rewritten', summaryVerdict: { kind: 'set', text: 'new scope' } })
     const parsed = parseMemoryFile(await file('entities/cpa.md'))
     assert.equal(parsed.current, '- rewritten')
     assert.match(parsed.history, /port 8317/)
     assert.equal((await store.readIndex())[0]!.summary, 'new scope')
+    // Missing verdict: the body is still replaced, the summary is flagged instead of silently kept.
     await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'again' })
+    assert.equal(parseMemoryFile(await file('entities/cpa.md')).current, '- again')
+    assert.equal((await store.readIndex())[0]!.summary, 'new scope ⚠stale')
+    // keep clears the flag; a resummarize rewrite replaces it.
+    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'third', summaryVerdict: { kind: 'keep' } })
     assert.equal((await store.readIndex())[0]!.summary, 'new scope')
+    await applyDecision(store, { kind: 'update', path: 'entities/cpa.md', content: 'fourth' }, {
+      resummarize: async () => ({ kind: 'set', text: 'fourth scope' }),
+    })
+    assert.equal((await store.readIndex())[0]!.summary, 'fourth scope')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
 
-test('create sets the model-written summary; a later merge never overwrites it', async () => {
+test('create sets the model-written summary; appends re-judge it instead of overwriting or ignoring it', async () => {
   const { store, root } = await makeStore()
   try {
-    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'first fact', summary: 'About the Thing system' })
-    await applyDecision(store, { kind: 'merge', path: 'entities/thing.md', content: 'second fact that must not become the summary' })
-    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'third fact', summary: 'ignored for existing file' })
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'first fact', summaryVerdict: { kind: 'set', text: 'About the Thing system' } })
     assert.equal((await store.readIndex())[0]!.summary, 'About the Thing system')
-    // Without a model summary a new file falls back to its first content.
+    // Append without a resummarize hook: the old summary stays but is flagged.
+    await applyDecision(store, { kind: 'merge', path: 'entities/thing.md', content: 'second fact' })
+    assert.equal((await store.readIndex())[0]!.summary, 'About the Thing system ⚠stale')
+    // A create colliding with the file ignores its own verdict and goes through resummarize.
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Thing', content: 'third fact', summaryVerdict: { kind: 'set', text: 'ignored for existing file' } }, {
+      resummarize: async () => ({ kind: 'keep' }),
+    })
+    assert.equal((await store.readIndex())[0]!.summary, 'About the Thing system')
+    // An append that adds nothing never touches the summary.
+    await applyDecision(store, { kind: 'merge', path: 'entities/thing.md', content: 'third fact' }, {
+      resummarize: async () => { throw new Error('must not be called') },
+    })
+    assert.equal((await store.readIndex())[0]!.summary, 'About the Thing system')
+    // Without any verdict a new file falls back to its first content, flagged stale.
     await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Other', content: 'only fact' })
-    assert.equal((await store.readIndex()).find(e => e.path === 'entities/other.md')!.summary, 'only fact')
+    assert.equal((await store.readIndex()).find(e => e.path === 'entities/other.md')!.summary, 'only fact ⚠stale')
+    // A keep verdict on a brand-new file has nothing to keep: resummarize decides, else the fallback.
+    await applyDecision(store, { kind: 'create', topic: 'entities', title: 'Third', content: 'x fact', summaryVerdict: { kind: 'keep' } }, {
+      resummarize: async () => ({ kind: 'keep' }),
+    })
+    assert.equal((await store.readIndex()).find(e => e.path === 'entities/third.md')!.summary, 'x fact')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('resummarize failures never block the body: the summary is flagged stale', async () => {
+  const { store, root, file } = await seeded()
+  try {
+    const applied = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'fact A' }, {
+      resummarize: async () => undefined,
+    })
+    assert.equal(applied.summary, 'stale')
+    assert.match(await file('entities/cpa.md'), /- fact A/)
+    const thrown = await applyDecisionDetailed(store, { kind: 'merge', path: 'entities/cpa.md', content: 'fact B' }, {
+      resummarize: async () => { throw new Error('boom') },
+    })
+    assert.equal(thrown.summary, 'stale')
+    assert.match(await file('entities/cpa.md'), /- fact B/)
+    assert.equal((await store.readIndex())[0]!.summary, 'CPA reverse proxy handbook ⚠stale')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('restricted trust still drops private writes before any summary work', async () => {
+  const { store, root } = await makeStore()
+  try {
+    let called = false
+    const applied = await applyDecisionDetailed(store, { kind: 'create', topic: 'private/health', title: 'Exam', content: 'secret', summaryVerdict: { kind: 'set', text: 's' } }, {
+      trust: { restricted: true, reason: 'hidePrivate' },
+      resummarize: async () => { called = true; return undefined },
+    })
+    assert.equal(applied.applied, 'skip')
+    assert.equal(called, false)
+    assert.deepEqual(await store.readIndex(), [])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

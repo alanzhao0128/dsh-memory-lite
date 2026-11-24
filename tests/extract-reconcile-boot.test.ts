@@ -62,9 +62,13 @@ function mockStreamText(text: string): AsyncIterable<any> {
 
 const MERGE = '{"decision":"merge","path":"infra/cpa.md","content":"Google 池 = 0（2026-11-12）"}'
 
+const KEEP = '{"summary":"keep"}'
+
 async function run(
   reconcileAnswer: string | undefined,
   extraction: MemoryConfig['extraction'] = {},
+  summaryAnswer: string = KEEP,
+  seedStale = false,
 ): Promise<{ calls: { system: string; user: string }[]; text: string; audit: any; log: any; index: string; tmp: string; cleanup: () => Promise<void> }> {
   await access(PLUGIN_ENTRY, constants.F_OK)
   const tmp = await mkdtemp(join(tmpdir(), 'dsh-reconcile-mem-'))
@@ -72,12 +76,14 @@ async function run(
   const store = new MemoryStore(tmp)
   await store.writeNewMemory('infra/cpa.md', 'CPA', 'port 8317\nGoogle 池 = 1')
   await store.refreshIndexEntry('infra/cpa.md', 'CPA 反代手册')
+  if (seedStale) await store.markIndexStale('infra/cpa.md', 'x')
   const calls: { system: string; user: string }[] = []
   ctx.on('llm/stream', (options: any) => {
     const system = String(options.system)
     const user = String(options.messages?.[0]?.content?.[0]?.text ?? '')
     calls.push({ system, user })
     if (system.includes('ONE existing memory file')) return mockStreamText(reconcileAnswer ?? '{"decision":"noop"}')
+    if (system.includes('catalog summary of ONE memory file')) return mockStreamText(summaryAnswer)
     return mockStreamText(MERGE)
   })
   const config = resolveConfig({ root: tmp, extraction: { messageScope: ['user', 'assistant', 'tool_result'], ...extraction } })
@@ -96,9 +102,11 @@ async function run(
 }
 
 test('merge on an existing file runs a reconcile call that sees numbered lines and patches in place', async () => {
-  const r = await run('{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}]}')
+  const r = await run('{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}],"summary":"keep"}')
   try {
     assert.equal(r.calls.length, 2)
+    // The reconcile prompt shows the file's current catalog summary before its lines.
+    assert.ok(r.calls[1]!.user.includes('## Current catalog summary\nCPA 反代手册'))
     assert.ok(r.calls[1]!.user.includes('1| - port 8317'))
     assert.ok(r.calls[1]!.user.includes('2| - Google 池 = 1'))
     assert.ok(r.calls[1]!.user.includes('Google 池 = 0（2026-11-12）'))
@@ -107,7 +115,94 @@ test('merge on an existing file runs a reconcile call that sees numbered lines a
     assert.equal(r.audit.llmCalls, 2)
     assert.equal(r.audit.inputTokens, 200)
     assert.equal(r.log.outcome, 'patch')
-    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册/)
+    assert.equal(r.log.summaryResummarized, 0)
+    assert.equal(r.log.summaryStaleMarked, 0)
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册\n/)
+  } finally {
+    await r.cleanup()
+  }
+})
+
+test('a patch that carries a rewritten summary lands it in the index without an extra call', async () => {
+  const r = await run('{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}],"summary":"CPA 反代手册，Google 池已耗尽"}')
+  try {
+    assert.equal(r.calls.length, 2)
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册，Google 池已耗尽\n/)
+  } finally {
+    await r.cleanup()
+  }
+})
+
+test('a patch without a summary triggers one extra re-summarize call that sees the patched file', async () => {
+  const r = await run(
+    '{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}]}',
+    {},
+    '{"summary":"CPA 反代手册，Google 池已耗尽"}',
+  )
+  try {
+    assert.equal(r.calls.length, 3)
+    const resummarize = r.calls[2]!
+    assert.ok(resummarize.system.includes('catalog summary of ONE memory file'))
+    assert.ok(resummarize.user.includes('## Existing catalog summary\nCPA 反代手册'))
+    assert.ok(resummarize.user.includes('- Google 池 = 0（2026-11-12）'))
+    assert.ok(!resummarize.user.includes('Google 池 = 1'))
+    assert.equal(parseMemoryFile(r.text).current, '- port 8317\n- Google 池 = 0（2026-11-12）')
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册，Google 池已耗尽\n/)
+    assert.equal(r.audit.llmCalls, 3)
+    assert.equal(r.audit.inputTokens, 300)
+    assert.equal(r.audit.summaryResummarized, 1)
+    assert.equal(r.log.llmCalls, 3)
+    assert.equal(r.log.summaryResummarized, 1)
+    assert.equal(r.log.summaryStaleMarked, 0)
+    assert.equal(r.log.outcome, 'patch')
+  } finally {
+    await r.cleanup()
+  }
+})
+
+test('a re-summarize call that answers keep leaves the summary untouched', async () => {
+  const r = await run('{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}]}')
+  try {
+    assert.equal(r.calls.length, 3)
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册\n/)
+    assert.equal(r.log.summaryResummarized, 1)
+  } finally {
+    await r.cleanup()
+  }
+})
+
+test('when the re-summarize call also fails the summary is flagged stale and the patch still lands', async () => {
+  const r = await run(
+    '{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}]}',
+    {},
+    'I cannot decide.',
+  )
+  try {
+    assert.equal(r.calls.length, 3)
+    assert.equal(parseMemoryFile(r.text).current, '- port 8317\n- Google 池 = 0（2026-11-12）')
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册 ⚠stale\n/)
+    assert.equal(r.log.outcome, 'patch')
+    assert.equal(r.log.summaryResummarized, 1)
+    assert.equal(r.log.summaryStaleMarked, 1)
+    assert.equal(r.audit.summaryStaleMarked, 1)
+    const failed = (await readFile(join(r.tmp, 'sessions', 'failed-answers.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.equal(failed.some(entry => entry.stage === 'summary' && entry.path === 'infra/cpa.md'), true)
+  } finally {
+    await r.cleanup()
+  }
+})
+
+test('the next touch of a stale file shows the flag to the reconcile model and a keep clears it', async () => {
+  const r = await run(
+    '{"decision":"patch","ops":[{"op":"replace","line":2,"content":"Google 池 = 0（2026-11-12）"}],"summary":"keep"}',
+    {},
+    KEEP,
+    true,
+  )
+  try {
+    assert.ok(r.calls[1]!.user.includes('CPA 反代手册\n(This summary is flagged as possibly outdated'))
+    assert.ok(!r.calls[1]!.user.includes('⚠stale'))
+    assert.match(r.index, /infra\/cpa\.md: CPA 反代手册\n/)
   } finally {
     await r.cleanup()
   }
@@ -140,12 +235,14 @@ test('an unparsable reconcile answer falls back to append and logs why', async (
   }
 })
 
-test('reconcile: false keeps the single-call append behaviour', async () => {
+test('reconcile: false appends without a reconcile call (only the re-summarize call remains)', async () => {
   const r = await run(undefined, { reconcile: false })
   try {
-    assert.equal(r.calls.length, 1)
+    assert.equal(r.calls.length, 2)
+    assert.ok(r.calls[1]!.system.includes('catalog summary of ONE memory file'))
     assert.equal(parseMemoryFile(r.text).current, '- port 8317\n- Google 池 = 1\n- Google 池 = 0（2026-11-12）')
-    assert.equal(r.audit.llmCalls, 1)
+    assert.equal(r.audit.llmCalls, 2)
+    assert.equal(r.log.summaryResummarized, 1)
   } finally {
     await r.cleanup()
   }
@@ -154,7 +251,10 @@ test('reconcile: false keeps the single-call append behaviour', async () => {
 test('a Current larger than reconcileMaxBytes skips the second call and appends', async () => {
   const r = await run(undefined, { reconcileMaxBytes: 10 })
   try {
-    assert.equal(r.calls.length, 1)
+    // First call + one re-summarize call (its view of the file is clipped to the same budget).
+    assert.equal(r.calls.length, 2)
+    assert.ok(r.calls[1]!.system.includes('catalog summary of ONE memory file'))
+    assert.ok(r.calls[1]!.user.includes('truncated'))
     assert.equal(r.audit.reconcileFallback, 'current-too-large')
     assert.match(r.text, /Google 池 = 0（2026-11-12）/)
   } finally {

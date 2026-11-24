@@ -4,6 +4,7 @@
  */
 
 import { DEFAULT_PRIVATE_NAMESPACE } from '../types.js'
+import { isStale, stripStale } from '../summary.js'
 
 export interface GrepHitLike {
   readonly path: string
@@ -45,7 +46,7 @@ export function extractionSystem(opts: ExtractionSystemOptions = {}): string {
     'Decisions:',
     '- create: ONLY for a brand-new, durable, core system asset, permanent infrastructure truth, or explicit user rule. Requires topic, a short title, summary, and content.',
     '- merge: add an essential, high-value fact to an existing memory file.',
-    '- update: an existing memory is outdated or contradicted; new content replaces it (old content moves to History automatically).',
+    '- update: an existing memory is outdated or contradicted; new content replaces it (old content moves to History automatically). Requires path, content, and summary.',
     '- skip: DEFAULT CHOICE. Use whenever information is transient, conversational, single-task, one-off debugging, standard tool usage, or already covered.',
     '',
     '### HARD CRITERIA — TRIPLE GATE FOR EXTRACTION (WHEN IN DOUBT, ALWAYS SKIP):',
@@ -82,13 +83,13 @@ export function extractionSystem(opts: ExtractionSystemOptions = {}): string {
     'Reply with exactly ONE JSON object matching this schema (choose one of the four):',
     '{"decision":"create","topic":"...","title":"...","summary":"...","content":"..."}',
     '{"decision":"merge","path":"...","content":"..."}',
-    '{"decision":"update","path":"...","content":"..."}',
+    '{"decision":"update","path":"...","content":"...","summary":"keep|..."}',
     '{"decision":"skip","reason":"..."}',
     '',
     'CONTENT FORMAT:',
     '- content is plain text, one self-contained statement per line. Do NOT prefix lines with "- " or "* "; the store adds list markers itself.',
     '- State the conclusion and, when it matters, the reason and the date (YYYY-MM-DD). Never record the debugging story.',
-    '- summary (create only, required): ONE sentence, at most 80 characters, describing what the whole file is about (topic and scope).',
+    '- summary is ONE sentence, at most 80 characters, describing the whole file in its FINAL state. It is required for create and for update. For update, answer "keep" if the file\'s existing summary in the memory index is still accurate; if any number, status, or conclusion in it is overturned, rewrite it. merge needs no summary.',
     '',
     'STRICT OUTPUT RULES:',
     '- Your entire reply must be exactly one JSON object and nothing else.',
@@ -105,7 +106,7 @@ export function reconcileSystem(): string {
     'You maintain ONE existing memory file. You are given its current lines (numbered "N| text") and a proposed addition. Decide how to fold the addition in without duplicates or contradictions.',
     'Reply with exactly ONE JSON object, one of:',
     '{"decision":"noop","reason":"..."}',
-    '{"decision":"patch","ops":[...],"summary":"..."}',
+    '{"decision":"patch","ops":[...],"summary":"keep|..."}',
     'Operations (line numbers refer to the numbered lines shown):',
     '- {"op":"replace","line":N,"content":"..."}: rewrite line N. Use this when the addition updates, corrects or contradicts that line; keep still-valid details and dates.',
     '- {"op":"delete","line":N}: remove line N only when the addition clearly supersedes it or it is an exact duplicate.',
@@ -116,13 +117,20 @@ export function reconcileSystem(): string {
     '- Prefer replace over append when an existing line covers the same fact; never leave two lines that disagree.',
     '- Do not touch unrelated lines. Never delete more than a few lines. At most 12 operations.',
     '- content is plain text, one self-contained statement per line, without numbering and without a leading "- ".',
-    '- summary is optional: only give it when the file\'s overall topic changed; ONE sentence of at most 80 characters.',
+    '- summary (required for patch): the user turn shows the file\'s current catalog summary. Judge it against the file AFTER your patch: answer "keep" if it is still accurate; rewrite it as ONE sentence (≤80 chars) if any number, status, or conclusion in it is overturned or it no longer describes the whole file. noop needs no summary.',
     '',
     'STRICT OUTPUT RULES:',
     '- Your entire reply must be exactly one JSON object and nothing else.',
     '- No prose, no explanation, no markdown, no code fences, no trailing period.',
     '- The JSON must be valid, balanced, and use half-width braces and quotes.',
   ].join('\n')
+}
+
+/** Render a catalog summary for a prompt: `(none)`, or its text with a stale-flag note. */
+function describeSummary(summary: string | undefined): string {
+  if (summary === undefined || summary === '') return '(none)'
+  if (!isStale(summary)) return summary
+  return `${stripStale(summary)}\n(This summary is flagged as possibly outdated; check it carefully.)`
 }
 
 /** The user turn for the reconcile call. */
@@ -132,17 +140,53 @@ export function buildReconcileUser(
   truncated: boolean,
   kind: 'create' | 'merge' | 'update',
   proposed: string,
+  currentSummary?: string,
 ): string {
   const hint = kind === 'update'
     ? 'The extractor believes parts of the current file are OUTDATED or CONTRADICTED by this addition.'
     : 'The extractor proposes adding this to the file.'
   return [
     `## Memory file: ${title}`,
+    `## Current catalog summary\n${describeSummary(currentSummary)}`,
     '## Current lines' + (truncated ? ' (long lines shortened with …; replace/delete still work by line number)' : ''),
     numbered,
     '## Proposed addition',
     hint,
     proposed,
+    'Reply with the single JSON object only (see STRICT OUTPUT RULES).',
+  ].join('\n\n')
+}
+
+/** The system instruction for the re-summarize call that settles the catalog summary after a body change. */
+export function summarySystem(): string {
+  return [
+    'You maintain the one-line catalog summary of ONE memory file. You are given the file\'s current lines and its existing catalog summary (if any). The file body was just changed; decide whether the summary still describes the file as it is NOW.',
+    'Reply with exactly ONE JSON object, one of:',
+    '{"summary":"keep"}',
+    '{"summary":"..."}',
+    'Rules:',
+    '- Answer keep only if the existing summary is still fully accurate for the whole file.',
+    '- If any number, status, or conclusion in the existing summary is overturned, or the summary no longer describes the whole file (or there is none), write a new one: ONE sentence, at most 80 characters, describing the whole file in its current state.',
+    '',
+    'STRICT OUTPUT RULES:',
+    '- Your entire reply must be exactly one JSON object and nothing else.',
+    '- No prose, no explanation, no markdown, no code fences, no trailing period.',
+    '- The JSON must be valid, balanced, and use half-width braces and quotes.',
+  ].join('\n')
+}
+
+/** The user turn for the re-summarize call. */
+export function buildSummaryUser(
+  title: string,
+  current: string,
+  oldSummary?: string,
+  truncated = false,
+): string {
+  return [
+    `## Memory file: ${title}`,
+    `## Existing catalog summary\n${describeSummary(oldSummary)}`,
+    '## Current lines' + (truncated ? ' (truncated: only the beginning of a long file is shown)' : ''),
+    current,
     'Reply with the single JSON object only (see STRICT OUTPUT RULES).',
   ].join('\n\n')
 }
